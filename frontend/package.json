@@ -1,0 +1,10 @@
+{
+  "name": "automata-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "echo \"No frontend implementation yet\""
+  },
+  "dependencies": {}
+}
