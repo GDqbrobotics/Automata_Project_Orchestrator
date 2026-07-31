@@ -3,12 +3,26 @@ name: xrf
 display_name: XRF Analyzer
 type: analyzer
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: true
 metadata:
   description: "Micro-X-ray fluorescence spectrometer"
 
 states:
+  initializing:
+    description: "Analyzer is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/xrf/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "Analyzer is ready and idle"
     transitions:

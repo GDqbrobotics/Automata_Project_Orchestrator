@@ -3,12 +3,26 @@ name: raman
 display_name: Raman Spectrometer
 type: analyzer
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: true
 metadata:
   description: "Raman spectroscopy system for molecular analysis"
 
 states:
+  initializing:
+    description: "Spectrometer is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/raman/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "Spectrometer is ready and idle"
     transitions:

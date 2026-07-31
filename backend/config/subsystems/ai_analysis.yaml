@@ -3,12 +3,26 @@ name: ai_analysis
 display_name: AI Analysis
 type: computation
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: false
 metadata:
   description: "AI-based interest point extraction for measurement planning"
 
 states:
+  initializing:
+    description: "AI system is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/ai_analysis/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "AI system is ready and idle"
     transitions:

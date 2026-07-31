@@ -25,6 +25,7 @@ A state represents the current condition of either the workflow or a subsystem.
 - `error` – Workflow interrupted by error
 
 **Subsystem states** (varies per subsystem, examples):
+- `initializing` – Subsystem is initializing (all subsystems start here)
 - `ready` – Subsystem is idle and ready
 - `running` / `measuring` / `capturing` / `analyzing` / `uploading` – Subsystem actively performing work
 - `paused` – Subsystem temporarily suspended
@@ -45,6 +46,7 @@ An event is an external or internal trigger that causes a state machine to evalu
 - `reset_requested` – Operator resets after an error
 
 **Subsystem events** (varies per subsystem, examples):
+- `init_complete` – Initialization complete (initializing → ready)
 - `start` – Start working
 - `stop` – Stop working
 - `pause` / `resume` – Pause / resume
@@ -153,7 +155,8 @@ states:
 
 ### Subsystem state machines (`backend/config/subsystems/*.yaml`)
 
-Each subsystem YAML file defines both subsystem metadata and its state machine:
+Each subsystem YAML file defines both subsystem metadata and its state machine.
+All subsystems start in an `initializing` state and transition to `ready` when initialization completes.
 
 ```yaml
 # Subsystem metadata
@@ -161,7 +164,7 @@ name: rotating_platform
 display_name: Rotating Platform
 type: platform
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: true
 metadata:
   description: "Motorized rotary stage with transparent disks"
@@ -169,6 +172,20 @@ metadata:
 
 # State machine definition
 states:
+  initializing:
+    description: "Subsystem is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/rotating_platform/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "Subsystem is ready and idle"
     transitions:
@@ -239,17 +256,19 @@ states:
 
 ### Available subsystem YAML files
 
+All subsystems start in `initializing` state and transition to `ready` via `init_complete`.
+
 | File | Subsystem | Key states |
 |---|---|---|
-| `rotating_platform.yaml` | Rotating Platform | ready → running → paused → stopped → error |
-| `vision.yaml` | Vision System | ready → running → stopped → error |
-| `robot_first.yaml` | Robot Arm 1 | ready → tool_changing → running → paused → stopped → error |
-| `robot_second.yaml` | Robot Arm 2 | ready → running → paused → stopped → error |
-| `xrf.yaml` | XRF Analyzer | ready → measuring → stopped → error |
-| `raman.yaml` | Raman Spectrometer | ready → measuring → stopped → error |
-| `imaging_3di_hsi.yaml` | 3DI/HSI Imaging | ready → capturing → stopped → error |
-| `ai_analysis.yaml` | AI Analysis | ready → analyzing → stopped → error |
-| `cloud_database.yaml` | Cloud Database | ready → uploading → stopped → error |
+| `rotating_platform.yaml` | Rotating Platform | initializing → ready → running → paused → stopped → error |
+| `vision.yaml` | Vision System | initializing → ready → running → stopped → error |
+| `robot_first.yaml` | Robot Arm 1 | initializing → ready → tool_changing → running → paused → stopped → error |
+| `robot_second.yaml` | Robot Arm 2 | initializing → ready → running → paused → stopped → error |
+| `xrf.yaml` | XRF Analyzer | initializing → ready → measuring → stopped → error |
+| `raman.yaml` | Raman Spectrometer | initializing → ready → measuring → stopped → error |
+| `imaging_3di_hsi.yaml` | 3DI/HSI Imaging | initializing → ready → capturing → stopped → error |
+| `ai_analysis.yaml` | AI Analysis | initializing → ready → analyzing → stopped → error |
+| `cloud_database.yaml` | Cloud Database | initializing → ready → uploading → stopped → error |
 
 ## How the orchestrator manages state machines
 

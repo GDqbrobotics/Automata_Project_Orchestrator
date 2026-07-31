@@ -3,13 +3,27 @@ name: robot_second
 display_name: Robot Arm 2
 type: robot
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: true
 metadata:
   description: "Second Universal Robot arm – XRF/Raman measurement positioning"
   hardware: "UR5e with custom end effector"
 
 states:
+  initializing:
+    description: "Robot is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/robot_second/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "Robot is ready and idle"
     transitions:

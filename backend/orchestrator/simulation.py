@@ -99,50 +99,52 @@ class WorkflowSimulator:
         return list(self.orchestrator.adapters.keys())
 
     def _simulate_subsystems_ready(self) -> None:
-        """Simulate all subsystems becoming ready by driving their state machines."""
+        """Simulate all subsystems becoming ready by driving their state machines.
+
+        Each subsystem starts in 'initializing' state and must transition
+        to 'ready' via the 'init_complete' event.
+        """
         subsystem_names = self._get_subsystem_names()
 
+        # Phase 1: Initialize all subsystems (initializing -> ready)
+        logger.info("Simulation: Initializing all subsystems...")
         for name in subsystem_names:
             if not self._running:
                 return
 
             adapter = self.orchestrator.adapters.get(name)
             if adapter and adapter.state_machine:
-                # Drive the state machine to ready state
                 current = adapter.state_machine.current_state
-                if current != "ready":
-                    # Try to transition to ready
+                if current == "initializing":
                     try:
-                        # If in error state, fire reset
-                        if current == "error":
-                            adapter.fire_transition("reset")
-                        # If in stopped state, fire ready
-                        elif current == "stopped":
-                            adapter.fire_transition("ready")
-                        # If in running/paused, fire stop then ready
-                        elif current in ("running", "paused"):
-                            adapter.fire_transition("stop")
-                            time.sleep(0.05)
-                            adapter.fire_transition("ready")
+                        adapter.fire_transition("init_complete")
+                        logger.info("Simulation: subsystem %s initialized -> ready", name)
                     except Exception as exc:
-                        logger.warning("Failed to transition %s to ready: %s", name, exc)
+                        logger.warning("Failed to initialize %s: %s", name, exc)
 
-            # Publish status update
-            topic = f"automata/subsystem/{name}/status"
-            payload = {"state": "ready", "timestamp": time.time()}
-            self._publish_mqtt(topic, payload)
-            logger.info("Simulation: subsystem %s -> ready", name)
+                # Publish status update
+                topic = f"automata/subsystem/{name}/status"
+                payload = {"state": "ready", "timestamp": time.time()}
+                self._publish_mqtt(topic, payload)
 
-            # Update orchestrator's adapter state
-            if name in self.orchestrator.adapters:
-                self.orchestrator.adapters[name].update_state(SubsystemState.READY)
+                # Update orchestrator's adapter state
+                if name in self.orchestrator.adapters:
+                    self.orchestrator.adapters[name].update_state(SubsystemState.READY)
 
-            time.sleep(0.1)
+                time.sleep(0.1)
 
-        # Update orchestrator's subsystem states
-        for name in subsystem_names:
-            if name in self.orchestrator.adapters:
-                self.orchestrator.adapters[name].update_state(SubsystemState.READY)
+        # Phase 2: Simulate analysis for each object
+        logger.info("Simulation: All subsystems initialized, starting analysis...")
+        for i in range(self.num_objects):
+            if not self._running:
+                break
+            object_id = f"object_{i+1:03d}"
+            logger.info("Simulating analysis for %s", object_id)
+            self._simulate_object_analysis(object_id, i + 1, self.num_objects)
+
+        # Phase 3: Complete
+        if self._running:
+            self._simulate_completion()
 
     def _simulate_object_analysis(
         self,

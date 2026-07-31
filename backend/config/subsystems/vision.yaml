@@ -3,13 +3,27 @@ name: vision
 display_name: Vision System
 type: camera
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: true
 metadata:
   description: "RGB-D camera for object detection and ID creation"
   hardware: "Intel RealSense D455"
 
 states:
+  initializing:
+    description: "Camera is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/vision/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "Camera is ready and idle"
     transitions:

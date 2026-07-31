@@ -3,13 +3,27 @@ name: robot_first
 display_name: Robot Arm 1
 type: robot
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: true
 metadata:
   description: "First Universal Robot arm – pick-and-place and 3DI/HSI handling"
   hardware: "UR5e with custom end effector"
 
 states:
+  initializing:
+    description: "Robot is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/robot_first/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "Robot is ready and idle"
     transitions:

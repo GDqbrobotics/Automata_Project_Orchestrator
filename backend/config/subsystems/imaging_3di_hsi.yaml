@@ -3,12 +3,26 @@ name: imaging_3di_hsi
 display_name: 3DI/HSI Imaging
 type: imaging
 mqtt_topic: "automata/subsystem/{name}"
-initial_state: ready
+initial_state: initializing
 required: true
 metadata:
   description: "3D imaging and hyperspectral imaging modules"
 
 states:
+  initializing:
+    description: "Imaging system is initializing"
+    transitions:
+      - event: init_complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/imaging_3di_hsi/ready
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   ready:
     description: "Imaging system is ready and idle"
     transitions:

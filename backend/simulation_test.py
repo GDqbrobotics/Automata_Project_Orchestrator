@@ -409,6 +409,17 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
         "Orchestrator starts in 'idle' state",
     )
 
+    # Verify subsystems are created with 'initializing' as initial state
+    # The initialization phase will transition them to 'ready' during simulation
+    for name in ALL_SUBSYSTEMS:
+        adapter = runner.orchestrator.adapters.get(name)
+        if adapter and adapter.state_machine:
+            # State machine should be loaded with 'initializing' as initial state
+            results.check(
+                adapter.state_machine.config.initial_state == "initializing",
+                f"Subsystem '{name}' YAML defines 'initializing' as initial state",
+            )
+
     # ---- Phase 2: Operator starts workflow via GUI ----
     await ws_client.send_command("start_workflow")
     ack = await ws_client.receive()
