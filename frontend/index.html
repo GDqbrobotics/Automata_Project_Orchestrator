@@ -250,6 +250,59 @@
       margin-left: 2px;
     }
 
+    /* Object cards */
+    .object-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      text-align: center;
+    }
+
+    .object-name {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .object-state {
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 12px;
+      display: inline-block;
+      margin-bottom: 4px;
+      text-transform: lowercase;
+    }
+
+    .object-state.state-identified { background: var(--text-muted); color: #fff; }
+    .object-state.state-moving { background: var(--accent); color: #fff; }
+    .object-state.state-imaging { background: #7c4dff; color: #fff; }
+    .object-state.state-rotating { background: #00bcd4; color: #fff; }
+    .object-state.state-measuring { background: #ff5722; color: #fff; }
+    .object-state.state-analyzed { background: var(--success); color: #fff; }
+
+    .object-state-desc {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      font-style: italic;
+      min-height: 28px;
+    }
+
+    .object-progress {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      padding-top: 6px;
+      border-top: 1px solid var(--border);
+    }
+
+    .object-step { color: var(--accent); font-weight: 600; }
+    .object-transitions { opacity: 0.7; }
+
     /* Event log */
     .event-log {
       max-height: 260px;
@@ -367,6 +420,14 @@
           <div class="panel-header">Subsystems Status</div>
           <div class="panel-body">
             <div class="subsystem-grid" id="subsystemGrid"></div>
+          </div>
+        </div>
+
+        <!-- Objects panel -->
+        <div class="panel" style="margin-top: 20px;">
+          <div class="panel-header">Object Analysis Progress</div>
+          <div class="panel-body">
+            <div class="subsystem-grid" id="objectsGrid"></div>
           </div>
         </div>
 

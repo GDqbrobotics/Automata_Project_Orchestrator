@@ -52,6 +52,7 @@ export class App {
   private render(): void {
     this.updateStateBadge();
     this.updateProgress();
+    this.updateObjectsGrid();
     this.updateSubsystemGrid();
     this.updateActionButtons();
     this.updateConnectionIndicator();
@@ -174,6 +175,66 @@ export class App {
     }
 
     log.scrollTop = log.scrollHeight;
+  }
+
+  private updateObjectsGrid(): void {
+    const grid = document.getElementById('objectsGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    const objects = this.state.objects;
+    if (objects.length === 0) {
+      grid.innerHTML = '<div style="color: var(--text-muted); padding: 10px;">No objects tracked yet</div>';
+      return;
+    }
+
+    for (const obj of objects) {
+      const card = document.createElement('div');
+      card.className = 'object-card';
+
+      // Determine state class - map object states to color classes
+      let stateClass = 'state-identified';
+      if (obj.state === 'object_analyzed') {
+        stateClass = 'state-analyzed';
+      } else if (obj.state === 'moving_to_disk' || obj.state === 'moving_to_box') {
+        stateClass = 'state-moving';
+      } else if (obj.state === 'HSI_3DI_analysis') {
+        stateClass = 'state-imaging';
+      } else if (obj.state === 'XRF_RAMAN_analysis') {
+        stateClass = 'state-measuring';
+      } else if (obj.state === 'object_going_second_position' || obj.state === 'object_going_first_position') {
+        stateClass = 'state-rotating';
+      }
+
+      // Determine progress: count transitions completed
+      const transitionCount = obj.transitions.length;
+      const stateIndex = this._getObjectStateIndex(obj.state);
+
+      card.innerHTML = `
+        <div class="object-name">${obj.object_id}</div>
+        <div class="object-state ${stateClass}">${obj.state}</div>
+        <div class="object-state-desc">${obj.state_description || ''}</div>
+        <div class="object-progress">
+          <span class="object-step">Step ${stateIndex + 1} / 8</span>
+          <span class="object-transitions">${transitionCount} transitions</span>
+        </div>
+      `;
+      grid.appendChild(card);
+    }
+  }
+
+  private _getObjectStateIndex(state: string): number {
+    const stateOrder = [
+      'identified_in_box',
+      'moving_to_disk',
+      'HSI_3DI_analysis',
+      'object_going_second_position',
+      'XRF_RAMAN_analysis',
+      'object_going_first_position',
+      'moving_to_box',
+      'object_analyzed',
+    ];
+    return stateOrder.indexOf(state);
   }
 
   // Public API for binding buttons

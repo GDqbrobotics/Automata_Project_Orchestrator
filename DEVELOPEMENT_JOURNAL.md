@@ -120,6 +120,63 @@ Major architectural change: each subsystem now has its own YAML file with a decl
 
 ### Simulation test suite rewritten & fixed (2026-07-31)
 
+### Per-object state machines (2026-07-31)
+
+Major architectural change: each analyzed object now has its own YAML-driven state machine instance that tracks the detailed analysis cycle from identification to completion.
+
+**New files**:
+- `backend/config/object.yaml` – Blueprint defining the 8-state per-object analysis workflow
+- `backend/orchestrator/object_state_machines.py` – `ObjectStateMachines` manager: creates/destroys instances, persists state to JSON files, fires transitions, notifies orchestrator
+
+**Backend changes**:
+- `ObjectStateMachines` class manages per-object state machine instances
+- Each object gets a `StateMachineEngine` loaded from `object.yaml` blueprint
+- Object state is persisted to `backend/object_states/{object_id}.json` (survives restarts)
+- `WorkflowOrchestrator` integrates `ObjectStateMachines` with new methods:
+  - `create_object(object_id)` – creates an object instance and notifies frontend
+  - `remove_object(object_id)` – removes an object instance
+  - `fire_object_transition(object_id, event)` – fires a transition on the object's state machine
+  - `_on_object_state_change()` – callback for object state changes
+  - `_broadcast_objects()` – broadcasts object list to frontend
+- Simulation now creates objects and drives their full 8-state analysis pipeline
+- New domain models: `ObjectState` enum, `ObjectInfo` dataclass, new `BackendEvent` types
+
+**Frontend changes**:
+- `ObjectInfo` interface added to contracts
+- New `object_state_changed`, `object_added`, `object_removed` event types
+- `UiState` now tracks `objects: ObjectInfo[]`
+- `reduceState()` handles object events and updates the object list
+- `updateObjectsGrid()` renders object cards with state, step number, and transition count
+- CSS styles added for object card states (identified, moving, imaging, rotating, measuring, analyzed)
+- New "Object Analysis Progress" panel in the UI
+
+**Simulation changes**:
+- Simulation now creates an object for each item to analyze
+- Maps subsystem completions to object events (e.g., `imaging_capture_complete` from 3DI/HSI subsystem)
+- Drives each object through the full 8-state pipeline
+- Tests 8-10 added: config validation, transition testing with persistence, orchestrator integration
+
+**Test results**: 108 tests passing (was 43)
+
+### Object workflow states
+
+The per-object state machine follows this sequence:
+
+```
+identified_in_box
+    → object_picked → moving_to_disk
+    → object_placed_on_disk → HSI_3DI_analysis
+    → imaging_capture_complete → object_going_second_position
+    → platform_rotated_to_second → XRF_RAMAN_analysis
+    → measurements_complete → object_going_first_position
+    → platform_rotated_to_first → moving_to_box
+    → object_returned_to_box → object_analyzed (final)
+```
+
+Events are driven by subsystem completions. For example, when the 3DI/HSI imaging subsystem finishes capturing, it fires `imaging_capture_complete` on the object state machine, advancing it from `HSI_3DI_analysis` to `object_going_second_position`.
+
+### Subsystem configuration via YAML
+
 ### Subsystem configuration via YAML
 
 Subsystems are now fully configurable through `backend/config/subsystems.yaml`:
@@ -137,15 +194,11 @@ To add a new subsystem, simply add an entry to `subsystems.yaml`. The system wil
 
 ## Next steps
 
-### 1. Extended workflow logic (sub-workflow engine)
-The current state machine handles high-level workflow states. The next layer is the **sub-workflow** engine that coordinates the detailed analysis cycle per object:
-- 3DI/HSI imaging acquisition
-- AI interest point extraction
-- XRF/Raman puntual measurements at extracted points
-- Cloud data upload per object
+### 1. Extended workflow logic (sub-workflow engine) ✅
+Per-object state machines are now implemented. Each object has its own YAML-driven state machine (`backend/config/object.yaml`) with full lifecycle tracking and disk persistence.
 
-### 2. Configuration-driven sub-workflows
-Move the per-object analysis sequence (pick → 3DI → HSI → AI → rotate → XRF → Raman → rotate → return) into a separate YAML configuration, making the full pipeline configurable without code changes.
+### 2. Configuration-driven sub-workflows ✅
+The per-object analysis sequence is now fully configurable via `object.yaml`. No code changes needed to modify the pipeline.
 
 ### 3. MQTT integration with real subsystems
 Wire the orchestrator's MQTT message dispatcher so that real subsystems (via their Docker/ROS2 nodes) can publish status updates on `automata/subsystem/{name}/status` and receive commands on `automata/subsystem/{name}/command`.
@@ -161,8 +214,9 @@ Wire the orchestrator's MQTT message dispatcher so that real subsystems (via the
 - Add linting (ruff, mypy for Python; eslint, prettier for TypeScript)
 - Add Docker compose setup for orchestrator + mosquitto + frontend
 
-### 6. Enhanced UI
+### 6. Enhanced UI (partially done)
+- ✅ Add object cards panel showing per-object analysis progress
 - Implement alias ID assignment endpoint on the backend
-- Add detailed object information panel
+- Add detailed object information panel (expandable object cards)
 - Add alarm/notification system for operator warnings
 - Add data export functionality

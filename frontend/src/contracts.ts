@@ -12,7 +12,10 @@ export type WorkflowEvent =
   | 'subsystem_status_updated'
   | 'subsystem_state_changed'
   | 'error_reported'
-  | 'progress_updated';
+  | 'progress_updated'
+  | 'object_state_changed'
+  | 'object_added'
+  | 'object_removed';
 
 export type WorkflowStateType =
   | 'idle'
@@ -56,6 +59,15 @@ export interface SubsystemConfig {
   metadata: Record<string, unknown>;
 }
 
+export interface ObjectInfo {
+  object_id: string;
+  state: string;
+  state_description: string;
+  created: string;
+  last_state_change: string;
+  transitions: Array<{ from: string; to: string; event: string; timestamp: string }>;
+}
+
 export interface FrontendMessage {
   type?: string;
   command?: WorkflowCommand;
@@ -66,4 +78,5 @@ export interface FrontendMessage {
   message?: string;
   details?: Record<string, unknown>;
   subsystems?: SubsystemConfig[];
+  objects?: ObjectInfo[];
 }

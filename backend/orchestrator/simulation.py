@@ -152,10 +152,15 @@ class WorkflowSimulator:
         """Simulate the analysis of a single object.
 
         Drives each subsystem's state machine through its transitions
-        to simulate realistic behavior.
+        to simulate realistic behavior, and fires corresponding
+        object state machine transitions.
         """
         self.orchestrator.set_current_object(object_id)
         self.orchestrator.set_total_objects(total)
+
+        # Create the object state machine
+        self.orchestrator.create_object(object_id)
+        time.sleep(0.1)
 
         # Get ordered list of subsystems to simulate
         required_names = self.orchestrator.required_subsystem_names
@@ -164,6 +169,19 @@ class WorkflowSimulator:
             if name not in required_names
         ]
         ordered_subsystems = required_names + optional_names
+
+        # Subsystem -> object event mapping
+        # Maps subsystem names to the object event that fires when they complete
+        subsystem_event_map = {
+            "vision": "object_picked",
+            "robot_first": None,  # Handled separately below
+            "imaging_3di_hsi": "imaging_capture_complete",
+            "rotating_platform": None,  # Handled separately below
+            "xrf": "measurements_complete",
+            "raman": "measurements_complete",
+            "ai_analysis": "measurements_complete",
+            "cloud_database": None,
+        }
 
         for subsystem_name in ordered_subsystems:
             if not self._running:
@@ -261,6 +279,42 @@ class WorkflowSimulator:
             is_required = subsystem_name in required_names
             delay = random.uniform(0.3, 0.6) if is_required else random.uniform(0.1, 0.3)
             time.sleep(delay)
+
+            # Fire the corresponding object state transition
+            obj_event = subsystem_event_map.get(subsystem_name)
+            if obj_event:
+                # Special handling: robot_first handles multiple transitions
+                if subsystem_name == "robot_first":
+                    # Check current object state to determine next event
+                    obj_state = self.orchestrator.object_manager.get_object_state(object_id)
+                    if obj_state == "identified_in_box":
+                        # Robot first picks up the object
+                        self.orchestrator.fire_object_transition(object_id, "object_picked")
+                        time.sleep(0.1)
+                        # Robot first places it on the disk
+                        self.orchestrator.fire_object_transition(object_id, "object_placed_on_disk")
+                        time.sleep(0.1)
+                    elif obj_state in ("XRF_RAMAN_analysis", "object_going_first_position"):
+                        # Robot first returns the object to the box
+                        self.orchestrator.fire_object_transition(object_id, "object_returned_to_box")
+                        time.sleep(0.1)
+                elif subsystem_name == "rotating_platform":
+                    # Check current object state to determine rotation direction
+                    obj_state = self.orchestrator.object_manager.get_object_state(object_id)
+                    if obj_state == "HSI_3DI_analysis":
+                        # Rotate to second position for measurements
+                        self.orchestrator.fire_object_transition(object_id, "platform_rotated_to_second")
+                        time.sleep(0.1)
+                    elif obj_state == "XRF_RAMAN_analysis":
+                        # Rotate back to first position
+                        self.orchestrator.fire_object_transition(object_id, "platform_rotated_to_first")
+                        time.sleep(0.1)
+                elif subsystem_name == "cloud_database":
+                    # Cloud upload is the final step
+                    self.orchestrator.fire_object_transition(object_id, "measurements_complete")
+                    time.sleep(0.1)
+                else:
+                    self.orchestrator.fire_object_transition(object_id, obj_event)
 
         # Update progress
         self.orchestrator._progress = current

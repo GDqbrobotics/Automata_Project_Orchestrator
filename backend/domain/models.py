@@ -26,6 +26,17 @@ class SubsystemState(str, enum.Enum):
     ERROR = "error"
 
 
+class ObjectState(str, enum.Enum):
+    IDENTIFIED = "identified_in_box"
+    MOVING_TO_DISK = "moving_to_disk"
+    HSI_3DI_ANALYSIS = "HSI_3DI_analysis"
+    GOING_SECOND_POSITION = "object_going_second_position"
+    XRF_RAMAN_ANALYSIS = "XRF_RAMAN_analysis"
+    GOING_FIRST_POSITION = "object_going_first_position"
+    MOVING_TO_BOX = "moving_to_box"
+    ANALYZED = "object_analyzed"
+
+
 class WorkflowCommand(str, enum.Enum):
     START_WORKFLOW = "start_workflow"
     PAUSE_WORKFLOW = "pause_workflow"
@@ -48,6 +59,9 @@ class BackendEvent(str, enum.Enum):
     SUBSYSTEM_STATE_CHANGED = "subsystem_state_changed"
     ERROR_REPORTED = "error_reported"
     PROGRESS_UPDATED = "progress_updated"
+    OBJECT_STATE_CHANGED = "object_state_changed"
+    OBJECT_ADDED = "object_added"
+    OBJECT_REMOVED = "object_removed"
 
 
 @dataclass
@@ -129,12 +143,35 @@ class EventPayload:
 
 
 @dataclass
+class ObjectInfo:
+    """Runtime info about an analyzed object."""
+
+    object_id: str = ""
+    state: str = "identified_in_box"
+    state_description: str = ""
+    created: str = ""
+    last_state_change: str = ""
+    transitions: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "object_id": self.object_id,
+            "state": self.state,
+            "state_description": self.state_description,
+            "created": self.created,
+            "last_state_change": self.last_state_change,
+            "transitions": self.transitions,
+        }
+
+
+@dataclass
 class WorkflowStatus:
     state: WorkflowState
     total_objects: int = 0
     progress: int = 0
     current_object: Optional[str] = None
     active_subsystems: Dict[str, SubsystemInfo] = field(default_factory=dict)
+    objects: List[ObjectInfo] = field(default_factory=list)
     error: Optional[str] = None
     last_update: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -148,6 +185,7 @@ class WorkflowStatus:
                 name: info.to_dict()
                 for name, info in self.active_subsystems.items()
             },
+            "objects": [obj.to_dict() for obj in self.objects],
             "error": self.error,
             "last_update": self.last_update,
         }

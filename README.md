@@ -28,15 +28,17 @@ The wider AUTOMATA project includes robotics, imaging systems, analyzers, AI pro
 └──────────────────┘     └──────────────────────────┘     └─────────────────┘
 ```
 
-The system is built on three pillars:
+The system is built on four pillars:
 
 1. **Declarative state machine** – All workflow behavior is defined in a YAML configuration file (`backend/config/workflow.yaml`). States, transitions, events, and actions are externalized and easily extensible.
 
 2. **Declarative subsystem configuration** – Each subsystem has its own YAML file in `backend/config/subsystems/` (e.g., `rotating_platform.yaml`, `vision.yaml`). Each file defines both subsystem metadata (name, type, required, metadata) and a complete state machine (states, transitions, events, actions). The orchestrator dynamically creates adapters with per-subsystem state machines and the frontend renders cards showing current subsystem state.
 
-3. **MQTT communication** – The orchestrator communicates with all external subsystems (vision, robots, analyzers, AI, cloud) via MQTT topics. Subsystem adapters wrap each hardware/software component with a consistent API.
+3. **Declarative per-object sub-workflows** – Each analyzed object has its own YAML-driven state machine (`backend/config/object.yaml`) that tracks the detailed analysis cycle from identification to completion. Object states are persisted to disk and the frontend renders cards showing per-object progress.
 
-4. **Thin frontend** – The TypeScript UI is purely declarative: it renders state, captures operator actions, and displays logs. All business logic lives in the Python backend.
+4. **MQTT communication** – The orchestrator communicates with all external subsystems (vision, robots, analyzers, AI, cloud) via MQTT topics. Subsystem adapters wrap each hardware/software component with a consistent API.
+
+5. **Thin frontend** – The TypeScript UI is purely declarative: it renders state, captures operator actions, and displays logs. All business logic lives in the Python backend.
 
 ## Current status
 
@@ -50,14 +52,15 @@ A working prototype is complete with integrated frontend, backend, and simulatio
 | Subsystem config | ✅ Complete | Per-subsystem YAML files with state machine definitions |
 | Subsystem state machines | ✅ Complete | Each subsystem has its own state machine (ready, running, error, etc.) |
 | Subsystem adapters | ✅ Dynamic | Adapters with per-subsystem state machines – add new subsystems by adding YAML |
+| Object state machines | ✅ Complete | Per-object YAML-driven analysis workflows with disk persistence |
 | Workflow | ✅ Complete | Orchestrator with start/pause/resume/stop/error/recovery |
 | MQTT messaging | ✅ Complete | Publish/subscribe with topic routing to configured subsystems |
-| Domain models | ✅ Complete | Typed dataclasses for workflow, subsystems, events |
-| Frontend UI | ✅ Complete | Real-time state display, progress bar, dynamic subsystem cards with state descriptions, event log |
+| Domain models | ✅ Complete | Typed dataclasses for workflow, subsystems, objects, events |
+| Frontend UI | ✅ Complete | Real-time state display, progress bar, subsystem cards, object cards, event log |
 | WebSocket server | ✅ Complete | Frontend-backend communication |
-| Simulation mode | ✅ Complete | Simulates all configured subsystems responding to GUI commands |
+| Simulation mode | ✅ Complete | Simulates all configured subsystems and object analysis pipelines |
 | Unified launch | ✅ Complete | Single command to start frontend + backend + simulation |
-| Test suite | ✅ Complete | 43 passing tests: state machine, workflow, MQTT, error recovery, subsystem state machines |
+| Test suite | ✅ Complete | 108 passing tests covering all state machines, workflow, MQTT, objects, and integration |
 
 ## Subsystem configuration
 
@@ -159,6 +162,111 @@ When a subsystem's state machine transitions, the change is:
 2. Broadcast to the frontend via WebSocket
 3. Displayed in the subsystem card with a state description
 
+### Object configuration
+
+Each analyzed object follows a declarative sub-workflow defined in `backend/config/object.yaml`. When the vision system identifies an object (or in simulation), the orchestrator creates a state machine instance for it:
+
+```yaml
+name: object_analysis_workflow
+initial_state: identified_in_box
+
+states:
+  identified_in_box:
+    description: Object has been identified in the box by the vision system
+    transitions:
+      - event: object_picked
+        target: moving_to_disk
+        actions:
+          - log_event
+
+  moving_to_disk:
+    description: Object is being moved from the box to the rotating platform disk
+    transitions:
+      - event: object_placed_on_disk
+        target: HSI_3DI_analysis
+        actions:
+          - log_event
+          - update_operator_ui
+
+  HSI_3DI_analysis:
+    description: 3D imaging and hyperspectral imaging capture is being performed
+    transitions:
+      - event: imaging_capture_complete
+        target: object_going_second_position
+        actions:
+          - log_event
+          - publish_mqtt_message: object/imaging_complete
+
+  object_going_second_position:
+    description: Rotating platform is moving the object to the second measurement position
+    transitions:
+      - event: platform_rotated_to_second
+        target: XRF_RAMAN_analysis
+        actions:
+          - log_event
+          - publish_mqtt_message: object/rotated_second
+
+  XRF_RAMAN_analysis:
+    description: XRF and Raman puntual measurements are being performed at AI-extracted points
+    transitions:
+      - event: measurements_complete
+        target: object_going_first_position
+        actions:
+          - log_event
+          - publish_mqtt_message: object/measurements_complete
+
+  object_going_first_position:
+    description: Rotating platform is moving the object back to the first position
+    transitions:
+      - event: platform_rotated_to_first
+        target: moving_to_box
+        actions:
+          - log_event
+          - publish_mqtt_message: object/rotated_first
+
+  moving_to_box:
+    description: Object is being moved from the disk back to its original position in the box
+    transitions:
+      - event: object_returned_to_box
+        target: object_analyzed
+        actions:
+          - log_event
+          - update_operator_ui
+          - publish_mqtt_message: object/returned_to_box
+
+  object_analyzed:
+    description: Object analysis is complete – data will be uploaded to the cloud database
+```
+
+**Object lifecycle**:
+1. Vision system identifies an object → `orchestrator.create_object(object_id)`
+2. Subsystem events trigger object transitions (e.g., `imaging_capture_complete`)
+3. Each transition is persisted to `backend/object_states/{object_id}.json`
+4. Object reaches `object_analyzed` → progress counter increments
+5. State survives orchestrator restarts via disk persistence
+
+**Frontend object cards** show:
+- **Object ID**
+- **Current analysis phase** (color-coded badge)
+- **State description**
+- **Step number** (e.g., "Step 3 / 8")
+- **Transition count**
+
+### Object state machine events
+
+Events are driven by subsystem completions:
+
+| Subsystem | Event fired on object |
+|---|---|
+| Vision system | `object_picked` |
+| Robot arm 1 (pick & place) | `object_picked`, `object_placed_on_disk` |
+| 3DI/HSI imaging | `imaging_capture_complete` |
+| Rotating platform (to second) | `platform_rotated_to_second` |
+| XRF + Raman + AI analysis | `measurements_complete` |
+| Rotating platform (to first) | `platform_rotated_to_first` |
+| Robot arm 1 (return) | `object_returned_to_box` |
+| Cloud database (upload) | `measurements_complete` (final) |
+
 ## How to run
 
 ### Prerequisites
@@ -206,7 +314,7 @@ npm run dev
 ### Testing
 
 ```bash
-# Run simulation tests (43 tests, validates full workflow)
+# Run simulation tests (108 tests, validates full workflow)
 cd backend
 python simulation_test.py
 
@@ -222,6 +330,9 @@ python simulation_test.py --num-objects 5
 - Error recovery (error → idle transitions)
 - Subsystem state machine transitions
 - Subsystem YAML configuration loading
+- Object state machine configuration and transitions
+- Object state persistence to disk
+- Object orchestrator integration
 
 ## Development
 

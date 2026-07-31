@@ -30,6 +30,7 @@ from backend.domain.models import (
     BackendEvent,
     Command,
     EventPayload,
+    ObjectInfo,
     SubsystemConfig,
     SubsystemInfo,
     WorkflowCommand,
@@ -39,6 +40,7 @@ from backend.domain.models import (
 from backend.messaging.mqtt_client import MqttClient, TOPIC_SUBSYSTEM
 from backend.services.frontend_server import FrontendServer
 from backend.state.state_machine import StateMachineEngine, StateMachineError
+from backend.orchestrator.object_state_machines import ObjectStateMachines
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,16 @@ class WorkflowOrchestrator:
         self._progress = 0
         self._current_object: Optional[str] = None
         self._lock = threading.Lock()
+
+        # Object state machines (per-object analysis workflows)
+        object_config_path = Path(__file__).resolve().parent.parent / "config" / "object.yaml"
+        object_storage_dir = Path(__file__).resolve().parent.parent / "object_states"
+        self.object_manager = ObjectStateMachines(
+            config_path=object_config_path,
+            storage_dir=object_storage_dir,
+        )
+        # Register callback for object state changes
+        self.object_manager.on_change(self._on_object_state_change)
 
         # Simulation mode
         self._use_simulation = use_simulation
@@ -349,6 +361,103 @@ class WorkflowOrchestrator:
         self.frontend.broadcast_status(self._status)
 
     # ------------------------------------------------------------------
+    # Object state machine management
+    # ------------------------------------------------------------------
+    def create_object(self, object_id: str) -> None:
+        """Create a new object state machine instance.
+
+        Called when the vision system identifies a new object, or when
+        the simulation generates an object for analysis.
+        """
+        with self._lock:
+            self.object_manager.create_object(object_id)
+
+        logger.info("Created object state machine: %s", object_id)
+
+        self._fire_frontend_event(
+            BackendEvent.OBJECT_ADDED.value,
+            {
+                "object_id": object_id,
+                "state": "identified_in_box",
+                "state_description": "Object has been identified in the box",
+            },
+        )
+        self._broadcast_objects()
+
+    def remove_object(self, object_id: str) -> None:
+        """Remove an object state machine instance."""
+        with self._lock:
+            self.object_manager.remove_object(object_id)
+
+        logger.info("Removed object state machine: %s", object_id)
+
+        self._fire_frontend_event(
+            BackendEvent.OBJECT_REMOVED.value,
+            {"object_id": object_id},
+        )
+        self._broadcast_objects()
+
+    def fire_object_transition(self, object_id: str, event: str) -> Optional[str]:
+        """Fire a transition on an object's state machine.
+
+        This is called when subsystem events indicate an object should
+        advance to the next phase of analysis.
+
+        Args:
+            object_id: The object to transition.
+            event: The event name (e.g., "object_placed_on_disk").
+
+        Returns:
+            The new state name, or None if the transition failed.
+        """
+        with self._lock:
+            new_state = self.object_manager.fire_transition(object_id, event)
+
+        if new_state:
+            self._fire_frontend_event(
+                BackendEvent.OBJECT_STATE_CHANGED.value,
+                {
+                    "object_id": object_id,
+                    "new_state": new_state,
+                },
+            )
+            self._broadcast_objects()
+
+            # Check if the object has reached the final state
+            if new_state == "object_analyzed":
+                logger.info("Object '%s' analysis complete", object_id)
+                # Update progress
+                self._progress = len(self.object_manager.get_object_ids())
+                self._fire_frontend_event(
+                    BackendEvent.PROGRESS_UPDATED.value,
+                    {
+                        "progress": self._progress,
+                        "total": self._total_objects,
+                    },
+                )
+
+        return new_state
+
+    def _on_object_state_change(self, object_id: str, new_state: str, event: str) -> None:
+        """Callback for object state machine transitions."""
+        logger.info(
+            "Object '%s' state change: %s -> %s (event: %s)",
+            object_id, self.object_manager.get_object_state(object_id),
+            new_state, event,
+        )
+
+    def _broadcast_objects(self) -> None:
+        """Broadcast the current list of objects to the frontend."""
+        with self._lock:
+            objects_info = self.object_manager.get_all_objects_info()
+
+        self._fire_frontend_event(
+            BackendEvent.WORKFLOW_STATE_CHANGED.value,
+            {"objects": objects_info},
+        )
+        self.frontend.broadcast_status(self._status)
+
+    # ------------------------------------------------------------------
     # MQTT message dispatcher
     # ------------------------------------------------------------------
     def _on_mqtt_message(self, topic: str, payload: bytes) -> None:
@@ -528,6 +637,19 @@ class WorkflowOrchestrator:
         self.frontend.broadcast(payload)
 
     def _get_status(self) -> WorkflowStatus:
+        # Update objects list in the status
+        with self._lock:
+            self._status.objects = [
+                ObjectInfo(
+                    object_id=obj["object_id"],
+                    state=obj["state"],
+                    state_description=obj.get("state_description", ""),
+                    created=obj.get("created", ""),
+                    last_state_change=obj.get("last_state_change", ""),
+                    transitions=obj.get("transitions", []),
+                )
+                for obj in self.object_manager.get_all_objects_info()
+            ]
         return self._status
 
     # ------------------------------------------------------------------

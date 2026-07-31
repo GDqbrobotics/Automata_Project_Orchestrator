@@ -52,7 +52,7 @@ from backend.adapters.subsystem import (
     ROBOT_SECOND,
     CLOUD_DB,
 )
-from backend.domain.models import WorkflowState, SubsystemState
+from backend.domain.models import WorkflowState, SubsystemState, ObjectState
 from backend.messaging.mqtt_client import (
     TOPIC_COMMAND,
     TOPIC_STATUS,
@@ -60,6 +60,7 @@ from backend.messaging.mqtt_client import (
 )
 from backend.orchestrator.workflow import WorkflowOrchestrator
 from backend.state.state_machine import StateMachineEngine, StateMachineError
+from backend.orchestrator.object_state_machines import ObjectStateMachines
 
 # ---------------------------------------------------------------------------
 # Test configuration
@@ -842,6 +843,284 @@ def test_subsystem_config() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 8: Object state machine configuration
+# ---------------------------------------------------------------------------
+def test_object_state_machine_config() -> None:
+    """Test: Validate the object state machine configuration loads correctly."""
+    logger.info("--- TEST 8: Object State Machine Configuration ---")
+
+    config_path = Path(__file__).resolve().parent / "config" / "object.yaml"
+    assert config_path.exists(), f"Object config file not found: {config_path}"
+
+    # Load the object state machine engine
+    manager = ObjectStateMachines(config_path)
+
+    results.check(
+        manager.config.name == "object_analysis_workflow",
+        "Object workflow has correct name",
+    )
+    results.check(
+        manager.config.initial_state == "identified_in_box",
+        "Object workflow initial state is 'identified_in_box'",
+    )
+
+    # Verify known states exist
+    expected_states = [
+        "identified_in_box",
+        "moving_to_disk",
+        "HSI_3DI_analysis",
+        "object_going_second_position",
+        "XRF_RAMAN_analysis",
+        "object_going_first_position",
+        "moving_to_box",
+        "object_analyzed",
+    ]
+    for state in expected_states:
+        results.check(
+            state in manager.config.states,
+            f"State '{state}' is defined in object config",
+        )
+
+    # Verify transitions have valid events and targets
+    expected_transitions = {
+        "identified_in_box": "object_picked",
+        "moving_to_disk": "object_placed_on_disk",
+        "HSI_3DI_analysis": "imaging_capture_complete",
+        "object_going_second_position": "platform_rotated_to_second",
+        "XRF_RAMAN_analysis": "measurements_complete",
+        "object_going_first_position": "platform_rotated_to_first",
+        "moving_to_box": "object_returned_to_box",
+    }
+    for state, expected_event in expected_transitions.items():
+        transitions = manager.config.states[state].transitions
+        events = [t.event for t in transitions]
+        results.check(
+            expected_event in events,
+            f"State '{state}' has transition event '{expected_event}'",
+        )
+        # Verify target state exists
+        for t in transitions:
+            if t.event == expected_event:
+                results.check(
+                    t.target in manager.config.states,
+                    f"Transition from '{state}' to '{t.target}' has valid target",
+                )
+
+    # Verify final state has no transitions
+    final_transitions = manager.config.states["object_analyzed"].transitions
+    results.check(
+        len(final_transitions) == 0,
+        "Final state 'object_analyzed' has no transitions",
+    )
+
+    logger.info("Object state machine configuration test complete.\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Object state machine transitions
+# ---------------------------------------------------------------------------
+def test_object_state_machine_transitions() -> None:
+    """Test: Verify object state machines transition correctly."""
+    logger.info("--- TEST 9: Object State Machine Transitions ---")
+
+    config_path = Path(__file__).resolve().parent / "config" / "object.yaml"
+    manager = ObjectStateMachines(config_path)
+
+    # Create an object
+    manager.create_object("test_object_001")
+    results.check(
+        manager.get_object_state("test_object_001") == "identified_in_box",
+        "Object starts in 'identified_in_box' state",
+    )
+
+    # Get available transitions
+    available = manager.get_available_transitions("test_object_001")
+    results.check(
+        "object_picked" in available,
+        "Available transition from 'identified_in_box' is 'object_picked'",
+    )
+
+    # Fire transitions through the entire workflow
+    transition_sequence = [
+        ("object_picked", "moving_to_disk"),
+        ("object_placed_on_disk", "HSI_3DI_analysis"),
+        ("imaging_capture_complete", "object_going_second_position"),
+        ("platform_rotated_to_second", "XRF_RAMAN_analysis"),
+        ("measurements_complete", "object_going_first_position"),
+        ("platform_rotated_to_first", "moving_to_box"),
+        ("object_returned_to_box", "object_analyzed"),
+    ]
+
+    for event, expected_state in transition_sequence:
+        new_state = manager.fire_transition("test_object_001", event)
+        results.check(
+            new_state == expected_state,
+            f"Transition '{event}' -> '{expected_state}' (got '{new_state}')",
+        )
+
+    # Verify final state
+    results.check(
+        manager.get_object_state("test_object_001") == "object_analyzed",
+        "Object reaches 'object_analyzed' final state",
+    )
+
+    # Verify no transitions available from final state
+    final_available = manager.get_available_transitions("test_object_001")
+    results.check(
+        len(final_available) == 0,
+        "No transitions available from 'object_analyzed' state",
+    )
+
+    # Verify persistence - state should be saved to disk
+    state_file = manager._object_state_file("test_object_001")
+    results.check(
+        state_file.exists(),
+        "Object state persisted to disk",
+    )
+
+    # Create a new manager and verify state is loaded from disk
+    manager2 = ObjectStateMachines(config_path)
+    results.check(
+        manager2.get_object_state("test_object_001") == "object_analyzed",
+        "Object state restored from disk after manager restart",
+    )
+
+    # Test invalid transition
+    result = manager.fire_transition("test_object_001", "invalid_event")
+    results.check(
+        result is None,
+        "Invalid transition returns None",
+    )
+
+    # Test non-existent object
+    result = manager.fire_transition("nonexistent", "object_picked")
+    results.check(
+        result is None,
+        "Transition on non-existent object returns None",
+    )
+
+    # Get object info
+    obj_info = manager.get_object_info("test_object_001")
+    results.check(
+        obj_info is not None,
+        "Object info is retrievable",
+    )
+    if obj_info:
+        results.check(
+            obj_info["object_id"] == "test_object_001",
+            "Object info contains correct object_id",
+        )
+        results.check(
+            len(obj_info["transitions"]) == 7,
+            "Object info contains 7 transition records",
+        )
+
+    # Create a second object
+    manager.create_object("test_object_002")
+    all_objects = manager.get_object_ids()
+    results.check(
+        "test_object_001" in all_objects and "test_object_002" in all_objects,
+        "Multiple objects tracked",
+    )
+
+    # Remove an object
+    manager.remove_object("test_object_002")
+    all_objects = manager.get_object_ids()
+    results.check(
+        "test_object_002" not in all_objects,
+        "Object removed from tracking",
+    )
+
+    # Cleanup
+    import shutil
+    shutil.rmtree(manager.storage_dir, ignore_errors=True)
+
+    logger.info("Object state machine transitions test complete.\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Object state machine in orchestrator integration
+# ---------------------------------------------------------------------------
+async def test_object_in_orchestrator() -> None:
+    """Test: Verify object state machines work in the orchestrator."""
+    logger.info("--- TEST 10: Object in Orchestrator Integration ---")
+
+    runner = OrchestratorRunner(
+        CONFIG_PATH,
+        SUBSYSTEMS_CONFIG_DIR,
+        use_simulation=False,
+    )
+    runner.start()
+
+    # Verify object manager is initialized
+    results.check(
+        hasattr(runner.orchestrator, 'object_manager'),
+        "Orchestrator has object_manager attribute",
+    )
+
+    # Create an object via orchestrator
+    runner.orchestrator.create_object("orch_test_001")
+    time.sleep(0.2)
+
+    results.check(
+        "orch_test_001" in runner.orchestrator.object_manager.get_object_ids(),
+        "Object created via orchestrator",
+    )
+
+    # Verify initial state
+    state = runner.orchestrator.object_manager.get_object_state("orch_test_001")
+    results.check(
+        state == "identified_in_box",
+        "Object created via orchestrator starts in 'identified_in_box'",
+    )
+
+    # Fire a transition via orchestrator
+    new_state = runner.orchestrator.fire_object_transition(
+        "orch_test_001", "object_picked"
+    )
+    results.check(
+        new_state == "moving_to_disk",
+        "Object transition via orchestrator: identified_in_box -> moving_to_disk",
+    )
+
+    # Fire complete sequence via orchestrator
+    transition_sequence = [
+        ("object_placed_on_disk", "HSI_3DI_analysis"),
+        ("imaging_capture_complete", "object_going_second_position"),
+        ("platform_rotated_to_second", "XRF_RAMAN_analysis"),
+        ("measurements_complete", "object_going_first_position"),
+        ("platform_rotated_to_first", "moving_to_box"),
+        ("object_returned_to_box", "object_analyzed"),
+    ]
+
+    for event, expected_state in transition_sequence:
+        new_state = runner.orchestrator.fire_object_transition("orch_test_001", event)
+        results.check(
+            new_state == expected_state,
+            f"Orchestrator transition: {event} -> {expected_state}",
+        )
+
+    # Verify object is analyzed
+    final_state = runner.orchestrator.object_manager.get_object_state("orch_test_001")
+    results.check(
+        final_state == "object_analyzed",
+        "Object reaches 'object_analyzed' via orchestrator",
+    )
+
+    # Verify status includes objects
+    status = runner.orchestrator._get_status()
+    results.check(
+        len(status.objects) >= 1,
+        f"Status includes {len(status.objects)} object(s)",
+    )
+
+    # Cleanup
+    runner.stop()
+
+    logger.info("Object orchestrator integration test complete.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def run_all_tests(num_objects: int = 3) -> bool:
@@ -871,6 +1150,12 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         await test_subsystem_state_machine()
         time.sleep(1)
         test_subsystem_config()
+        time.sleep(1)
+        test_object_state_machine_config()
+        time.sleep(1)
+        test_object_state_machine_transitions()
+        time.sleep(1)
+        await test_object_in_orchestrator()
 
     except Exception as exc:
         logger.error("Test suite error: %s", exc, exc_info=True)

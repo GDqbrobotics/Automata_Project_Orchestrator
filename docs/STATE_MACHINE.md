@@ -4,11 +4,13 @@ This document describes the state-machine configuration used by the AUTOMATA GUI
 
 ## Overview
 
-The system uses **two levels** of state machines, both driven by declarative YAML configuration:
+The system uses **three levels** of state machines, all driven by declarative YAML configuration:
 
 1. **Workflow state machine** – Manages the high-level workflow lifecycle (idle → starting → running → paused → stopping → stopped → error). Defined in `backend/config/workflow.yaml`.
 
 2. **Subsystem state machines** – Each subsystem has its own state machine with its own states, transitions, and actions. Defined in individual YAML files in `backend/config/subsystems/` (e.g., `rotating_platform.yaml`, `vision.yaml`).
+
+3. **Object state machines** – Each analyzed object has its own state machine instance that tracks the detailed analysis cycle from identification to completion. The blueprint is defined in `backend/config/object.yaml`, and each object gets a runtime instance persisted to disk.
 
 ## Core concepts
 
@@ -32,6 +34,16 @@ A state represents the current condition of either the workflow or a subsystem.
 - `stopped` – Subsystem has stopped
 - `error` – Subsystem in error state
 
+**Object states** (defined in `object.yaml`, one instance per object):
+- `identified_in_box` – Object has been identified in the box by the vision system
+- `moving_to_disk` – Object is being moved from the box to the rotating platform
+- `HSI_3DI_analysis` – 3D imaging and hyperspectral imaging capture is being performed
+- `object_going_second_position` – Rotating platform is moving the object to the second position
+- `XRF_RAMAN_analysis` – XRF and Raman puntual measurements are being performed
+- `object_going_first_position` – Rotating platform is moving the object back to the first position
+- `moving_to_box` – Object is being moved from the disk back to the box
+- `object_analyzed` – Object analysis is complete (terminal state)
+
 ### Event
 An event is an external or internal trigger that causes a state machine to evaluate a transition.
 
@@ -54,6 +66,16 @@ An event is an external or internal trigger that causes a state machine to evalu
 - `error` – Error occurred
 - `reset` – Reset after error
 - `tool_change` – Changing end effector (robot_first)
+
+**Object events** (driven by subsystem completions):
+- `object_picked` – Vision system identified object, robot picks it up
+- `object_placed_on_disk` – Robot places object on the rotating platform
+- `imaging_capture_complete` – 3DI/HSI imaging capture finished
+- `platform_rotated_to_second` – Platform rotated to second measurement position
+- `measurements_complete` – XRF/Raman measurements finished
+- `platform_rotated_to_first` – Platform rotated back to first position
+- `object_returned_to_box` – Robot returns object to the box
+- `object_analyzed` – Analysis complete (final state, no transitions)
 
 ### Transition
 A transition is a valid move from one state to another, triggered by an event.
@@ -152,6 +174,90 @@ states:
           - log_event
           - clear_error_state
 ```
+
+### Object state machine (`backend/config/object.yaml`)
+
+Each analyzed object gets a runtime instance of this state machine. The orchestrator creates one instance per object, drives transitions based on subsystem completions, and persists the state to disk.
+
+```yaml
+name: object_analysis_workflow
+initial_state: identified_in_box
+
+states:
+  identified_in_box:
+    description: Object has been identified in the box by the vision system
+    transitions:
+      - event: object_picked
+        target: moving_to_disk
+        actions:
+          - log_event
+
+  moving_to_disk:
+    description: Object is being moved from the box to the rotating platform disk
+    transitions:
+      - event: object_placed_on_disk
+        target: HSI_3DI_analysis
+        actions:
+          - log_event
+          - update_operator_ui
+
+  HSI_3DI_analysis:
+    description: 3D imaging and hyperspectral imaging capture is being performed
+    transitions:
+      - event: imaging_capture_complete
+        target: object_going_second_position
+        actions:
+          - log_event
+          - publish_mqtt_message: object/imaging_complete
+
+  object_going_second_position:
+    description: Rotating platform is moving the object to the second measurement position
+    transitions:
+      - event: platform_rotated_to_second
+        target: XRF_RAMAN_analysis
+        actions:
+          - log_event
+          - publish_mqtt_message: object/rotated_second
+
+  XRF_RAMAN_analysis:
+    description: XRF and Raman puntual measurements are being performed at AI-extracted points
+    transitions:
+      - event: measurements_complete
+        target: object_going_first_position
+        actions:
+          - log_event
+          - publish_mqtt_message: object/measurements_complete
+
+  object_going_first_position:
+    description: Rotating platform is moving the object back to the first position
+    transitions:
+      - event: platform_rotated_to_first
+        target: moving_to_box
+        actions:
+          - log_event
+          - publish_mqtt_message: object/rotated_first
+
+  moving_to_box:
+    description: Object is being moved from the disk back to its original position in the box
+    transitions:
+      - event: object_returned_to_box
+        target: object_analyzed
+        actions:
+          - log_event
+          - update_operator_ui
+          - publish_mqtt_message: object/returned_to_box
+
+  object_analyzed:
+    description: Object analysis is complete – data will be uploaded to the cloud database
+```
+
+**Object state machine behavior**:
+- Created when the vision system identifies an object (or in simulation)
+- Transitions are driven by subsystem completion events
+- State is persisted to `backend/object_states/{object_id}.json` after each transition
+- State survives orchestrator restarts via disk persistence
+- Terminal state (`object_analyzed`) has no transitions
+- Each transition is logged with timestamps
 
 ### Subsystem state machines (`backend/config/subsystems/*.yaml`)
 
@@ -272,14 +378,38 @@ All subsystems start in `initializing` state and transition to `ready` via `init
 
 ## How the orchestrator manages state machines
 
-The `WorkflowOrchestrator` coordinates both levels:
+The `WorkflowOrchestrator` coordinates all three levels:
 
 1. **Loads** the workflow state machine from `workflow.yaml`
 2. **Loads** each subsystem's YAML from `config/subsystems/*.yaml`
 3. **Creates** a `SubsystemAdapter` for each subsystem, each owning its own `StateMachineEngine`
-4. **Routes** incoming MQTT messages to update subsystem states
-5. **Monitors** subsystem states to trigger workflow transitions (e.g., all subsystems ready → running)
-6. **Drives** subsystem state machines via `fire_subsystem_transition(subsystem_name, event)`
+4. **Creates** an `ObjectStateMachines` manager that loads `object.yaml` and creates per-object instances
+5. **Routes** incoming MQTT messages to update subsystem states
+6. **Monitors** subsystem states to trigger workflow transitions (e.g., all subsystems ready → running)
+7. **Drives** subsystem state machines via `fire_subsystem_transition(subsystem_name, event)`
+8. **Drives** object state machines via `fire_object_transition(object_id, event)`
+9. **Monitors** object completions to update progress counter
+
+### Object state machine lifecycle
+
+```
+Vision system identifies object
+    ↓
+orchestrator.create_object("object_001")
+    ↓
+ObjectStateMachines creates StateMachineEngine instance
+    ↓
+State persisted to object_states/object_001.json
+    ↓
+Subsystem events fire transitions:
+    object_picked → object_placed_on_disk → imaging_capture_complete → ...
+    ↓
+Final state: object_analyzed
+    ↓
+Progress counter increments
+```
+
+### Subsystem state machine transitions
 
 ### Subsystem state machine transitions
 
@@ -290,7 +420,46 @@ When a subsystem's state machine transitions, the orchestrator:
 3. Broadcasts the change to the frontend via WebSocket
 4. Checks if the transition should affect the main workflow state
 
+### Object state machine transitions
+
+When a subsystem completes its work, the orchestrator fires the corresponding event on the object's state machine:
+
+1. Subsystem transition completes (e.g., 3DI/HSI imaging finished)
+2. Orchestrator calls `fire_object_transition(object_id, event)` (e.g., `imaging_capture_complete`)
+3. Object state machine transitions to the next state
+4. New state is persisted to disk
+5. Change is broadcast to the frontend via WebSocket
+6. If object reached `object_analyzed`, progress counter increments
+
 ### Frontend subsystem cards
+
+The frontend renders a card for each subsystem showing:
+- **Display name** (from YAML `display_name`)
+- **Required indicator** (*) for required subsystems
+- **Current state** (colored badge: ready=green, running=blue, error=red, etc.)
+- **State description** (from the state machine YAML)
+
+When a subsystem's state machine transitions, the change is:
+1. Published via MQTT to `automata/subsystem/{name}/status`
+2. Broadcast to the frontend via WebSocket
+3. Displayed in the subsystem card with a state description
+
+### Frontend object cards
+
+The frontend renders a card for each object showing:
+- **Object ID** (e.g., `object_001`)
+- **Current analysis phase** (color-coded badge)
+- **State description** (from the object state machine YAML)
+- **Step number** (e.g., "Step 3 / 8")
+- **Transition count** (number of completed transitions)
+
+Object states are color-coded:
+- `identified_in_box` – gray
+- `moving_to_disk`, `moving_to_box` – blue (moving)
+- `HSI_3DI_analysis` – purple (imaging)
+- `object_going_second_position`, `object_going_first_position` – cyan (rotating)
+- `XRF_RAMAN_analysis` – orange (measuring)
+- `object_analyzed` – green (complete)
 
 The frontend renders a card for each subsystem showing:
 - **Display name** (from YAML `display_name`)
@@ -307,6 +476,9 @@ The frontend renders a card for each subsystem showing:
 5. Invalid transitions should be rejected with a clear error.
 6. Errors and recovery paths should be modeled as first-class states.
 7. Subsystem state machines should be independent of the workflow state machine.
+8. Object state machines should be independent of both workflow and subsystem state machines.
+9. Object states should be persisted to disk for crash recovery.
+10. Object transitions are driven by subsystem completions, not by direct operator input.
 
 ## Validation expectations
 

@@ -3,6 +3,7 @@ import type {
   WorkflowStatus,
   SubsystemStatus,
   SubsystemConfig,
+  ObjectInfo,
 } from '../contracts.js';
 
 export interface UiState {
@@ -14,6 +15,7 @@ export interface UiState {
   error: string | null;
   subsystems: Record<string, SubsystemStatus>;
   subsystemsConfig: SubsystemConfig[];
+  objects: ObjectInfo[];
   connectionStatus: 'connected' | 'disconnected';
   logs: Array<{ time: string; source: string; message: string; level: 'info' | 'error' | 'success' | 'warning' }>;
 }
@@ -33,6 +35,7 @@ export function createInitialState(): UiState {
     error: null,
     subsystems: {},
     subsystemsConfig: [],
+    objects: [],
     connectionStatus: 'disconnected',
     logs: [],
   };
@@ -181,7 +184,7 @@ export function reduceState(state: UiState, msg: unknown): UiState {
 
   // Also handle top-level status updates
   if (m.state) {
-    const s = m as unknown as WorkflowStatus & { subsystems_config?: SubsystemConfig[] };
+    const s = m as unknown as WorkflowStatus & { subsystems_config?: SubsystemConfig[]; objects?: ObjectInfo[] };
     updated.workflowState = s.state;
     updated.progress = s.progress;
     updated.totalObjects = s.total_objects;
@@ -197,6 +200,103 @@ export function reduceState(state: UiState, msg: unknown): UiState {
         source: 'config',
         message: `Loaded ${updated.subsystemsConfig.length} subsystem config(s)`,
         level: 'info',
+      });
+    }
+    if (s.objects && Array.isArray(s.objects)) {
+      updated.objects = s.objects as ObjectInfo[];
+      if (updated.objects.length > 0) {
+        logs.push({
+          time: now(),
+          source: 'objects',
+          message: `Loaded ${updated.objects.length} object(s)`,
+          level: 'info',
+        });
+      }
+    }
+  }
+
+  // Handle object list updates from status
+  if (m.event === 'workflow_state_changed' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    if (d.objects && Array.isArray(d.objects)) {
+      updated.objects = d.objects as ObjectInfo[];
+      if (updated.objects.length > 0) {
+        logs.push({
+          time: now(),
+          source: 'objects',
+          message: `Updated ${updated.objects.length} object(s)`,
+          level: 'info',
+        });
+      }
+    }
+  }
+
+  // Handle individual object state changes
+  if (m.event === 'object_state_changed' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const objectId = d.object_id as string;
+    const newState = d.new_state as string;
+    if (objectId && newState) {
+      // Update or add object in the list
+      const existingIdx = updated.objects.findIndex(o => o.object_id === objectId);
+      const objInfo = updated.objects[existingIdx] || { object_id: objectId };
+      const updatedObj = {
+        ...objInfo,
+        object_id: objectId,
+        state: newState,
+        last_state_change: now(),
+      } as ObjectInfo;
+
+      if (existingIdx >= 0) {
+        updated.objects = [...updated.objects];
+        updated.objects[existingIdx] = updatedObj;
+      } else {
+        updated.objects = [...updated.objects, updatedObj];
+      }
+
+      logs.push({
+        time: now(),
+        source: 'object',
+        message: `${objectId}: ${objInfo.state || 'unknown'} → ${newState}`,
+        level: 'info',
+      });
+    }
+  }
+
+  // Handle object added
+  if (m.event === 'object_added' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const objectId = d.object_id as string;
+    if (objectId) {
+      const objInfo = {
+        object_id: objectId,
+        state: d.state as string || 'identified_in_box',
+        state_description: d.state_description as string || '',
+        created: now(),
+        last_state_change: now(),
+        transitions: [],
+      } as ObjectInfo;
+      updated.objects = [...updated.objects, objInfo];
+      logs.push({
+        time: now(),
+        source: 'object',
+        message: `Object added: ${objectId} (${objInfo.state})`,
+        level: 'success',
+      });
+    }
+  }
+
+  // Handle object removed
+  if (m.event === 'object_removed' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const objectId = d.object_id as string;
+    if (objectId) {
+      updated.objects = updated.objects.filter(o => o.object_id !== objectId);
+      logs.push({
+        time: now(),
+        source: 'object',
+        message: `Object removed: ${objectId}`,
+        level: 'warning',
       });
     }
   }

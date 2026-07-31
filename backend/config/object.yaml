@@ -1,0 +1,69 @@
+name: object_analysis_workflow
+initial_state: identified_in_box
+
+states:
+  identified_in_box:
+    description: Object has been identified in the box by the vision system
+    transitions:
+      - event: object_picked
+        target: moving_to_disk
+        actions:
+          - log_event
+
+  moving_to_disk:
+    description: Object is being moved from the box to the rotating platform disk
+    transitions:
+      - event: object_placed_on_disk
+        target: HSI_3DI_analysis
+        actions:
+          - log_event
+          - update_operator_ui
+
+  HSI_3DI_analysis:
+    description: 3D imaging and hyperspectral imaging capture is being performed
+    transitions:
+      - event: imaging_capture_complete
+        target: object_going_second_position
+        actions:
+          - log_event
+          - publish_mqtt_message: object/imaging_complete
+
+  object_going_second_position:
+    description: Rotating platform is moving the object to the second measurement position
+    transitions:
+      - event: platform_rotated_to_second
+        target: XRF_RAMAN_analysis
+        actions:
+          - log_event
+          - publish_mqtt_message: object/rotated_second
+
+  XRF_RAMAN_analysis:
+    description: XRF and Raman puntual measurements are being performed at AI-extracted points
+    transitions:
+      - event: measurements_complete
+        target: object_going_first_position
+        actions:
+          - log_event
+          - publish_mqtt_message: object/measurements_complete
+
+  object_going_first_position:
+    description: Rotating platform is moving the object back to the first position
+    transitions:
+      - event: platform_rotated_to_first
+        target: moving_to_box
+        actions:
+          - log_event
+          - publish_mqtt_message: object/rotated_first
+
+  moving_to_box:
+    description: Object is being moved from the disk back to its original position in the box
+    transitions:
+      - event: object_returned_to_box
+        target: object_analyzed
+        actions:
+          - log_event
+          - update_operator_ui
+          - publish_mqtt_message: object/returned_to_box
+
+  object_analyzed:
+    description: Object analysis is complete – data will be uploaded to the cloud database
