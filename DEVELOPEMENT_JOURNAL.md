@@ -80,17 +80,45 @@ Then open `http://localhost:3000` in a browser.
 
 ## Recent changes
 
+### Per-subsystem state machines (2026-07-31)
+
+Major architectural change: each subsystem now has its own YAML file with a declarative state machine definition.
+
+**New subsystem YAML files** (`backend/config/subsystems/*.yaml`):
+- `rotating_platform.yaml` – State machine: ready → running → paused → stopped → error
+- `vision.yaml` – State machine: ready → running → stopped → error
+- `robot_first.yaml` – State machine: ready → tool_changing → running → paused → stopped → error
+- `robot_second.yaml` – State machine: ready → running → paused → stopped → error
+- `xrf.yaml` – State machine: ready → measuring → stopped → error
+- `raman.yaml` – State machine: ready → measuring → stopped → error
+- `imaging_3di_hsi.yaml` – State machine: ready → capturing → stopped → error
+- `ai_analysis.yaml` – State machine: ready → analyzing → stopped → error
+- `cloud_database.yaml` – State machine: ready → uploading → stopped → error
+
+**Backend changes**:
+- `StateMachineEngine` now supports custom action handlers registered via `register_action()`
+- `SubsystemAdapter` now owns its own `StateMachineEngine` instance
+- `SubsystemAdapterFactory` loads per-subsystem YAML files and creates state machines
+- `WorkflowOrchestrator` loads subsystem configs from `config/subsystems/*.yaml` (new format) or falls back to legacy `subsystems.yaml`
+- Added `fire_subsystem_transition()` method to drive subsystem state machines and broadcast state changes
+- Subsystem state changes are published via MQTT and broadcast to frontend
+
+**Frontend changes**:
+- Subsystem cards now show current state with state description
+- New `subsystem_state_changed` event type for state machine transitions
+- CSS styles added for all subsystem states (ready, running, measuring, capturing, analyzing, uploading, paused, stopped, error)
+
+**Simulation changes**:
+- Simulation now drives each subsystem's state machine through transitions
+- Subsystem state machines transition through states (ready → running → complete → ready) for each object
+- Proper state machine transitions for workflow completion (stop_requested → stopped)
+
+**Domain model changes**:
+- `SubsystemConfig` now includes `state_machine_path` field
+- `SubsystemInfo` now includes `current_state`, `state_description`, and `display_name`
+- New `BackendEvent.SUBSYSTEM_STATE_CHANGED` event type
+
 ### Simulation test suite rewritten & fixed (2026-07-31)
-
-The `backend/simulation_test.py` was completely rewritten to work with the current codebase:
-
-- **Fixed orchestrator initialization**: Updated to use new `WorkflowOrchestrator` constructor signature (now requires `subsystems_config_path` parameter)
-- **Fixed state machine event name**: Changed `subsystems_ready` → `subsystem_ready` in the orchestrator to match the YAML config (`backend/config/workflow.yaml`)
-- **Fixed adapter state access**: Changed `a.info.state` → `a.state` in `update_all_subsystems_ready()` and `_update_subsystem_status()` — `info` property returns `SubsystemInfo` (no `state` attribute), not the adapter itself
-- **Fixed simulation completion transitions**: Changed `_simulate_completion()` to use proper state machine transitions (`stop_requested` → `stopped`) instead of directly calling `_update_state()`
-- **Fixed MQTT disconnect logging**: Added `ReasonCode` enum handling for paho-mqtt 2.x compatibility
-- **Fixed frontend server shutdown**: Added `reuse_port=True` to allow port reuse after shutdown
-- **Test suite now passes**: All 36 tests pass (state machine config, full workflow simulation, pause/resume, MQTT publishing, error recovery, command routing, subsystem config)
 
 ### Subsystem configuration via YAML
 

@@ -1,13 +1,15 @@
 """Subsystem adapters – wrappers around MQTT communication with each subsystem.
 
-Adapters are created dynamically from the subsystems.yaml configuration.
-Each adapter knows its MQTT topics, current state, and metadata.
+Adapters are created dynamically from individual subsystem YAML files
+(e.g., rotating_platform.yaml, vision.yaml). Each adapter owns its own
+state machine engine that drives the subsystem's internal state transitions.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from backend.domain.models import SubsystemConfig, SubsystemInfo, SubsystemState
@@ -15,9 +17,18 @@ from backend.domain.models import SubsystemConfig, SubsystemInfo, SubsystemState
 logger = logging.getLogger(__name__)
 
 
+class SubsystemStateMachineError(Exception):
+    """Raised when an invalid transition is attempted on a subsystem state machine."""
+    pass
+
+
 @dataclass
 class SubsystemAdapter:
-    """Generic adapter for a subsystem, created from config."""
+    """Generic adapter for a subsystem, created from config.
+
+    Each adapter owns its own state machine engine that manages
+    the subsystem's internal state (ready, running, paused, error, etc.).
+    """
 
     name: str
     mqtt_client: Any
@@ -26,16 +37,32 @@ class SubsystemAdapter:
     initial_state: str = "ready"
     required: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
-    state: SubsystemState = SubsystemState.OFFLINE
+    state: SubsystemState = SubsystemState.READY
     error: Optional[str] = None
+    state_machine: Any = None  # StateMachineEngine instance
+    state_machine_path: Optional[str] = None
 
     @property
     def info(self) -> SubsystemInfo:
         return SubsystemInfo(
             name=self.name,
-            description=self.display_name or self.name,
+            display_name=self.display_name or self.name,
+            type=self.subsystem_type,
+            current_state=self.state_machine.current_state if self.state_machine else self.initial_state,
+            state_description=self._get_state_description(),
+            required=self.required,
             topic_prefix=f"automata/subsystem/{self.name}",
+            metadata=self.metadata,
         )
+
+    def _get_state_description(self) -> str:
+        """Get the description for the current state from the state machine config."""
+        if not self.state_machine or not self.state_machine.config:
+            return ""
+        current = self.state_machine.current_state
+        if current in self.state_machine.config.states:
+            return self.state_machine.config.states[current].description
+        return ""
 
     @property
     def config(self) -> SubsystemConfig:
@@ -46,12 +73,23 @@ class SubsystemAdapter:
             initial_state=self.initial_state,
             required=self.required,
             metadata=self.metadata,
+            state_machine_path=self.state_machine_path,
         )
 
     def update_state(self, state: SubsystemState, error: Optional[str] = None) -> None:
         self.state = state
         if error:
             self.error = error
+
+    def fire_transition(self, event: str) -> str:
+        """Fire a transition on the subsystem's state machine.
+
+        Returns the new state name.
+        Raises SubsystemStateMachineError if the transition is invalid.
+        """
+        if self.state_machine is None:
+            raise SubsystemStateMachineError(f"No state machine for subsystem '{self.name}'")
+        return self.state_machine.fire(event, None)
 
     def send_command(self, command: str, payload: Optional[Dict[str, Any]] = None) -> None:
         topic = f"automata/subsystem/{self.name}/command"
@@ -64,16 +102,28 @@ class SubsystemAdapter:
 class SubsystemAdapterFactory:
     """Factory that creates SubsystemAdapter instances from config."""
 
-    def __init__(self, mqtt_client: Any, subsystems_config: List[SubsystemConfig]) -> None:
+    def __init__(
+        self,
+        mqtt_client: Any,
+        subsystems_config: List[SubsystemConfig],
+        config_dir: Optional[Path] = None,
+    ) -> None:
         self.mqtt_client = mqtt_client
         self.subsystems_config = subsystems_config
+        self.config_dir = config_dir or Path(__file__).resolve().parent.parent / "config" / "subsystems"
         self.adapters: Dict[str, SubsystemAdapter] = {}
         self._build_adapters()
 
     def _build_adapters(self) -> None:
-        """Create an adapter for each configured subsystem."""
+        """Create an adapter for each configured subsystem, including its state machine."""
         for cfg in self.subsystems_config:
-            self.adapters[cfg.name] = SubsystemAdapter(
+            # Determine the state machine YAML path
+            state_machine_path = cfg.state_machine_path
+            if state_machine_path is None:
+                # Default: look for {name}.yaml in the subsystems config directory
+                state_machine_path = str(self.config_dir / f"{cfg.name}.yaml")
+
+            adapter = SubsystemAdapter(
                 name=cfg.name,
                 mqtt_client=self.mqtt_client,
                 display_name=cfg.display_name,
@@ -81,8 +131,26 @@ class SubsystemAdapterFactory:
                 initial_state=cfg.initial_state,
                 required=cfg.required,
                 metadata=cfg.metadata,
+                state_machine_path=state_machine_path,
             )
-            logger.info("Adapter created: %s (%s)", cfg.name, cfg.type)
+
+            # Load the state machine if the YAML file exists
+            sm_path = Path(state_machine_path)
+            if sm_path.exists():
+                from backend.state.state_machine import StateMachineEngine
+                adapter.state_machine = StateMachineEngine(sm_path, mqtt_client=self.mqtt_client)
+                logger.info(
+                    "Adapter created: %s (%s) [required=%s, state_machine=%s]",
+                    cfg.name, cfg.type, cfg.required, sm_path.name,
+                )
+            else:
+                logger.warning(
+                    "State machine YAML not found at %s for subsystem '%s'. "
+                    "Adapter will use basic state tracking.",
+                    state_machine_path, cfg.name,
+                )
+
+            self.adapters[cfg.name] = adapter
 
     def get(self, name: str) -> Optional[SubsystemAdapter]:
         return self.adapters.get(name)

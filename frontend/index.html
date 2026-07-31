@@ -220,12 +220,28 @@
       padding: 3px 10px;
       border-radius: 12px;
       display: inline-block;
+      margin-bottom: 4px;
     }
 
     .subsystem-state.ready { background: var(--success); color: #fff; }
     .subsystem-state.busy { background: var(--accent); color: #fff; }
     .subsystem-state.error { background: var(--error); color: #fff; }
     .subsystem-state.offline { background: var(--surface); color: var(--text-muted); }
+    .subsystem-state.running { background: var(--accent); color: #fff; }
+    .subsystem-state.measuring { background: var(--accent); color: #fff; }
+    .subsystem-state.capturing { background: var(--accent); color: #fff; }
+    .subsystem-state.analyzing { background: var(--accent); color: #fff; }
+    .subsystem-state.uploading { background: var(--accent); color: #fff; }
+    .subsystem-state.paused { background: var(--warning); color: #000; }
+    .subsystem-state.stopped { background: var(--surface); color: var(--text-muted); }
+    .subsystem-state.tool_changing { background: var(--warning); color: #000; }
+
+    .subsystem-state-desc {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+      font-style: italic;
+    }
 
     .required-badge {
       color: var(--error);

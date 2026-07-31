@@ -126,6 +126,32 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     }
   }
 
+  // Handle subsystem state changes from state machine transitions
+  if (m.event === 'subsystem_state_changed' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const name = d.subsystem as string;
+    const newState = d.new_state as string;
+    if (name && newState) {
+      // Update or create subsystem status
+      const existing = updated.subsystems[name] || { name };
+      updated.subsystems = {
+        ...updated.subsystems,
+        [name]: {
+          ...existing,
+          name,
+          state: newState,
+          ready: newState === 'ready',
+        } as SubsystemStatus,
+      };
+      logs.push({
+        time: now(),
+        source: 'subsystem',
+        message: `${name}: ${existing.state || 'unknown'} → ${newState}`,
+        level: 'info',
+      });
+    }
+  }
+
   // Also handle top-level status updates
   if (m.state) {
     const s = m as unknown as WorkflowStatus & { subsystems_config?: SubsystemConfig[] };

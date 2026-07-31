@@ -3,9 +3,9 @@ Workflow orchestrator – the heart of the GUI.
 
 Ties together:
   - State machine engine (declarative YAML config)
-  - Subsystem configuration (declarative YAML config)
+  - Subsystem configuration (per-subsystem YAML files)
   - MQTT messaging (subsystem communication)
-  - Subsystem adapters (dynamically created from config)
+  - Subsystem adapters with per-subsystem state machines
   - Frontend WebSocket server
 """
 
@@ -47,10 +47,11 @@ class WorkflowOrchestrator:
     """
     Central orchestrator that:
       1. Manages the workflow state machine
-      2. Loads subsystem configuration from YAML
-      3. Communicates with subsystems via MQTT
-      4. Exposes state to the frontend via WebSocket
-      5. Handles operator commands
+      2. Loads subsystem configuration from individual YAML files
+      3. Creates and manages per-subsystem state machines
+      4. Communicates with subsystems via MQTT
+      5. Exposes state to the frontend via WebSocket
+      6. Handles operator commands
     """
 
     def __init__(
@@ -60,18 +61,22 @@ class WorkflowOrchestrator:
         use_simulation: bool = False,
         num_objects: int = 3,
     ) -> None:
-        # MQTT client (created first so it can be passed to the state machine)
+        # MQTT client (created first so it can be passed to the state machines)
         self.mqtt = MqttClient(broker="localhost", port=1883)
 
         # State machine (passes mqtt_client so action handlers can publish)
         self.state_machine = StateMachineEngine(config_path, mqtt_client=self.mqtt)
 
-        # Load subsystem configuration from YAML
+        # Load subsystem configuration from YAML files
         self.subsystems_config: List[SubsystemConfig] = []
         self._load_subsystems_config(subsystems_config_path)
 
-        # Create adapters dynamically from config
-        self.adapter_factory = SubsystemAdapterFactory(self.mqtt, self.subsystems_config)
+        # Create adapters with per-subsystem state machines
+        self.adapter_factory = SubsystemAdapterFactory(
+            self.mqtt,
+            self.subsystems_config,
+            config_dir=Path(__file__).resolve().parent.parent / "config" / "subsystems",
+        )
         self.adapters: Dict[str, SubsystemAdapter] = self.adapter_factory.get_all()
 
         # Frontend server
@@ -110,18 +115,46 @@ class WorkflowOrchestrator:
     # Subsystem configuration loading
     # ------------------------------------------------------------------
     def _load_subsystems_config(self, config_path: str | Path | None) -> None:
-        """Load subsystem configuration from YAML file."""
-        if config_path is None:
-            # Default path: same directory as workflow.yaml but named subsystems.yaml
-            config_dir = Path(config_path if config_path else ".").parent
-            config_path = Path(__file__).resolve().parent.parent.parent / "backend" / "config" / "subsystems.yaml"
+        """Load subsystem configuration from YAML file.
 
-        config_path = Path(config_path)
-        if not config_path.exists():
-            logger.warning("Subsystems config not found at %s, using empty config", config_path)
-            self.subsystems_config = []
+        The config file can be either:
+        - The old format: a single file with a 'subsystems' list
+        - A directory of per-subsystem YAML files (new format)
+
+        If config_path is a directory, it looks for *.yaml files.
+        If config_path is a file, it loads the old format.
+        If config_path is None, it tries the default locations.
+        """
+        # Determine config directory
+        config_dir = Path(__file__).resolve().parent.parent / "config" / "subsystems"
+
+        # If config_path is provided and is a file, try old format first
+        if config_path is not None:
+            config_path = Path(config_path)
+            if config_path.is_file():
+                self._load_old_format(config_path)
+                return
+            elif config_path.is_dir():
+                config_dir = config_path
+
+        # Try new format: load from config_dir/*.yaml
+        yaml_files = sorted(config_dir.glob("*.yaml"))
+        if yaml_files:
+            self._load_new_format(config_dir, yaml_files)
             return
 
+        # Fallback: try old format at default location
+        old_config_path = Path(__file__).resolve().parent.parent.parent / "backend" / "config" / "subsystems.yaml"
+        if old_config_path.exists():
+            logger.info("Falling back to legacy subsystems.yaml")
+            self._load_old_format(old_config_path)
+            return
+
+        logger.warning("No subsystem configuration found, using empty config")
+        self.subsystems_config = []
+
+    def _load_old_format(self, config_path: Path) -> None:
+        """Load subsystem config from the old single-file format."""
         with open(config_path, "r") as f:
             data = yaml.safe_load(f)
 
@@ -131,6 +164,7 @@ class WorkflowOrchestrator:
             return
 
         self.subsystems_config = []
+        config_dir = config_path.parent.parent / "config" / "subsystems"
         for item in data["subsystems"]:
             cfg = SubsystemConfig(
                 name=item["name"],
@@ -140,10 +174,36 @@ class WorkflowOrchestrator:
                 initial_state=item.get("initial_state", "ready"),
                 required=item.get("required", True),
                 metadata=item.get("metadata", {}),
+                state_machine_path=str(config_dir / f"{item['name']}.yaml"),
             )
             self.subsystems_config.append(cfg)
             logger.info("Loaded subsystem config: %s (%s) – required=%s",
                         cfg.name, cfg.type, cfg.required)
+
+    def _load_new_format(self, config_dir: Path, yaml_files: List[Path]) -> None:
+        """Load subsystem config from individual YAML files."""
+        self.subsystems_config = []
+        for yaml_file in yaml_files:
+            with open(yaml_file, "r") as f:
+                data = yaml.safe_load(f)
+
+            if not data or "name" not in data:
+                logger.warning("Skipping invalid subsystem YAML: %s", yaml_file)
+                continue
+
+            cfg = SubsystemConfig(
+                name=data["name"],
+                display_name=data.get("display_name", data["name"]),
+                type=data.get("type", "generic"),
+                mqtt_topic=data.get("mqtt_topic", "automata/subsystem/{name}"),
+                initial_state=data.get("initial_state", "ready"),
+                required=data.get("required", True),
+                metadata=data.get("metadata", {}),
+                state_machine_path=str(yaml_file),
+            )
+            self.subsystems_config.append(cfg)
+            logger.info("Loaded subsystem config: %s (%s) – required=%s – state_machine=%s",
+                        cfg.name, cfg.type, cfg.required, yaml_file.name)
 
     @property
     def subsystem_names(self) -> List[str]:
@@ -347,6 +407,95 @@ class WorkflowOrchestrator:
 
         # Check if all required subsystems are ready (for starting -> running transition)
         if self.state_machine.state == WorkflowState.STARTING:
+            required_adapters = self.adapter_factory.get_required()
+            all_ready = all(
+                a.state == SubsystemState.READY for a in required_adapters
+            )
+            if all_ready:
+                logger.info("All required subsystems ready!")
+                self.state_machine.fire("subsystem_ready", self._status)
+                self._update_state(WorkflowState.RUNNING)
+                self._fire_frontend_event(
+                    BackendEvent.WORKFLOW_STATE_CHANGED.value,
+                    {"new_state": "running", "source": "subsystems_ready"},
+                )
+
+    # ------------------------------------------------------------------
+    # Subsystem state machine transitions
+    # ------------------------------------------------------------------
+    def fire_subsystem_transition(
+        self,
+        subsystem_name: str,
+        event: str,
+    ) -> bool:
+        """Fire a transition on a subsystem's state machine.
+
+        This method:
+        1. Fires the event on the subsystem's state machine
+        2. Publishes the new state via MQTT
+        3. Updates the frontend with the new subsystem state
+        4. Checks if the transition affects the main workflow state
+
+        Returns True if successful, False otherwise.
+        """
+        adapter = self.adapters.get(subsystem_name)
+        if adapter is None:
+            logger.warning("No adapter found for subsystem '%s'", subsystem_name)
+            return False
+
+        if adapter.state_machine is None:
+            logger.warning("No state machine for subsystem '%s'", subsystem_name)
+            return False
+
+        try:
+            new_state = adapter.fire_transition(event)
+            logger.info(
+                "Subsystem '%s' transition: %s -> %s (event: %s)",
+                subsystem_name, adapter.state_machine.current_state,
+                new_state, event,
+            )
+
+            # Publish the state change via MQTT
+            topic = f"automata/subsystem/{subsystem_name}/status"
+            self.mqtt.publish(topic, {
+                "state": new_state,
+                "name": subsystem_name,
+                "ready": new_state == "ready",
+            })
+
+            # Update the frontend with the new subsystem state
+            self._fire_frontend_event(
+                BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
+                {
+                    "subsystem": subsystem_name,
+                    "new_state": new_state,
+                    "source": "state_machine",
+                },
+            )
+
+            # Update the subsystem info in the status
+            if subsystem_name in self._status.active_subsystems:
+                info = self._status.active_subsystems[subsystem_name]
+                info.current_state = new_state
+                info.state_description = adapter._get_state_description()
+
+            # Check if this transition affects the main workflow state
+            self._check_workflow_state_on_subsystem_change(subsystem_name, new_state)
+
+            return True
+
+        except Exception as exc:
+            logger.error("Failed to fire transition on subsystem '%s': %s", subsystem_name, exc)
+            return False
+
+    def _check_workflow_state_on_subsystem_change(
+        self,
+        subsystem_name: str,
+        new_state: str,
+    ) -> None:
+        """Check if a subsystem state change should trigger a workflow state transition."""
+        # If all subsystems become ready and we're in STARTING, move to RUNNING
+        if new_state == "ready" and self.state_machine.state == WorkflowState.STARTING:
             required_adapters = self.adapter_factory.get_required()
             all_ready = all(
                 a.state == SubsystemState.READY for a in required_adapters

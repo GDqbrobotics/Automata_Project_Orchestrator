@@ -45,13 +45,18 @@ class Command(str, enum.Enum):
 class BackendEvent(str, enum.Enum):
     WORKFLOW_STATE_CHANGED = "workflow_state_changed"
     SUBSYSTEM_STATUS_UPDATED = "subsystem_status_updated"
+    SUBSYSTEM_STATE_CHANGED = "subsystem_state_changed"
     ERROR_REPORTED = "error_reported"
     PROGRESS_UPDATED = "progress_updated"
 
 
 @dataclass
 class SubsystemConfig:
-    """Configuration for a single subsystem, loaded from YAML."""
+    """Configuration for a single subsystem, loaded from YAML.
+
+    Contains both subsystem metadata (name, type, required, etc.)
+    and the path to its state machine YAML file.
+    """
 
     name: str
     display_name: str
@@ -60,42 +65,7 @@ class SubsystemConfig:
     initial_state: str = "ready"
     required: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def command_topic(self) -> str:
-        return self.mqtt_topic.replace("{name}", self.name) + "/command"
-
-    @property
-    def status_topic(self) -> str:
-        return self.mqtt_topic.replace("{name}", self.name) + "/status"
-
-    @property
-    def response_topic(self) -> str:
-        return self.mqtt_topic.replace("{name}", self.name) + "/response"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "display_name": self.display_name,
-            "type": self.type,
-            "mqtt_topic": self.mqtt_topic,
-            "initial_state": self.initial_state,
-            "required": self.required,
-            "metadata": self.metadata,
-        }
-
-
-@dataclass
-class SubsystemConfig:
-    """Configuration for a single subsystem, loaded from YAML."""
-
-    name: str
-    display_name: str
-    type: str = "generic"
-    mqtt_topic: str = "automata/subsystem/{name}"
-    initial_state: str = "ready"
-    required: bool = True
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    state_machine_path: Optional[str] = None
 
     @property
     def command_topic(self) -> str:
@@ -123,9 +93,27 @@ class SubsystemConfig:
 
 @dataclass
 class SubsystemInfo:
+    """Runtime info about a subsystem, including its current state."""
+
     name: str
-    description: str
-    topic_prefix: str
+    display_name: str = ""
+    type: str = "generic"
+    current_state: str = "ready"
+    state_description: str = ""
+    required: bool = True
+    topic_prefix: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "display_name": self.display_name,
+            "type": self.type,
+            "state": self.current_state,
+            "state_description": self.state_description,
+            "required": self.required,
+            "metadata": self.metadata,
+        }
 
 
 @dataclass
@@ -157,7 +145,7 @@ class WorkflowStatus:
             "progress": self.progress,
             "current_object": self.current_object,
             "subsystems": {
-                name: {"name": info.name, "state": info.description}
+                name: info.to_dict()
                 for name, info in self.active_subsystems.items()
             },
             "error": self.error,

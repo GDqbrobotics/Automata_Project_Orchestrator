@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AUTOMATA – GUI Orchestrator</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #252836;
+      --border: #333648;
+      --text: #e0e3eb;
+      --text-muted: #8a8fa8;
+      --accent: #5b8def;
+      --accent-hover: #7ba4ff;
+      --success: #4caf50;
+      --warning: #ff9800;
+      --error: #f44336;
+      --idle-color: #666;
+      --starting-color: #2196f3;
+      --running-color: #4caf50;
+      --paused-color: #ff9800;
+      --stopped-color: #666;
+      --completing-color: #9c27b0;
+      --error-color: #f44336;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    .app {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+
+    header h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    header h1 span { color: var(--accent); }
+
+    .connection-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+
+    .connection-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--error);
+    }
+
+    .connection-dot.connected { background: var(--success); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+
+    @media (max-width: 768px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+
+    .panel-body { padding: 18px; }
+
+    /* State display */
+    .state-display {
+      text-align: center;
+      padding: 30px 20px;
+    }
+
+    .state-badge {
+      display: inline-block;
+      padding: 10px 28px;
+      border-radius: 24px;
+      font-size: 1.2rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      background: var(--surface2);
+      color: var(--text-muted);
+    }
+
+    .state-badge.idle { background: var(--idle-color); color: #fff; }
+    .state-badge.starting { background: var(--starting-color); }
+    .state-badge.running { background: var(--running-color); }
+    .state-badge.paused { background: var(--paused-color); }
+    .state-badge.stopping { background: var(--warning); color: #000; }
+    .state-badge.stopped { background: var(--stopped-color); color: #fff; }
+    .state-badge.completing { background: var(--completing-color); }
+    .state-badge.error { background: var(--error-color); color: #fff; }
+
+    .workflow-message {
+      margin-top: 16px;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      min-height: 24px;
+    }
+
+    /* Progress bar */
+    .progress-section { margin-top: 20px; }
+
+    .progress-bar {
+      height: 8px;
+      background: var(--surface2);
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 8px 0;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 4px;
+      transition: width 0.5s ease;
+    }
+
+    .progress-label {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    /* Action buttons */
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .btn:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn:active { transform: translateY(0); }
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-warning { background: var(--warning); color: #000; }
+    .btn-danger { background: var(--error); color: #fff; }
+    .btn-success { background: var(--success); color: #fff; }
+    .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+
+    /* Subsystem list */
+    .subsystem-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 10px;
+    }
+
+    .subsystem-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      text-align: center;
+    }
+
+    .subsystem-name {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .subsystem-state {
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 12px;
+      display: inline-block;
+      margin-bottom: 4px;
+    }
+
+    .subsystem-state.ready { background: var(--success); color: #fff; }
+    .subsystem-state.busy { background: var(--accent); color: #fff; }
+    .subsystem-state.error { background: var(--error); color: #fff; }
+    .subsystem-state.offline { background: var(--surface); color: var(--text-muted); }
+    .subsystem-state.running { background: var(--accent); color: #fff; }
+    .subsystem-state.measuring { background: var(--accent); color: #fff; }
+    .subsystem-state.capturing { background: var(--accent); color: #fff; }
+    .subsystem-state.analyzing { background: var(--accent); color: #fff; }
+    .subsystem-state.uploading { background: var(--accent); color: #fff; }
+    .subsystem-state.paused { background: var(--warning); color: #000; }
+    .subsystem-state.stopped { background: var(--surface); color: var(--text-muted); }
+    .subsystem-state.tool_changing { background: var(--warning); color: #000; }
+
+    .subsystem-state-desc {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+      font-style: italic;
+    }
+
+    .required-badge {
+      color: var(--error);
+      font-weight: bold;
+      margin-left: 2px;
+    }
+
+    /* Event log */
+    .event-log {
+      max-height: 260px;
+      overflow-y: auto;
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 0.8rem;
+      line-height: 1.6;
+    }
+
+    .log-entry {
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+
+    .log-time { color: var(--text-muted); margin-right: 8px; }
+    .log-source { color: var(--accent); margin-right: 8px; }
+    .log-msg { color: var(--text); }
+    .log-msg.error { color: var(--error); }
+    .log-msg.success { color: var(--success); }
+    .log-msg.warning { color: var(--warning); }
+
+    /* Object alias input */
+    .alias-section {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .alias-input-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    .alias-input {
+      flex: 1;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface2);
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+
+    .alias-input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .alias-label {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+  </style>
+  <script type="module" crossorigin src="/assets/index-CPu5oTHK.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1><span>AUTOMATA</span> — GUI Orchestrator</h1>
+      <div class="connection-indicator">
+        <div class="connection-dot" id="connectionDot"></div>
+        <span id="connectionText">Disconnected</span>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Left column -->
+      <div class="left-column">
+        <!-- State panel -->
+        <div class="panel">
+          <div class="panel-header">Workflow State</div>
+          <div class="panel-body">
+            <div class="state-display">
+              <div class="state-badge idle" id="stateBadge">Idle</div>
+              <div class="workflow-message" id="workflowMessage">Waiting for operator input</div>
+            </div>
+
+            <div class="progress-section">
+              <div class="progress-label" id="progressLabel">Progress: 0 / 0</div>
+              <div class="progress-bar">
+                <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+              </div>
+            </div>
+
+            <div class="alias-section">
+              <div class="alias-label">Assign alias ID (during workflow):</div>
+              <div class="alias-input-group">
+                <input type="text" class="alias-input" id="aliasInput" placeholder="Object ID → Alias" />
+                <button class="btn btn-secondary" id="aliasBtn">Assign</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Actions panel -->
+        <div class="panel" style="margin-top: 20px;">
+          <div class="panel-header">Operator Actions</div>
+          <div class="panel-body">
+            <div class="actions">
+              <button class="btn btn-primary" id="btnStart">▶ Start Workflow</button>
+              <button class="btn btn-warning" id="btnPause" disabled>⏸ Pause</button>
+              <button class="btn btn-success" id="btnResume" disabled>▶ Resume</button>
+              <button class="btn btn-danger" id="btnStop">⏹ Stop</button>
+              <button class="btn btn-secondary" id="btnStatus">⟳ Refresh Status</button>
+              <button class="btn btn-secondary" id="btnReset">↺ Reset</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right column -->
+      <div class="right-column">
+        <!-- Subsystems panel -->
+        <div class="panel">
+          <div class="panel-header">Subsystems Status</div>
+          <div class="panel-body">
+            <div class="subsystem-grid" id="subsystemGrid"></div>
+          </div>
+        </div>
+
+        <!-- Event log panel -->
+        <div class="panel" style="margin-top: 20px;">
+          <div class="panel-header">Event Log</div>
+          <div class="panel-body">
+            <div class="event-log" id="eventLog"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>

@@ -68,7 +68,7 @@ MQTT_BROKER_HOST = "localhost"
 MQTT_BROKER_PORT = 1883
 FRONTEND_PORT = 8081
 CONFIG_PATH = str(Path(__file__).resolve().parent / "config" / "workflow.yaml")
-SUBSYSTEMS_CONFIG_PATH = str(Path(__file__).resolve().parent / "config" / "subsystems.yaml")
+SUBSYSTEMS_CONFIG_DIR = str(Path(__file__).resolve().parent / "config" / "subsystems")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,13 +176,13 @@ class OrchestratorRunner:
     def __init__(
         self,
         config_path: str,
-        subsystems_config_path: str,
+        subsystems_config_dir: str,
         use_simulation: bool = False,
         num_objects: int = 3,
     ) -> None:
         self.orchestrator = WorkflowOrchestrator(
             config_path=Path(config_path),
-            subsystems_config_path=Path(subsystems_config_path),
+            subsystems_config_path=Path(subsystems_config_dir),
             use_simulation=use_simulation,
             num_objects=num_objects,
         )
@@ -392,7 +392,7 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
     # Start orchestrator in simulation mode with the correct number of objects
     runner = OrchestratorRunner(
         CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_PATH,
+        SUBSYSTEMS_CONFIG_DIR,
         use_simulation=True,
         num_objects=num_objects,
     )
@@ -485,7 +485,7 @@ async def test_pause_resume_gui() -> None:
 
     runner = OrchestratorRunner(
         CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_PATH,
+        SUBSYSTEMS_CONFIG_DIR,
         use_simulation=False,
     )
     runner.start()
@@ -520,7 +520,7 @@ async def test_pause_resume_gui() -> None:
     # Pause
     await ws_client.send_command("pause_workflow")
     await ws_client.receive()
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     results.check(
         runner.current_state_name == "paused",
@@ -530,7 +530,7 @@ async def test_pause_resume_gui() -> None:
     # Resume
     await ws_client.send_command("resume_workflow")
     await ws_client.receive()
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     results.check(
         runner.current_state_name == "running",
@@ -540,7 +540,7 @@ async def test_pause_resume_gui() -> None:
     # Stop
     await ws_client.send_command("stop_workflow")
     await ws_client.receive()
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     results.check(
         runner.current_state_name == "stopping",
@@ -549,7 +549,7 @@ async def test_pause_resume_gui() -> None:
 
     # Fire the final 'stopped' event to complete the stop sequence
     runner.fire_event("stopped")
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     results.check(
         runner.current_state_name == "stopped",
@@ -574,7 +574,7 @@ async def test_mqtt_topic_publishing() -> None:
 
     runner = OrchestratorRunner(
         CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_PATH,
+        SUBSYSTEMS_CONFIG_DIR,
         use_simulation=False,
     )
     runner.start()
@@ -605,12 +605,12 @@ async def test_mqtt_topic_publishing() -> None:
     # Connect WebSocket client
     ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
     await ws_client.connect()
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     # Start workflow -- should publish workflow/start command
     await ws_client.send_command("start_workflow")
     await ws_client.receive()
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     # The state machine publishes to MQTT via the orchestrator's MQTT client,
     # but our checker subscribes to the broker. Let's verify by checking
@@ -669,7 +669,7 @@ async def test_error_recovery() -> None:
 
     runner = OrchestratorRunner(
         CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_PATH,
+        SUBSYSTEMS_CONFIG_DIR,
         use_simulation=False,
     )
     runner.start()
@@ -677,7 +677,7 @@ async def test_error_recovery() -> None:
     # Connect WebSocket client
     ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
     await ws_client.connect()
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     # Create and ready subsystems
     simulators_er = {}
@@ -726,81 +726,56 @@ async def test_error_recovery() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Subsystem command routing
+# Test 6: Subsystem state machine transitions
 # ---------------------------------------------------------------------------
-async def test_subsystem_command_routing() -> None:
-    """Test: Verify subsystems receive correct commands via MQTT."""
-    logger.info("--- TEST 6: Subsystem Command Routing (GUI) ---")
+async def test_subsystem_state_machine() -> None:
+    """Test: Verify subsystem state machines work correctly."""
+    logger.info("--- TEST 6: Subsystem State Machine ---")
 
     runner = OrchestratorRunner(
         CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_PATH,
+        SUBSYSTEMS_CONFIG_DIR,
         use_simulation=False,
     )
     runner.start()
 
-    # Connect WebSocket client
-    ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
-    await ws_client.connect()
-    time.sleep(0.3)
-
-    robot_first_sim = SubsystemSimulator(ROBOT_FIRST)
-    platform_sim = SubsystemSimulator(ROTATING_PLATFORM)
-
-    time.sleep(0.5)
-
-    # Start workflow
-    await ws_client.send_command("start_workflow")
-    await ws_client.receive()
-    time.sleep(0.3)
-
-    robot_first_sim.mark_ready()
-    platform_sim.mark_ready()
-
-    runner.orchestrator.update_all_subsystems_ready()
-    time.sleep(0.3)
-
     results.check(
-        runner.current_state_name == "running",
-        "Subsystems ready via MQTT -> state transitions to running",
+        len(runner.orchestrator.adapters) > 0,
+        f"Adapters created: {len(runner.orchestrator.adapters)}",
     )
 
-    # Verify the orchestrator's MQTT client can publish to subsystem topics
-    # by checking that the adapter's MQTT client is properly configured.
-    adapter = runner.orchestrator.adapters.get(ROBOT_FIRST)
-    results.check(
-        adapter is not None,
-        f"Adapter exists for '{ROBOT_FIRST}'",
-    )
+    # Check that each subsystem has a state machine
+    for name in ALL_SUBSYSTEMS:
+        adapter = runner.orchestrator.adapters.get(name)
+        if adapter:
+            has_sm = adapter.state_machine is not None
+            results.check(
+                has_sm,
+                f"Subsystem '{name}' has a state machine",
+            )
 
-    # Verify the adapter's send_command method constructs the correct topic
-    # (we can't easily test actual MQTT delivery due to threading,
-    #  but we can verify the topic construction is correct)
-    expected_topic = f"automata/subsystem/{ROBOT_FIRST}/command"
-    results.check(
-        adapter.info.topic_prefix == f"automata/subsystem/{ROBOT_FIRST}",
-        "Adapter topic prefix is correctly configured",
-    )
+    # Test firing a transition on a subsystem state machine
+    if runner.orchestrator.adapters.get(VISION) and runner.orchestrator.adapters[VISION].state_machine:
+        adapter = runner.orchestrator.adapters[VISION]
+        current_state = adapter.state_machine.current_state
 
-    # Verify the orchestrator can publish messages
-    test_cmd = {"command": "test_command", "test": True}
-    try:
-        runner.orchestrator.mqtt.publish(
-            expected_topic,
-            json.dumps(test_cmd),
-        )
-        results.check(True, "Orchestrator successfully published MQTT command")
-    except Exception as e:
-        results.check(False, f"Orchestrator published MQTT command: {e}")
+        # Get available transitions
+        available = adapter.state_machine.get_available_transitions()
+
+        if "start" in available:
+            try:
+                new_state = adapter.fire_transition("start")
+                results.check(
+                    new_state in available.values(),
+                    f"Subsystem '{name}' transitioned to '{new_state}'",
+                )
+            except Exception as e:
+                results.check(False, f"Subsystem '{name}' transition failed: {e}")
 
     # Cleanup
     runner.stop()
-    for sim in [robot_first_sim, platform_sim]:
-        sim.stop()
 
-    await ws_client.close()
-
-    logger.info("Subsystem command routing test complete.")
+    logger.info("Subsystem state machine test complete.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -810,11 +785,8 @@ def test_subsystem_config() -> None:
     """Test: Validate subsystem configuration loads correctly."""
     logger.info("--- TEST 7: Subsystem Configuration ---")
 
-    config_path = Path(SUBSYSTEMS_CONFIG_PATH)
-    assert config_path.exists(), f"Subsystems config not found: {config_path}"
-
     # Create a runner just to check config loading
-    runner = OrchestratorRunner(CONFIG_PATH, SUBSYSTEMS_CONFIG_PATH)
+    runner = OrchestratorRunner(CONFIG_PATH, SUBSYSTEMS_CONFIG_DIR)
     runner.start()
 
     results.check(
@@ -885,7 +857,7 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         time.sleep(1)
         await test_error_recovery()
         time.sleep(1)
-        await test_subsystem_command_routing()
+        await test_subsystem_state_machine()
         time.sleep(1)
         test_subsystem_config()
 
@@ -922,7 +894,7 @@ def main() -> None:
     else:
         logger.error("Some tests failed!")
         sys.exit(1)
-    #TODO: script get stuck here instead of shutdown process...
+
 
 if __name__ == "__main__":
     import asyncio

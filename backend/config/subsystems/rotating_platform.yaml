@@ -1,0 +1,87 @@
+# Rotating Platform Subsystem Configuration
+# This file defines both the subsystem metadata and its state machine.
+
+# Subsystem metadata
+name: rotating_platform
+display_name: Rotating Platform
+type: platform
+mqtt_topic: "automata/subsystem/{name}"
+initial_state: ready
+required: true
+metadata:
+  description: "Motorized rotary stage with transparent disks"
+  hardware: "Motorized rotary stage"
+
+# State machine definition for this subsystem
+states:
+  ready:
+    description: "Subsystem is ready and idle"
+    transitions:
+      - event: start
+        target: running
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/rotating_platform/running
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
+
+  running:
+    description: "Subsystem is actively performing operations"
+    transitions:
+      - event: pause
+        target: paused
+        actions:
+          - log_event
+
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/rotating_platform/stopped
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
+  paused:
+    description: "Subsystem is paused, waiting for resume"
+    transitions:
+      - event: resume
+        target: running
+        actions:
+          - log_event
+
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
+
+  stopped:
+    description: "Subsystem has stopped"
+    transitions:
+      - event: start
+        target: running
+        actions:
+          - log_event
+
+      - event: ready
+        target: ready
+        actions:
+          - log_event
+
+  error:
+    description: "Subsystem is in error state"
+    transitions:
+      - event: reset
+        target: ready
+        actions:
+          - log_event

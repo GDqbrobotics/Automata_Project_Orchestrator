@@ -1,8 +1,8 @@
 """Simulation mode – simulates subsystems responding to workflow commands.
 
-The simulation reads subsystem configuration from YAML to know which subsystems
-to simulate and their properties. This keeps the simulation in sync with the
-orchestrator's configuration.
+The simulation reads subsystem configuration from individual YAML files
+to know which subsystems to simulate, their state machines, and how to
+drive them through transitions.
 """
 
 from __future__ import annotations
@@ -20,22 +20,12 @@ from backend.domain.models import BackendEvent, SubsystemConfig, SubsystemState,
 logger = logging.getLogger(__name__)
 
 
-# Default analysis steps per subsystem – used when config doesn't specify steps
-DEFAULT_STEPS: Dict[str, str] = {
-    "vision": "object_detection",
-    "robot_first": "pick_and_place",
-    "robot_second": "measurement_positioning",
-    "rotating_platform": "position_rotation",
-    "xrf": "xrf_measurement",
-    "raman": "raman_measurement",
-    "imaging_3di_hsi": "3di_hsi_imaging",
-    "ai_analysis": "ai_analysis",
-    "cloud_database": "cloud_upload",
-}
-
-
 class WorkflowSimulator:
-    """Simulates subsystems responding to the workflow state machine."""
+    """Simulates subsystems responding to the workflow state machine.
+
+    Each subsystem's state machine is driven through its transitions
+    to simulate realistic behavior.
+    """
 
     def __init__(
         self,
@@ -77,8 +67,8 @@ class WorkflowSimulator:
     def simulate_full_workflow(self) -> None:
         """Run the full simulated workflow.
 
-        Uses the subsystem configuration to determine which subsystems to simulate
-        and in what order.
+        Drives each subsystem's state machine through transitions
+        to simulate realistic behavior for each object.
         """
         logger.info(
             "Starting full workflow simulation with %d objects and %d subsystems",
@@ -86,7 +76,7 @@ class WorkflowSimulator:
             len(self.subsystems_config),
         )
 
-        # Phase 1: All subsystems become ready
+        # Phase 1: All subsystems become ready (drive state machines to ready)
         self._simulate_subsystems_ready()
 
         # Phase 2: Simulate the analysis workflow for each object
@@ -109,16 +99,44 @@ class WorkflowSimulator:
         return list(self.orchestrator.adapters.keys())
 
     def _simulate_subsystems_ready(self) -> None:
-        """Simulate all subsystems becoming ready."""
+        """Simulate all subsystems becoming ready by driving their state machines."""
         subsystem_names = self._get_subsystem_names()
 
         for name in subsystem_names:
             if not self._running:
                 return
+
+            adapter = self.orchestrator.adapters.get(name)
+            if adapter and adapter.state_machine:
+                # Drive the state machine to ready state
+                current = adapter.state_machine.current_state
+                if current != "ready":
+                    # Try to transition to ready
+                    try:
+                        # If in error state, fire reset
+                        if current == "error":
+                            adapter.fire_transition("reset")
+                        # If in stopped state, fire ready
+                        elif current == "stopped":
+                            adapter.fire_transition("ready")
+                        # If in running/paused, fire stop then ready
+                        elif current in ("running", "paused"):
+                            adapter.fire_transition("stop")
+                            time.sleep(0.05)
+                            adapter.fire_transition("ready")
+                    except Exception as exc:
+                        logger.warning("Failed to transition %s to ready: %s", name, exc)
+
+            # Publish status update
             topic = f"automata/subsystem/{name}/status"
             payload = {"state": "ready", "timestamp": time.time()}
             self._publish_mqtt(topic, payload)
             logger.info("Simulation: subsystem %s -> ready", name)
+
+            # Update orchestrator's adapter state
+            if name in self.orchestrator.adapters:
+                self.orchestrator.adapters[name].update_state(SubsystemState.READY)
+
             time.sleep(0.1)
 
         # Update orchestrator's subsystem states
@@ -134,13 +152,13 @@ class WorkflowSimulator:
     ) -> None:
         """Simulate the analysis of a single object.
 
-        Uses the configured subsystems to determine the analysis steps.
+        Drives each subsystem's state machine through its transitions
+        to simulate realistic behavior.
         """
         self.orchestrator.set_current_object(object_id)
         self.orchestrator.set_total_objects(total)
 
         # Get ordered list of subsystems to simulate
-        # Required subsystems first, then optional ones
         required_names = self.orchestrator.required_subsystem_names
         optional_names = [
             name for name in self._get_subsystem_names()
@@ -152,34 +170,104 @@ class WorkflowSimulator:
             if not self._running:
                 break
 
-            # Determine the step name from config or default
-            step = DEFAULT_STEPS.get(subsystem_name, "processing")
+            adapter = self.orchestrator.adapters.get(subsystem_name)
+            if not adapter or not adapter.state_machine:
+                # No state machine, just publish a status update
+                topic = f"automata/subsystem/{subsystem_name}/status"
+                self._publish_mqtt(
+                    topic,
+                    {
+                        "state": "busy",
+                        "object": object_id,
+                        "step": "processing",
+                        "timestamp": time.time(),
+                    },
+                )
+                time.sleep(random.uniform(0.2, 0.5))
+                self._publish_mqtt(
+                    topic,
+                    {
+                        "state": "ready",
+                        "object": object_id,
+                        "step": "complete",
+                        "timestamp": time.time(),
+                    },
+                )
+                continue
+
+            # Determine the next state to transition to
+            current_state = adapter.state_machine.current_state
+            available = adapter.state_machine.get_available_transitions()
+
+            # Try to find a useful transition
+            next_event = None
+            next_state = None
+
+            # If we're in ready, try to start
+            if current_state == "ready":
+                if "start" in available:
+                    next_event = "start"
+                    next_state = available["start"]
+                elif "start" in adapter.state_machine.config.states.get("ready", adapter.state_machine.config.states.get("idle", type('obj', (), {'transitions': []})())).transitions if hasattr(adapter.state_machine.config.states.get("ready"), 'transitions') else []:
+                    for t in adapter.state_machine.config.states.get("ready", type('obj', (), {'transitions': []})).transitions:
+                        if t.event == "start":
+                            next_event = "start"
+                            next_state = t.target
+                            break
+
+            # If we're in a running/processing state, try to complete or stop
+            elif current_state in ("running", "measuring", "capturing", "analyzing", "uploading", "tool_changing"):
+                if "complete" in available:
+                    next_event = "complete"
+                    next_state = available["complete"]
+                elif "stop" in available:
+                    next_event = "stop"
+                    next_state = available["stop"]
+
+            # If we're in paused, resume
+            elif current_state == "paused":
+                if "resume" in available:
+                    next_event = "resume"
+                    next_state = available["resume"]
+
+            # If we're in error, reset
+            elif current_state == "error":
+                if "reset" in available:
+                    next_event = "reset"
+                    next_state = available["reset"]
+
+            # If we're in stopped, start again
+            elif current_state == "stopped":
+                if "start" in available:
+                    next_event = "start"
+                    next_state = available["start"]
+
+            if next_event and next_state:
+                try:
+                    adapter.fire_transition(next_event)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to fire '%s' on %s: %s", next_event, subsystem_name, exc,
+                    )
+                    continue
+
+            # Publish status update with the new state
             topic = f"automata/subsystem/{subsystem_name}/status"
-
+            new_state = adapter.state_machine.current_state
             self._publish_mqtt(
                 topic,
                 {
-                    "state": "busy",
+                    "state": new_state,
                     "object": object_id,
-                    "step": step,
+                    "step": new_state,
                     "timestamp": time.time(),
                 },
             )
-            # Simulate processing time (shorter for optional subsystems)
+
+            # Simulate processing time
             is_required = subsystem_name in required_names
-            delay = random.uniform(0.15, 0.35) if is_required else random.uniform(0.05, 0.15)
+            delay = random.uniform(0.3, 0.6) if is_required else random.uniform(0.1, 0.3)
             time.sleep(delay)
-
-            # Return to ready
-            self._publish_mqtt(
-                topic,
-                {
-                    "state": "ready",
-                    "object": object_id,
-                    "step": "complete",
-                    "timestamp": time.time(),
-                },
-            )
 
         # Update progress
         self.orchestrator._progress = current
@@ -198,14 +286,14 @@ class WorkflowSimulator:
         # Transition: running -> stopping via stop_requested event
         try:
             self.orchestrator.fire_event("stop_requested")
-            time.sleep(0.3)
+            time.sleep(0.1)
         except Exception as exc:
             logger.warning("Failed to fire stop_requested: %s", exc)
 
         # Transition: stopping -> stopped via stopped event
         try:
             self.orchestrator.fire_event("stopped")
-            time.sleep(0.3)
+            time.sleep(0.1)
         except Exception as exc:
             logger.warning("Failed to fire stopped: %s", exc)
 

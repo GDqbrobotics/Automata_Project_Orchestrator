@@ -10,6 +10,7 @@ export type WorkflowCommand =
 export type WorkflowEvent =
   | 'workflow_state_changed'
   | 'subsystem_status_updated'
+  | 'subsystem_state_changed'
   | 'error_reported'
   | 'progress_updated';
 
@@ -35,8 +36,12 @@ export interface WorkflowStatus {
 
 export interface SubsystemStatus {
   name: string;
+  display_name: string;
+  type: string;
   state: string;
+  state_description: string;
   ready: boolean;
+  required: boolean;
   error: string | null;
   metadata: Record<string, unknown>;
 }

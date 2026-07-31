@@ -112,15 +112,22 @@ export class App {
         : name;
       const stateClass = info ? info.state : 'offline';
       const stateText = info ? info.state : 'offline';
+      const stateDescription = info ? info.state_description || '' : '';
 
       // Show required indicator
       const requiredBadge = config && config.required
         ? '<span class="required-badge" title="Required">*</span>'
         : '';
 
+      // Show state description if available
+      const descriptionHtml = stateDescription
+        ? `<div class="subsystem-state-desc">${stateDescription}</div>`
+        : '';
+
       card.innerHTML = `
         <div class="subsystem-name">${displayName}${requiredBadge}</div>
         <div class="subsystem-state ${stateClass}">${stateText}</div>
+        ${descriptionHtml}
       `;
       grid.appendChild(card);
     }

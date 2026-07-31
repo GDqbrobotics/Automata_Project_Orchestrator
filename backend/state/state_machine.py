@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
@@ -76,15 +77,46 @@ class StateMachineEngine:
       - explicit states and transitions
       - event-driven transitions
       - action execution during transitions
+      - custom action handlers for extensibility
+
+    Actions supported by default:
+      - log_event: log the transition event
+      - update_operator_ui: notify UI update
+      - publish_mqtt_message: publish to an MQTT topic
+
+    Custom actions can be registered via register_action().
     """
 
-    def __init__(self, config_path: str | Path, mqtt_client: Any = None) -> None:
+    def __init__(
+        self,
+        config_path: str | Path,
+        mqtt_client: Any = None,
+        config_name: str | None = None,
+    ) -> None:
         self.config_path = Path(config_path)
         self.mqtt_client = mqtt_client
+        self.config_name = config_name or self.config_path.stem
         self.config: StateMachineConfig = StateMachineConfig.from_yaml(config_path)
         self.current_state: str = self.config.initial_state
+        self._action_handlers: Dict[str, Callable] = {}
+
+        # Register default action handlers
+        self.register_action("log_event", self._action_log_event)
+        self.register_action("update_operator_ui", self._action_update_ui)
+        self.register_action("publish_mqtt_message", self._action_publish_mqtt)
+
         logger.info("State machine loaded: %s (initial: %s)",
-                     self.config.name, self.current_state)
+                     self.config_name, self.current_state)
+
+    def register_action(self, name: str, handler: Callable) -> None:
+        """Register a custom action handler.
+
+        Args:
+            name: The action name as used in the YAML config.
+            handler: A callable that receives (action_value, event, status).
+        """
+        self._action_handlers[name] = handler
+        logger.debug("Registered action handler: %s", name)
 
     # ------------------------------------------------------------------
     # Configuration
@@ -129,28 +161,64 @@ class StateMachineEngine:
             if transition.event == event:
                 target = transition.target
                 if target and target in states:
-                    # Execute actions
+                    # Execute actions before transitioning
                     self._execute_actions(transition.actions, event, status)
                     self.current_state = target
-                    logger.info("Transition: %s -> %s (event: %s)", current, target, event)
+                    logger.info(
+                        "State machine '%s': %s -> %s (event: %s)",
+                        self.config_name, current, target, event,
+                    )
                     return target
                 else:
                     raise StateMachineError(f"Invalid target state: {target}")
 
-        raise StateMachineError(f"No transition for event '{event}' in state '{current}'")
+        raise StateMachineError(
+            f"No transition for event '{event}' in state '{current}'"
+        )
 
     # ------------------------------------------------------------------
     # Action execution
     # ------------------------------------------------------------------
-    def _execute_actions(self, actions: List[str], event: str, status: Any = None) -> None:
+    def _execute_actions(
+        self,
+        actions: List[str],
+        event: str,
+        status: Any = None,
+    ) -> None:
         for action in actions:
             if isinstance(action, str):
-                if action == "log_event":
-                    logger.info("Action: log_event (event=%s)", event)
-                elif action == "update_operator_ui":
-                    logger.info("Action: update_operator_ui")
+                # Simple string action - look up handler
+                handler = self._action_handlers.get(action)
+                if handler:
+                    try:
+                        handler(None, event, status)
+                    except Exception:
+                        logger.exception("Action handler error: %s", action)
+                else:
+                    logger.warning("Unknown action: %s", action)
             elif isinstance(action, dict):
+                # Dict action: {action_name: value}
                 for key, value in action.items():
-                    if key == "publish_mqtt_message":
-                        if self.mqtt_client:
-                            self.mqtt_client.publish(f"automata/{value}", {"event": value})
+                    handler = self._action_handlers.get(key)
+                    if handler:
+                        try:
+                            handler(value, event, status)
+                        except Exception:
+                            logger.exception(
+                                "Action handler error: %s = %s", key, value,
+                            )
+                    else:
+                        logger.warning("Unknown action: %s", key)
+
+    # ------------------------------------------------------------------
+    # Default action handlers
+    # ------------------------------------------------------------------
+    def _action_log_event(self, value: Any, event: str, status: Any = None) -> None:
+        logger.info("Action: log_event (event=%s)", event)
+
+    def _action_update_ui(self, value: Any, event: str, status: Any = None) -> None:
+        logger.info("Action: update_operator_ui")
+
+    def _action_publish_mqtt(self, value: Any, event: str, status: Any = None) -> None:
+        if self.mqtt_client:
+            self.mqtt_client.publish(f"automata/{value}", {"event": value})

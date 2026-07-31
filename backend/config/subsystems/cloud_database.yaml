@@ -1,0 +1,65 @@
+# Cloud Database Subsystem Configuration
+name: cloud_database
+display_name: Cloud Database
+type: storage
+mqtt_topic: "automata/subsystem/{name}"
+initial_state: ready
+required: false
+metadata:
+  description: "Cloud storage for digital twin records"
+
+states:
+  ready:
+    description: "Cloud connection is ready and idle"
+    transitions:
+      - event: start
+        target: uploading
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/cloud_database/uploading
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
+  uploading:
+    description: "System is uploading data to cloud"
+    transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/cloud_database/ready
+
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
+          - publish_mqtt_message: subsystem/cloud_database/stopped
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
+  stopped:
+    description: "Cloud operation has stopped"
+    transitions:
+      - event: start
+        target: uploading
+        actions:
+          - log_event
+
+      - event: ready
+        target: ready
+        actions:
+          - log_event
+
+  error:
+    description: "Cloud service is in error state"
+    transitions:
+      - event: reset
+        target: ready
+        actions:
+          - log_event
