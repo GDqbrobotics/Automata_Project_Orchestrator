@@ -525,7 +525,7 @@ class WorkflowOrchestrator:
             event_type=event_type,
             details=details,
         ).to_dict()
-        self.frontend.broadcast_status(self._status)
+        self.frontend.broadcast(payload)
 
     def _get_status(self) -> WorkflowStatus:
         return self._status

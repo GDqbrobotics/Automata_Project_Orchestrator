@@ -135,6 +135,18 @@ class FrontendServer:
         if self._event_loop is not None and self._event_loop.is_running():
             asyncio.run_coroutine_threadsafe(self._broadcast(payload, clients), self._event_loop)
 
+    def broadcast(self, payload: Dict[str, Any]) -> None:
+        """Broadcast an arbitrary payload to all connected clients.
+
+        This is used for events that are not workflow state changes,
+        such as subsystem state changes or progress updates.
+        """
+        # Capture clients list while holding thread-safe lock
+        with self._broadcast_lock:
+            clients = list(self._connected_clients)
+        if self._event_loop is not None and self._event_loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._broadcast(payload, clients), self._event_loop)
+
     def set_subsystem_config(self, config_list: List[Dict[str, Any]]) -> None:
         """Set the subsystem configuration to broadcast with status updates."""
         self._subsystem_config = config_list

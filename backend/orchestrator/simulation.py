@@ -117,15 +117,12 @@ class WorkflowSimulator:
                 current = adapter.state_machine.current_state
                 if current == "initializing":
                     try:
-                        adapter.fire_transition("init_complete")
+                        # Use orchestrator's fire_subsystem_transition to ensure
+                        # frontend notifications happen correctly
+                        self.orchestrator.fire_subsystem_transition(name, "init_complete")
                         logger.info("Simulation: subsystem %s initialized -> ready", name)
                     except Exception as exc:
                         logger.warning("Failed to initialize %s: %s", name, exc)
-
-                # Publish status update
-                topic = f"automata/subsystem/{name}/status"
-                payload = {"state": "ready", "timestamp": time.time()}
-                self._publish_mqtt(topic, payload)
 
                 # Update orchestrator's adapter state
                 if name in self.orchestrator.adapters:
@@ -246,25 +243,19 @@ class WorkflowSimulator:
 
             if next_event and next_state:
                 try:
-                    adapter.fire_transition(next_event)
+                    # Use orchestrator's fire_subsystem_transition to ensure
+                    # frontend notifications happen correctly
+                    self.orchestrator.fire_subsystem_transition(subsystem_name, next_event)
                 except Exception as exc:
                     logger.warning(
                         "Failed to fire '%s' on %s: %s", next_event, subsystem_name, exc,
                     )
                     continue
 
-            # Publish status update with the new state
-            topic = f"automata/subsystem/{subsystem_name}/status"
+            # Update adapter state
             new_state = adapter.state_machine.current_state
-            self._publish_mqtt(
-                topic,
-                {
-                    "state": new_state,
-                    "object": object_id,
-                    "step": new_state,
-                    "timestamp": time.time(),
-                },
-            )
+            if subsystem_name in self.orchestrator.adapters:
+                self.orchestrator.adapters[subsystem_name].update_state(SubsystemState.READY)
 
             # Simulate processing time
             is_required = subsystem_name in required_names
