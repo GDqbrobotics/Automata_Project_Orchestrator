@@ -25,6 +25,8 @@ class TransitionConfig:
     event: str
     target: str
     actions: List[str] = field(default_factory=list)
+    # Additional event to fire after transition (for cross-level communication)
+    on_complete_event: Optional[str] = None
 
 
 @dataclass
@@ -51,10 +53,18 @@ class StateMachineConfig:
         for state_name, state_data in data.get("states", {}).items():
             transitions: List[TransitionConfig] = []
             for t in state_data.get("transitions", []):
+                actions = t.get("actions", [])
+                on_complete_event = None
+                # Check if any action is an event action: {event: <name>}
+                for action in actions:
+                    if isinstance(action, dict) and "event" in action:
+                        on_complete_event = action["event"]
+                        break
                 transitions.append(TransitionConfig(
                     event=t["event"],
                     target=t["target"],
-                    actions=t.get("actions", []),
+                    actions=actions,
+                    on_complete_event=on_complete_event,
                 ))
             states[state_name] = StateConfig(
                 name=state_name,
@@ -99,6 +109,7 @@ class StateMachineEngine:
         self.config: StateMachineConfig = StateMachineConfig.from_yaml(config_path)
         self.current_state: str = self.config.initial_state
         self._action_handlers: Dict[str, Callable] = {}
+        self._on_complete_event: Optional[Callable[[str], None]] = None
 
         # Register default action handlers
         self.register_action("log_event", self._action_log_event)
@@ -117,6 +128,24 @@ class StateMachineEngine:
         """
         self._action_handlers[name] = handler
         logger.debug("Registered action handler: %s", name)
+
+    def set_on_complete_event_callback(
+        self,
+        callback: Callable[[str], None],
+    ) -> None:
+        """Set callback for events fired on transition completion.
+
+        When a transition completes and has an 'event' action, this callback
+        is invoked with the event name. Used for cross-level state machine
+        communication (e.g., object state machine → orchestrator).
+
+        Args:
+            callback: Called with (event_name) when a transition completes
+                      with an event action.
+        """
+        self._on_complete_event = callback
+        logger.debug("Registered on_complete_event callback for %s",
+                     self.config_name)
 
     # ------------------------------------------------------------------
     # Configuration
@@ -168,6 +197,9 @@ class StateMachineEngine:
                         "State machine '%s': %s -> %s (event: %s)",
                         self.config_name, current, target, event,
                     )
+                    # Fire the on_complete_event if defined
+                    if transition.on_complete_event and self._on_complete_event:
+                        self._on_complete_event(transition.on_complete_event)
                     return target
                 else:
                     raise StateMachineError(f"Invalid target state: {target}")
@@ -199,6 +231,10 @@ class StateMachineEngine:
             elif isinstance(action, dict):
                 # Dict action: {action_name: value}
                 for key, value in action.items():
+                    # Skip 'event' actions - they are handled by on_complete_event
+                    # callback after the transition, not during action execution
+                    if key == "event":
+                        continue
                     handler = self._action_handlers.get(key)
                     if handler:
                         try:

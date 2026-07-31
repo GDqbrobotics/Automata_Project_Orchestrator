@@ -58,6 +58,8 @@ class ObjectStateMachines:
 
         # Callback for object state changes
         self._on_change: Optional[Callable[[str, str, str], None]] = None
+        # Callback for events fired on transition completion
+        self._on_event: Optional[Callable[[str, str], None]] = None
         # Lock for thread safety
         self._lock = threading.RLock()
 
@@ -79,6 +81,16 @@ class ObjectStateMachines:
         """
         self._on_change = callback
 
+    def on_event(self, callback: Callable[[str, str], None]) -> None:
+        """Register a callback for events fired on transition completion.
+
+        Args:
+            callback: Called with (object_id, event_name) when a transition
+                      completes with an 'event' action. The orchestrator uses
+                      this to trigger subsystem actions.
+        """
+        self._on_event = callback
+
     # ------------------------------------------------------------------
     # Object lifecycle
     # ------------------------------------------------------------------
@@ -97,6 +109,10 @@ class ObjectStateMachines:
             engine = StateMachineEngine(
                 config_path=self.config_path,
                 config_name=f"object:{object_id}",
+            )
+            # Wire up the on_complete_event callback
+            engine.set_on_complete_event_callback(
+                lambda event_name, oid=object_id: self._fire_event(oid, event_name),
             )
             self._machines[object_id] = engine
             self._state_descriptions[object_id] = engine.config.states.get(
@@ -295,11 +311,16 @@ class ObjectStateMachines:
             with open(state_file, "r") as f:
                 data = json.load(f)
 
-            machine = StateMachineEngine(
+            engine = StateMachineEngine(
                 config_path=self.config_path,
                 config_name=f"object:{object_id}",
             )
+            # Wire up the on_complete_event callback
+            engine.set_on_complete_event_callback(
+                lambda event_name, oid=object_id: self._fire_event(oid, event_name),
+            )
             # Restore the persisted state
+            machine = engine
             machine.current_state = data.get("state", machine.config.initial_state)
 
             self._machines[object_id] = machine
@@ -320,6 +341,28 @@ class ObjectStateMachines:
         for state_file in sorted(self.storage_dir.glob("*.json")):
             object_id = state_file.stem
             self._load_object_from_disk(object_id)
+
+    # ------------------------------------------------------------------
+    # Event firing
+    # ------------------------------------------------------------------
+    def _fire_event(self, object_id: str, event_name: str) -> None:
+        """Fire an event from an object state machine transition.
+
+        Called by the state machine engine when a transition completes
+        with an 'event' action. The callback notifies the orchestrator
+        so it can trigger the appropriate subsystem action.
+
+        Args:
+            object_id: The object that fired the event.
+            event_name: The event name (e.g., 'trigger_robot_first_pick').
+        """
+        if self._on_event:
+            self._on_event(object_id, event_name)
+        else:
+            logger.warning(
+                "No event callback registered for object '%s' event '%s'",
+                object_id, event_name,
+            )
 
     # ------------------------------------------------------------------
     # Cleanup

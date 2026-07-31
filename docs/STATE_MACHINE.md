@@ -179,6 +179,8 @@ states:
 
 Each analyzed object gets a runtime instance of this state machine. The orchestrator creates one instance per object, drives transitions based on subsystem completions, and persists the state to disk.
 
+**Design principle**: Object state machines do NOT publish MQTT messages. MQTT publishing is reserved for subsystem state machines only. Interactions between state machine levels are internal and driven by `event` actions.
+
 ```yaml
 name: object_analysis_workflow
 initial_state: identified_in_box
@@ -191,6 +193,7 @@ states:
         target: moving_to_disk
         actions:
           - log_event
+          - event: trigger_robot_first_pick
 
   moving_to_disk:
     description: Object is being moved from the box to the rotating platform disk
@@ -200,6 +203,7 @@ states:
         actions:
           - log_event
           - update_operator_ui
+          - event: trigger_imaging_capture
 
   HSI_3DI_analysis:
     description: 3D imaging and hyperspectral imaging capture is being performed
@@ -208,7 +212,7 @@ states:
         target: object_going_second_position
         actions:
           - log_event
-          - publish_mqtt_message: object/imaging_complete
+          - event: trigger_platform_rotate_to_second
 
   object_going_second_position:
     description: Rotating platform is moving the object to the second measurement position
@@ -217,7 +221,7 @@ states:
         target: XRF_RAMAN_analysis
         actions:
           - log_event
-          - publish_mqtt_message: object/rotated_second
+          - event: trigger_measurements
 
   XRF_RAMAN_analysis:
     description: XRF and Raman puntual measurements are being performed at AI-extracted points
@@ -226,7 +230,7 @@ states:
         target: object_going_first_position
         actions:
           - log_event
-          - publish_mqtt_message: object/measurements_complete
+          - event: trigger_platform_rotate_to_first
 
   object_going_first_position:
     description: Rotating platform is moving the object back to the first position
@@ -235,7 +239,7 @@ states:
         target: moving_to_box
         actions:
           - log_event
-          - publish_mqtt_message: object/rotated_first
+          - event: trigger_robot_first_return
 
   moving_to_box:
     description: Object is being moved from the disk back to its original position in the box
@@ -245,7 +249,7 @@ states:
         actions:
           - log_event
           - update_operator_ui
-          - publish_mqtt_message: object/returned_to_box
+          - event: trigger_cloud_upload
 
   object_analyzed:
     description: Object analysis is complete – data will be uploaded to the cloud database
@@ -258,6 +262,25 @@ states:
 - State survives orchestrator restarts via disk persistence
 - Terminal state (`object_analyzed`) has no transitions
 - Each transition is logged with timestamps
+
+**Event actions in object state machines**:
+- Each transition can include an `event:` action (e.g., `event: trigger_robot_first_pick`)
+- This event is fired AFTER the transition completes, not during action execution
+- The orchestrator handles the event and triggers the appropriate subsystem action
+- The subsystem action publishes MQTT commands to the hardware
+- This keeps MQTT publishing centralized in the orchestrator's subsystem trigger methods
+
+**Event-to-subsystem mapping**:
+
+| Object Event | Subsystem Triggered | MQTT Command |
+|---|---|---|
+| `trigger_robot_first_pick` | robot_first | `pick_object` |
+| `trigger_imaging_capture` | imaging_3di_hsi | `start_capture` |
+| `trigger_platform_rotate_to_second` | rotating_platform | `rotate_to_second` |
+| `trigger_measurements` | xrf, raman, ai_analysis | `start_measurement` |
+| `trigger_platform_rotate_to_first` | rotating_platform | `rotate_to_first` |
+| `trigger_robot_first_return` | robot_first | `return_object` |
+| `trigger_cloud_upload` | cloud_database | `upload_data` |
 
 ### Subsystem state machines (`backend/config/subsystems/*.yaml`)
 

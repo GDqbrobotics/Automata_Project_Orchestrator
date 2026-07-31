@@ -164,7 +164,9 @@ When a subsystem's state machine transitions, the change is:
 
 ### Object configuration
 
-Each analyzed object follows a declarative sub-workflow defined in `backend/config/object.yaml`. When the vision system identifies an object (or in simulation), the orchestrator creates a state machine instance for it:
+Each analyzed object follows a declarative sub-workflow defined in `backend/config/object.yaml`. When the vision system identifies an object (or in simulation), the orchestrator creates a state machine instance for it.
+
+**Design principle**: Object state machines do NOT publish MQTT messages. MQTT publishing is reserved for subsystem state machines only. Interactions between state machine levels are internal and driven by `event` actions in the YAML.
 
 ```yaml
 name: object_analysis_workflow
@@ -178,6 +180,7 @@ states:
         target: moving_to_disk
         actions:
           - log_event
+          - event: trigger_robot_first_pick
 
   moving_to_disk:
     description: Object is being moved from the box to the rotating platform disk
@@ -187,6 +190,7 @@ states:
         actions:
           - log_event
           - update_operator_ui
+          - event: trigger_imaging_capture
 
   HSI_3DI_analysis:
     description: 3D imaging and hyperspectral imaging capture is being performed
@@ -195,7 +199,7 @@ states:
         target: object_going_second_position
         actions:
           - log_event
-          - publish_mqtt_message: object/imaging_complete
+          - event: trigger_platform_rotate_to_second
 
   object_going_second_position:
     description: Rotating platform is moving the object to the second measurement position
@@ -204,7 +208,7 @@ states:
         target: XRF_RAMAN_analysis
         actions:
           - log_event
-          - publish_mqtt_message: object/rotated_second
+          - event: trigger_measurements
 
   XRF_RAMAN_analysis:
     description: XRF and Raman puntual measurements are being performed at AI-extracted points
@@ -213,7 +217,7 @@ states:
         target: object_going_first_position
         actions:
           - log_event
-          - publish_mqtt_message: object/measurements_complete
+          - event: trigger_platform_rotate_to_first
 
   object_going_first_position:
     description: Rotating platform is moving the object back to the first position
@@ -222,7 +226,7 @@ states:
         target: moving_to_box
         actions:
           - log_event
-          - publish_mqtt_message: object/rotated_first
+          - event: trigger_robot_first_return
 
   moving_to_box:
     description: Object is being moved from the disk back to its original position in the box
@@ -232,15 +236,28 @@ states:
         actions:
           - log_event
           - update_operator_ui
-          - publish_mqtt_message: object/returned_to_box
+          - event: trigger_cloud_upload
 
   object_analyzed:
     description: Object analysis is complete – data will be uploaded to the cloud database
 ```
 
+**Event-driven flow** (internal, no MQTT from object state machines):
+
+```
+1. Vision identifies object → orchestrator fires object_picked transition
+2. Object transitions to moving_to_disk → fires event: trigger_robot_first_pick
+3. Orchestrator handles event → publishes MQTT to robot_first (command: pick_object)
+4. Robot completes → orchestrator fires object_placed_on_disk transition
+5. Object transitions to HSI_3DI_analysis → fires event: trigger_imaging_capture
+6. Orchestrator handles event → publishes MQTT to imaging_3di_hsi (command: start_capture)
+7. 3DI/HSI completes → orchestrator fires imaging_capture_complete transition
+... (continues until object_analyzed)
+```
+
 **Object lifecycle**:
 1. Vision system identifies an object → `orchestrator.create_object(object_id)`
-2. Subsystem events trigger object transitions (e.g., `imaging_capture_complete`)
+2. Subsystem events trigger object transitions (e.g., `object_placed_on_disk`)
 3. Each transition is persisted to `backend/object_states/{object_id}.json`
 4. Object reaches `object_analyzed` → progress counter increments
 5. State survives orchestrator restarts via disk persistence
@@ -252,11 +269,19 @@ states:
 - **Step number** (e.g., "Step 3 / 8")
 - **Transition count**
 
-### Object state machine events
+### Object-to-subsystem event mapping
 
-Events are driven by subsystem completions:
+Object state machine transitions fire internal events that the orchestrator handles by triggering subsystem actions:
 
-| Subsystem | Event fired on object |
+| Object Transition | Event Fired | Subsystem Triggered | Command |
+|---|---|---|---|
+| identified_in_box → moving_to_disk | `trigger_robot_first_pick` | robot_first | pick_object |
+| moving_to_disk → HSI_3DI_analysis | `trigger_imaging_capture` | imaging_3di_hsi | start_capture |
+| HSI_3DI_analysis → object_going_second_position | `trigger_platform_rotate_to_second` | rotating_platform | rotate_to_second |
+| object_going_second_position → XRF_RAMAN_analysis | `trigger_measurements` | xrf, raman, ai_analysis | start_measurement |
+| XRF_RAMAN_analysis → object_going_first_position | `trigger_platform_rotate_to_first` | rotating_platform | rotate_to_first |
+| object_going_first_position → moving_to_box | `trigger_robot_first_return` | robot_first | return_object |
+| moving_to_box → object_analyzed | `trigger_cloud_upload` | cloud_database | upload_data |
 |---|---|
 | Vision system | `object_picked` |
 | Robot arm 1 (pick & place) | `object_picked`, `object_placed_on_disk` |

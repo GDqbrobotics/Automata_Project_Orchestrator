@@ -132,12 +132,18 @@ Major architectural change: each analyzed object now has its own YAML-driven sta
 - `ObjectStateMachines` class manages per-object state machine instances
 - Each object gets a `StateMachineEngine` loaded from `object.yaml` blueprint
 - Object state is persisted to `backend/object_states/{object_id}.json` (survives restarts)
+- `StateMachineEngine` now supports `event` action in YAML transitions (fires internal event after transition)
+- `StateMachineEngine.set_on_complete_event_callback()` wires event callbacks to state machines
 - `WorkflowOrchestrator` integrates `ObjectStateMachines` with new methods:
   - `create_object(object_id)` – creates an object instance and notifies frontend
   - `remove_object(object_id)` – removes an object instance
   - `fire_object_transition(object_id, event)` – fires a transition on the object's state machine
+  - `_on_object_event(object_id, event_name)` – handles object events, triggers subsystem actions
   - `_on_object_state_change()` – callback for object state changes
   - `_broadcast_objects()` – broadcasts object list to frontend
+  - `_trigger_robot_first_pick()`, `_trigger_imaging_capture()`, etc. – subsystem trigger methods
+  - `_fire_subsystem_command()` – publishes MQTT commands to subsystems
+- Event handler registry maps object events to subsystem actions
 - Simulation now creates objects and drives their full 8-state analysis pipeline
 - New domain models: `ObjectState` enum, `ObjectInfo` dataclass, new `BackendEvent` types
 
@@ -152,11 +158,27 @@ Major architectural change: each analyzed object now has its own YAML-driven sta
 
 **Simulation changes**:
 - Simulation now creates an object for each item to analyze
-- Maps subsystem completions to object events (e.g., `imaging_capture_complete` from 3DI/HSI subsystem)
+- Uses event-driven flow: object fires event → orchestrator triggers subsystem → subsystem completes → object transitions
 - Drives each object through the full 8-state pipeline
 - Tests 8-10 added: config validation, transition testing with persistence, orchestrator integration
 
-**Test results**: 108 tests passing (was 43)
+**Test results**: 122 tests passing (was 43)
+
+### Event-driven architecture update (2026-07-31)
+
+Refined the object state machine design to follow the main design principle: **MQTT publishing only for subsystem state machines. Interactions between state machine levels are internal and driven by events.**
+
+**Changes**:
+- Removed all `publish_mqtt_message` actions from `object.yaml`
+- Added `event:` action in YAML transitions to fire internal events (e.g., `event: trigger_robot_first_pick`)
+- `StateMachineConfig` now parses `event` actions and stores them in `TransitionConfig.on_complete_event`
+- `StateMachineEngine` fires `on_complete_event` callback after transition (not during action execution)
+- `ObjectStateMachines` wires up `on_complete_event` callback to orchestrator's `_on_object_event`
+- Orchestrator maps object events to subsystem trigger methods (e.g., `trigger_robot_first_pick` → `robot_first.pick_object`)
+- Subsystem trigger methods publish MQTT commands to subsystems
+- Simulation follows the event-driven flow: object event → orchestrator triggers subsystem → subsystem completes → object transition
+
+**Design principle**: The object state machine does NOT publish MQTT. It fires internal events that the orchestrator handles by triggering subsystem actions (which DO publish MQTT). This keeps MQTT publishing centralized in the orchestrator's subsystem trigger methods.
 
 ### Object workflow states
 

@@ -104,6 +104,20 @@ class WorkflowOrchestrator:
         )
         # Register callback for object state changes
         self.object_manager.on_change(self._on_object_state_change)
+        # Register callback for events fired on transition completion
+        self.object_manager.on_event(self._on_object_event)
+
+        # Object event → subsystem action mapping
+        # Maps object events to the subsystem action to trigger
+        self._object_event_handlers: Dict[str, Callable[[str], None]] = {
+            "trigger_robot_first_pick": self._trigger_robot_first_pick,
+            "trigger_imaging_capture": self._trigger_imaging_capture,
+            "trigger_platform_rotate_to_second": self._trigger_platform_rotate_to_second,
+            "trigger_measurements": self._trigger_measurements,
+            "trigger_platform_rotate_to_first": self._trigger_platform_rotate_to_first,
+            "trigger_robot_first_return": self._trigger_robot_first_return,
+            "trigger_cloud_upload": self._trigger_cloud_upload,
+        }
 
         # Simulation mode
         self._use_simulation = use_simulation
@@ -446,6 +460,29 @@ class WorkflowOrchestrator:
             new_state, event,
         )
 
+    def _on_object_event(self, object_id: str, event_name: str) -> None:
+        """Handle events fired by object state machine transitions.
+
+        When an object state machine transition completes with an 'event' action,
+        this method is called to trigger the appropriate subsystem action.
+
+        Args:
+            object_id: The object that fired the event.
+            event_name: The event name (e.g., 'trigger_robot_first_pick').
+        """
+        handler = self._object_event_handlers.get(event_name)
+        if handler:
+            logger.info(
+                "Object '%s' event '%s' → triggering subsystem action",
+                object_id, event_name,
+            )
+            handler(object_id)
+        else:
+            logger.warning(
+                "No handler registered for object event '%s' (object: %s)",
+                event_name, object_id,
+            )
+
     def _broadcast_objects(self) -> None:
         """Broadcast the current list of objects to the frontend."""
         with self._lock:
@@ -456,6 +493,60 @@ class WorkflowOrchestrator:
             {"objects": objects_info},
         )
         self.frontend.broadcast_status(self._status)
+
+    # ------------------------------------------------------------------
+    # Object event → subsystem trigger methods
+    # ------------------------------------------------------------------
+    def _trigger_robot_first_pick(self, object_id: str) -> None:
+        """Trigger first robot to pick object from box."""
+        logger.info("[Event] Triggering robot_first_pick for object '%s'", object_id)
+        self._fire_subsystem_command("robot_first", "pick_object", {"object_id": object_id})
+
+    def _trigger_robot_first_return(self, object_id: str) -> None:
+        """Trigger first robot to return object to box."""
+        logger.info("[Event] Triggering robot_first_return for object '%s'", object_id)
+        self._fire_subsystem_command("robot_first", "return_object", {"object_id": object_id})
+
+    def _trigger_imaging_capture(self, object_id: str) -> None:
+        """Trigger 3DI/HSI imaging capture."""
+        logger.info("[Event] Triggering imaging_capture for object '%s'", object_id)
+        self._fire_subsystem_command("imaging_3di_hsi", "start_capture", {"object_id": object_id})
+
+    def _trigger_platform_rotate_to_second(self, object_id: str) -> None:
+        """Trigger rotating platform to move object to second position."""
+        logger.info("[Event] Triggering platform_rotate_to_second for object '%s'", object_id)
+        self._fire_subsystem_command("rotating_platform", "rotate_to_second", {"object_id": object_id})
+
+    def _trigger_platform_rotate_to_first(self, object_id: str) -> None:
+        """Trigger rotating platform to move object back to first position."""
+        logger.info("[Event] Triggering platform_rotate_to_first for object '%s'", object_id)
+        self._fire_subsystem_command("rotating_platform", "rotate_to_first", {"object_id": object_id})
+
+    def _trigger_measurements(self, object_id: str) -> None:
+        """Trigger XRF/Raman measurements."""
+        logger.info("[Event] Triggering measurements for object '%s'", object_id)
+        self._fire_subsystem_command("xrf", "start_measurement", {"object_id": object_id})
+        self._fire_subsystem_command("raman", "start_measurement", {"object_id": object_id})
+        self._fire_subsystem_command("ai_analysis", "plan_measurements", {"object_id": object_id})
+
+    def _trigger_cloud_upload(self, object_id: str) -> None:
+        """Trigger cloud database upload."""
+        logger.info("[Event] Triggering cloud_upload for object '%s'", object_id)
+        self._fire_subsystem_command("cloud_database", "upload_data", {"object_id": object_id})
+
+    def _fire_subsystem_command(self, subsystem_name: str, command: str, payload: Dict[str, Any]) -> None:
+        """Publish a command to a subsystem via MQTT."""
+        adapter = self.adapters.get(subsystem_name)
+        if adapter:
+            # Get command topic from the adapter's config
+            config = adapter.config
+            topic = config.command_topic
+            self.mqtt.publish(topic, {"command": command, **payload})
+            logger.info("Published command '%s' to subsystem '%s' (topic: %s)",
+                       command, subsystem_name, topic)
+        else:
+            logger.warning("No adapter found for subsystem '%s' to fire command '%s'",
+                          subsystem_name, command)
 
     # ------------------------------------------------------------------
     # MQTT message dispatcher

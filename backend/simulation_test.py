@@ -913,6 +913,27 @@ def test_object_state_machine_config() -> None:
         "Final state 'object_analyzed' has no transitions",
     )
 
+    # Verify event actions are correctly parsed (on_complete_event)
+    # These events trigger subsystem actions when the object state machine
+    # transition completes
+    expected_events = {
+        "identified_in_box": "trigger_robot_first_pick",
+        "moving_to_disk": "trigger_imaging_capture",
+        "HSI_3DI_analysis": "trigger_platform_rotate_to_second",
+        "object_going_second_position": "trigger_measurements",
+        "XRF_RAMAN_analysis": "trigger_platform_rotate_to_first",
+        "object_going_first_position": "trigger_robot_first_return",
+        "moving_to_box": "trigger_cloud_upload",
+    }
+    for state, expected_event in expected_events.items():
+        transitions = manager.config.states[state].transitions
+        for t in transitions:
+            if t.event in expected_transitions.get(state, []):
+                results.check(
+                    t.on_complete_event == expected_event,
+                    f"Transition from '{state}' fires event '{expected_event}'",
+                )
+
     logger.info("Object state machine configuration test complete.\n")
 
 
@@ -1112,6 +1133,38 @@ async def test_object_in_orchestrator() -> None:
     results.check(
         len(status.objects) >= 1,
         f"Status includes {len(status.objects)} object(s)",
+    )
+
+    # Verify event handler mapping
+    orch = runner.orchestrator
+    event_handlers = orch._object_event_handlers
+    results.check(
+        "trigger_robot_first_pick" in event_handlers,
+        "Event handler registered for 'trigger_robot_first_pick'",
+    )
+    results.check(
+        "trigger_imaging_capture" in event_handlers,
+        "Event handler registered for 'trigger_imaging_capture'",
+    )
+    results.check(
+        "trigger_platform_rotate_to_second" in event_handlers,
+        "Event handler registered for 'trigger_platform_rotate_to_second'",
+    )
+    results.check(
+        "trigger_measurements" in event_handlers,
+        "Event handler registered for 'trigger_measurements'",
+    )
+    results.check(
+        "trigger_platform_rotate_to_first" in event_handlers,
+        "Event handler registered for 'trigger_platform_rotate_to_first'",
+    )
+    results.check(
+        "trigger_robot_first_return" in event_handlers,
+        "Event handler registered for 'trigger_robot_first_return'",
+    )
+    results.check(
+        "trigger_cloud_upload" in event_handlers,
+        "Event handler registered for 'trigger_cloud_upload'",
     )
 
     # Cleanup
