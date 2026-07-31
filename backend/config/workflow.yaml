@@ -1,0 +1,78 @@
+name: automata_gui_workflow
+initial_state: idle
+
+states:
+  idle:
+    description: Waiting for operator input
+    transitions:
+      - event: start_requested
+        target: starting
+        actions:
+          - log_event
+          - publish_mqtt_message: workflow.start
+
+  starting:
+    description: Preparing the workflow
+    transitions:
+      - event: subsystem_ready
+        target: running
+        actions:
+          - log_event
+          - update_operator_ui
+
+      - event: stop_requested
+        target: stopped
+        actions:
+          - publish_mqtt_message: workflow.stop
+
+  running:
+    description: Workflow in progress
+    transitions:
+      - event: pause_requested
+        target: paused
+        actions:
+          - publish_mqtt_message: workflow.pause
+
+      - event: stop_requested
+        target: stopping
+        actions:
+          - publish_mqtt_message: workflow.stop
+
+      - event: subsystem_error
+        target: error
+        actions:
+          - log_event
+          - update_operator_ui
+
+  paused:
+    description: Workflow temporarily suspended
+    transitions:
+      - event: resume_requested
+        target: running
+        actions:
+          - publish_mqtt_message: workflow.resume
+
+      - event: stop_requested
+        target: stopping
+        actions:
+          - publish_mqtt_message: workflow.stop
+
+  stopping:
+    description: Stopping workflow
+    transitions:
+      - event: stopped
+        target: stopped
+        actions:
+          - log_event
+
+  stopped:
+    description: Workflow ended by operator request
+
+  error:
+    description: Workflow interrupted by error
+    transitions:
+      - event: reset_requested
+        target: idle
+        actions:
+          - log_event
+          - clear_error_state
