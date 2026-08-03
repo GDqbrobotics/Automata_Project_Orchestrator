@@ -5,7 +5,10 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import yaml
 
 
 class WorkflowState(str, enum.Enum):
@@ -43,6 +46,7 @@ class WorkflowCommand(str, enum.Enum):
     RESUME_WORKFLOW = "resume_workflow"
     STOP_WORKFLOW = "stop_workflow"
     REQUEST_STATUS = "request_status"
+    RESET_WORKFLOW = "reset_workflow"
 
 
 class Command(str, enum.Enum):
@@ -103,6 +107,102 @@ class SubsystemConfig:
             "required": self.required,
             "metadata": self.metadata,
         }
+
+
+@dataclass
+class WorkflowActionCommand:
+    """A single subsystem command from the workflow_actions config."""
+
+    subsystem: str
+    command: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WorkflowActionCommand":
+        return cls(
+            subsystem=data["subsystem"],
+            command=data["command"],
+            payload=data.get("payload", {}),
+        )
+
+
+@dataclass
+class WorkflowAction:
+    """A workflow action: one object event triggers N subsystem commands."""
+
+    commands: List[WorkflowActionCommand] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WorkflowAction":
+        return cls(
+            commands=[
+                WorkflowActionCommand.from_dict(cmd)
+                for cmd in data
+            ],
+        )
+
+
+@dataclass
+class WorkflowActionsConfig:
+    """Full workflow actions configuration loaded from YAML.
+
+    Maps object state machine events to subsystem commands.
+    """
+
+    actions: Dict[str, WorkflowAction] = field(default_factory=dict)
+
+    @classmethod
+    def from_yaml(cls, config_path: str | Path) -> "WorkflowActionsConfig":
+        with open(config_path, "r") as f:
+            data = yaml.safe_load(f)
+        actions: Dict[str, WorkflowAction] = {}
+        for event_name, commands in data.get("event_actions", {}).items():
+            actions[event_name] = WorkflowAction.from_dict(commands)
+        return cls(actions=actions)
+
+
+@dataclass
+class GlobalConfig:
+    """Global configuration loaded from global.yaml.
+
+    Contains all default values: broker, ports, simulation defaults,
+    object workflow display settings, and workflow state messages.
+    """
+
+    mqtt_broker: str = "localhost"
+    mqtt_port: int = 1883
+    frontend_host: str = "0.0.0.0"
+    frontend_port: int = 8080
+    simulation_default_num_objects: int = 3
+    object_state_order: List[str] = field(default_factory=list)
+    object_state_colors: Dict[str, str] = field(default_factory=dict)
+    workflow_state_messages: Dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_yaml(cls, config_path: str | Path) -> "GlobalConfig":
+        with open(config_path, "r") as f:
+            data = yaml.safe_load(f)
+        if not data:
+            return cls()
+
+        mqtt_cfg = data.get("mqtt", {})
+        frontend_cfg = data.get("frontend", {})
+        sim_cfg = data.get("simulation", {})
+        obj_cfg = data.get("object_workflow", {})
+        wf_cfg = data.get("workflow_states", {})
+
+        return cls(
+            mqtt_broker=mqtt_cfg.get("broker", "localhost"),
+            mqtt_port=mqtt_cfg.get("port", 1883),
+            frontend_host=frontend_cfg.get("host", "0.0.0.0"),
+            frontend_port=frontend_cfg.get("port", 8080),
+            simulation_default_num_objects=sim_cfg.get(
+                "default_num_objects", 3
+            ),
+            object_state_order=obj_cfg.get("state_order", []),
+            object_state_colors=obj_cfg.get("state_colors", {}),
+            workflow_state_messages=wf_cfg,
+        )
 
 
 @dataclass

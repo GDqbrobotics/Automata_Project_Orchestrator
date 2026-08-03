@@ -11,11 +11,22 @@ import json
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
+import yaml
 
-from backend.domain.models import BackendEvent, SubsystemConfig, SubsystemState, WorkflowState
+from backend.domain.models import (
+    BackendEvent,
+    GlobalConfig,
+    SubsystemConfig,
+    SubsystemState,
+    WorkflowState,
+)
+
+# Placeholder for the project root
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +34,9 @@ logger = logging.getLogger(__name__)
 class WorkflowSimulator:
     """Simulates subsystems responding to the workflow state machine.
 
-    Each subsystem's state machine is driven through its transitions
-    to simulate realistic behavior.
+    Uses the workflow_actions.yaml config to determine the sequence of
+    subsystem commands for each object, and the object.yaml config to
+    determine the object state transitions.
     """
 
     def __init__(
@@ -34,14 +46,183 @@ class WorkflowSimulator:
         broker_port: int = 1883,
         num_objects: int = 3,
         subsystems_config: List[SubsystemConfig] | None = None,
+        global_config: GlobalConfig | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.num_objects = num_objects
         self.subsystems_config = subsystems_config or []
+        self._global_config = global_config or GlobalConfig()
         self._client: Optional[mqtt.Client] = None
         self._running = False
+
+        # Derived event chain (built from config at runtime)
+        self._event_chain: List[Dict[str, Any]] = []
+        self._default_delay: float = 0.4
+        self._build_event_chain()
+
+    def _build_event_chain(self) -> None:
+        """Build the simulation event chain from object.yaml + workflow_actions.yaml.
+
+        Reads the object state machine from object.yaml to get the state
+        transition sequence, and the workflow actions from workflow_actions.yaml
+        to know which subsystem commands to simulate for each event.
+
+        For multi-subsystem events (like trigger_measurements), all subsystems
+        are simulated before the object transition fires.
+        """
+        # Load object.yaml to get the state transition order
+        object_config_path = (
+            _PROJECT_ROOT / "backend" / "config" / "object.yaml"
+        )
+        if not object_config_path.exists():
+            logger.warning(
+                "object.yaml not found at %s, using default event chain",
+                object_config_path,
+            )
+            self._event_chain = self._default_event_chain()
+            return
+
+        with open(object_config_path, "r") as f:
+            object_data = yaml.safe_load(f)
+
+        # Load workflow_actions.yaml
+        actions_path = (
+            _PROJECT_ROOT / "backend" / "config" / "workflow_actions.yaml"
+        )
+        actions: Dict[str, Any] = {}
+        if actions_path.exists():
+            with open(actions_path, "r") as f:
+                actions_data = yaml.safe_load(f)
+                actions = actions_data.get("event_actions", {})
+
+        # Build the chain by walking through the object states in order
+        states = object_data.get("states", {})
+        chain: List[Dict[str, Any]] = []
+
+        # Get state order from global config or derive from YAML order
+        state_order = (
+            self._global_config.object_state_order
+            if self._global_config.object_state_order
+            else list(states.keys())
+        )
+
+        for state_name in state_order:
+            state_data = states.get(state_name, {})
+            for transition in state_data.get("transitions", []):
+                event_name = transition.get("event")
+                target_state = transition.get("target")
+
+                # Get the event action from the transition
+                event_action = self._get_event_action(transition)
+                if not event_action:
+                    continue
+
+                # Look up the workflow actions for this event
+                if event_action not in actions:
+                    logger.warning(
+                        "No workflow action found for event '%s', "
+                        "simulator will skip this step",
+                        event_action,
+                    )
+                    continue
+
+                action_cmds = actions[event_action]
+
+                # For the final state (object_analyzed), no subsystem transition needed
+                if target_state == "object_analyzed":
+                    for cmd in action_cmds:
+                        chain.append({
+                            "object_event": event_action,
+                            "subsystem": cmd.get("subsystem", ""),
+                            "subsystem_event": "start",
+                            "object_transition": None,
+                            "delay": self._default_delay,
+                        })
+                    continue
+
+                # For regular transitions: all subsystem commands share the same
+                # object_transition. The transition fires after ALL subsystems complete.
+                # We create one step per subsystem, but only the last one fires
+                # the object transition.
+                for i, cmd in enumerate(action_cmds):
+                    is_last = (i == len(action_cmds) - 1)
+                    chain.append({
+                        "object_event": event_action,
+                        "subsystem": cmd.get("subsystem", ""),
+                        "subsystem_event": "start",
+                        "object_transition": target_state if is_last else None,
+                        "delay": self._default_delay,
+                    })
+
+        self._event_chain = chain if chain else self._default_event_chain()
+        logger.info("Simulation event chain built with %d steps", len(self._event_chain))
+
+    @staticmethod
+    def _get_event_action(transition: Dict[str, Any]) -> Optional[str]:
+        """Extract the event action name from a transition."""
+        for action in transition.get("actions", []):
+            if isinstance(action, dict) and "event" in action:
+                return action["event"]
+            elif isinstance(action, str) and action.startswith("event:"):
+                return action.split(":", 1)[1].strip()
+        return None
+
+    @staticmethod
+    def _default_event_chain() -> List[Dict[str, Any]]:
+        """Fallback event chain when config files are missing."""
+        return [
+            {
+                "object_event": "trigger_robot_first_pick",
+                "subsystem": "robot_first",
+                "subsystem_event": "start",
+                "object_transition": "object_placed_on_disk",
+                "delay": 0.4,
+            },
+            {
+                "object_event": "trigger_imaging_capture",
+                "subsystem": "imaging_3di_hsi",
+                "subsystem_event": "start",
+                "object_transition": "imaging_capture_complete",
+                "delay": 0.5,
+            },
+            {
+                "object_event": "trigger_platform_rotate_to_second",
+                "subsystem": "rotating_platform",
+                "subsystem_event": "start",
+                "object_transition": "platform_rotated_to_second",
+                "delay": 0.3,
+            },
+            {
+                "object_event": "trigger_measurements",
+                "subsystem": "xrf",
+                "subsystem_event": "start",
+                "object_transition": "measurements_complete",
+                "delay": 0.6,
+            },
+            {
+                "object_event": "trigger_platform_rotate_to_first",
+                "subsystem": "rotating_platform",
+                "subsystem_event": "start",
+                "object_transition": "platform_rotated_to_first",
+                "delay": 0.3,
+            },
+            {
+                "object_event": "trigger_robot_first_return",
+                "subsystem": "robot_first",
+                "subsystem_event": "start",
+                "object_transition": "object_returned_to_box",
+                "delay": 0.4,
+            },
+            {
+                "object_event": "trigger_cloud_upload",
+                "subsystem": "cloud_database",
+                "subsystem_event": "start",
+                "object_transition": None,
+                "delay": 0.3,
+            },
+        ]
 
     def start(self) -> None:
         """Start the MQTT simulation client."""
@@ -151,17 +332,11 @@ class WorkflowSimulator:
     ) -> None:
         """Simulate the analysis of a single object.
 
-        Uses the event-driven flow:
+        Uses the config-driven event chain to:
         1. Object state machine fires event → orchestrator triggers subsystem
         2. Subsystem completes → simulation fires object transition
         3. Object state machine fires next event → orchestrator triggers next subsystem
         4. ... repeat until object is analyzed
-
-        This follows the real AUTOMATA machine workflow:
-        - Vision identifies → robot_first picks → places on disk
-        - 3DI/HSI capture → platform rotates to second position
-        - XRF/Raman measurements → platform rotates to first position
-        - robot_first returns object → cloud upload
         """
         self.orchestrator.set_current_object(object_id)
         self.orchestrator.set_total_objects(total)
@@ -169,65 +344,6 @@ class WorkflowSimulator:
         # Create the object state machine
         self.orchestrator.create_object(object_id)
         time.sleep(0.1)
-
-        # Object event → subsystem completion event mapping
-        # Maps the event fired by the object state machine to the subsystem
-        # that should be triggered, and the object transition to fire when
-        # that subsystem completes.
-        event_chain = [
-            {
-                "object_event": "trigger_robot_first_pick",
-                "subsystem": "robot_first",
-                "subsystem_event": "start",
-                "object_transition": "object_placed_on_disk",
-                "delay": 0.4,
-            },
-            {
-                "object_event": "trigger_imaging_capture",
-                "subsystem": "imaging_3di_hsi",
-                "subsystem_event": "start",
-                "object_transition": "imaging_capture_complete",
-                "delay": 0.5,
-            },
-            {
-                "object_event": "trigger_platform_rotate_to_second",
-                "subsystem": "rotating_platform",
-                "subsystem_event": "start",
-                "object_transition": "platform_rotated_to_second",
-                "delay": 0.3,
-            },
-            {
-                "object_event": "trigger_measurements",
-                "subsystems": [
-                    ("ai_analysis", "start"),
-                    ("xrf", "start"),
-                    ("raman", "start"),
-                ],
-                "object_transition": "measurements_complete",
-                "delay": 0.6,
-            },
-            {
-                "object_event": "trigger_platform_rotate_to_first",
-                "subsystem": "rotating_platform",
-                "subsystem_event": "start",
-                "object_transition": "platform_rotated_to_first",
-                "delay": 0.3,
-            },
-            {
-                "object_event": "trigger_robot_first_return",
-                "subsystem": "robot_first",
-                "subsystem_event": "start",
-                "object_transition": "object_returned_to_box",
-                "delay": 0.4,
-            },
-            {
-                "object_event": "trigger_cloud_upload",
-                "subsystem": "cloud_database",
-                "subsystem_event": "start",
-                "object_transition": None,  # Final state, no transition needed
-                "delay": 0.3,
-            },
-        ]
 
         # Kick off the chain by firing the initial object transition
         # The vision system identifies the object → object_picked
@@ -238,28 +354,23 @@ class WorkflowSimulator:
             logger.warning("Failed to fire initial transition for object '%s'", object_id)
             return
 
-        # Process each step in the event chain
-        for step in event_chain:
+        # Process each step from the config-driven event chain
+        for step in self._event_chain:
             if not self._running:
                 break
 
-            # Wait for the object event to trigger subsystem action
-            # In simulation, we directly trigger the subsystem since the
-            # orchestrator's event handler would publish MQTT
-            if "subsystem" in step:
-                subsystem_name = step["subsystem"]
-                subsystem_event = step["subsystem_event"]
-                self._simulate_subsystem_step(
-                    subsystem_name, subsystem_event, step["delay"], object_id,
-                )
-            elif "subsystems" in step:
-                for subsystem_name, subsystem_event in step["subsystems"]:
-                    self._simulate_subsystem_step(
-                        subsystem_name, subsystem_event, step["delay"], object_id,
-                    )
-
-            # Fire the object transition (simulating subsystem completion)
+            subsystem_name = step.get("subsystem")
+            subsystem_event = step.get("subsystem_event", "start")
+            delay = step.get("delay", self._default_delay)
             obj_transition = step.get("object_transition")
+
+            self._simulate_subsystem_step(
+                subsystem_name, subsystem_event, delay, object_id,
+            )
+
+            # Fire the object transition only if this step specifies one.
+            # For multi-subsystem events, the transition fires after the
+            # last subsystem in the group completes.
             if obj_transition:
                 self.orchestrator.fire_object_transition(object_id, obj_transition)
                 time.sleep(0.1)

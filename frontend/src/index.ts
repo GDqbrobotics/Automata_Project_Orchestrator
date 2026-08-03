@@ -14,10 +14,9 @@ app.onBindCommands({
   btnStatus: 'request_status',
 });
 
-// Reset button – fires stop then start (for error recovery)
+// Reset button – resets workflow to idle (for error/stopped recovery)
 document.getElementById('btnReset')?.addEventListener('click', () => {
-  app.sendCommand('stop_workflow');
-  setTimeout(() => app.sendCommand('start_workflow'), 500);
+  app.sendCommand('reset_workflow');
 });
 
 // Alias assignment

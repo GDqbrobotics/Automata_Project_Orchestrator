@@ -164,6 +164,25 @@ Major architectural change: each analyzed object now has its own YAML-driven sta
 
 **Test results**: 122 tests passing (was 43)
 
+### Workflow reset from stopped (2026-07-31)
+
+The workflow state machine was updated to allow restarting from the `stopped` state:
+
+**Changes**:
+- Added `reset_requested` → `idle` transition to `stopped` state in `workflow.yaml`
+- Added `RESET_WORKFLOW` command to `WorkflowCommand` enum
+- Added `_handle_reset()` method in `WorkflowOrchestrator` that:
+  - Clears all object state machines
+  - Resets progress counter to 0
+  - Clears current object
+  - Fires `reset_requested` on the workflow state machine
+  - Notifies frontend of state change and object removal
+- Updated frontend to enable reset button from both `error` and `stopped` states
+- Updated frontend reset button to send `reset_workflow` command (instead of stop+start)
+- Added test for reset from stopped → idle with object cleanup verification
+
+**Design**: The `stopped` state is no longer terminal. The operator can reset the workflow from `stopped` or `error` back to `idle`, which clears all object state machines and resets the workflow for a new run.
+
 ### Event-driven architecture update (2026-07-31)
 
 Refined the object state machine design to follow the main design principle: **MQTT publishing only for subsystem state machines. Interactions between state machine levels are internal and driven by events.**
@@ -213,6 +232,41 @@ To add a new subsystem, simply add an entry to `subsystems.yaml`. The system wil
 2. Subscribe to its MQTT topics
 3. Show it in the frontend grid
 4. Include it in the simulation
+
+### Configuration-driven architecture refactoring (2026-08-03)
+
+Major refactoring: moved all hardcoded workflow logic into YAML configuration files. The system now follows the principle that **behavior lives in config, not in code**.
+
+**New config files**:
+- `backend/config/workflow_actions.yaml` – Maps object state machine events to subsystem commands (previously hardcoded as 7 Python methods)
+- `backend/config/global.yaml` – Centralized defaults for MQTT broker, frontend port, simulation defaults, object state colors/order, and workflow state messages
+
+**New frontend config files**:
+- `frontend/src/config/object-styles.ts` – Object state colors, display order, and step mapping
+- `frontend/src/config/button-rules.ts` – Button enable/disable rules per workflow state
+- `frontend/src/config/state-messages.ts` – Workflow state display messages
+
+**Backend changes**:
+- `WorkflowOrchestrator` now accepts a `GlobalConfig` parameter (loaded from `global.yaml`)
+- Replaced 7 hardcoded `_trigger_*` methods with generic `_execute_workflow_action()` that reads from `workflow_actions.yaml`
+- Added `_resolve_placeholders()` for `{{object_id}}` substitution in payloads
+- `WorkflowActionCommand`, `WorkflowAction`, `WorkflowActionsConfig`, `GlobalConfig` dataclasses added to `domain/models.py`
+- Simulation's `_build_event_chain()` derives the full event chain from `object.yaml` + `workflow_actions.yaml` instead of using a hardcoded list
+- CLI entry point loads `global.yaml` by default, CLI args override config values
+
+**Frontend changes**:
+- `app.ts` uses config-driven state colors, button rules, and state messages
+- `store.ts` uses config-driven state messages
+- All hardcoded display rules moved to `src/config/`
+
+**Simulation changes**:
+- Simulation now reads the event chain from config files, not from hardcoded Python lists
+- Multi-subsystem events (like `trigger_measurements`) correctly simulate all subsystems before advancing the object state
+- Fallback to default event chain if config files are missing
+
+**Test results**: 123 tests passing (was 123), all tests updated to verify config-driven behavior.
+
+**Impact**: Adding a new analysis step now requires only editing YAML files — no Python or TypeScript code changes needed.
 
 ## Next steps
 

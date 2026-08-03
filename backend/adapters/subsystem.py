@@ -171,6 +171,10 @@ class SubsystemAdapterFactory:
 # ------------------------------------------------------------------
 # Legacy constants for backward compatibility (simulation_test.py)
 # ------------------------------------------------------------------
+# NOTE: These are kept for backward compatibility with simulation_test.py.
+# New code should derive subsystem names from the config instead of using
+# these hardcoded constants. Use SubsystemAdapterFactory.get_names() or
+# get_required_names() to get the actual configured subsystems.
 ALL_SUBSYSTEMS: List[str] = [
     "vision",
     "robot_first",

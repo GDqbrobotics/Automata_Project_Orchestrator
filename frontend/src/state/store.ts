@@ -5,6 +5,7 @@ import type {
   SubsystemConfig,
   ObjectInfo,
 } from '../contracts.js';
+import { getStateMessage } from '../config/state-messages.js';
 
 export interface UiState {
   workflowState: WorkflowStateType;
@@ -70,17 +71,7 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     const newState = m.new_state as WorkflowStateType;
     updated.workflowState = newState;
 
-    const messages: Record<WorkflowStateType, string> = {
-      idle: 'Waiting for operator input',
-      starting: 'Initializing subsystems...',
-      running: 'Workflow in progress',
-      paused: 'Workflow paused',
-      stopping: 'Stopping workflow...',
-      stopped: 'Workflow stopped by operator',
-      completing: 'Finalizing and uploading data...',
-      error: `Error: ${state.error || 'Workflow interrupted'}`,
-    };
-    updated.message = messages[newState] || '';
+    updated.message = getStateMessage(newState, state.error || undefined);
     logs.push({ time: now(), source: 'workflow', message: `State → ${newState}`, level: 'info' });
   }
 

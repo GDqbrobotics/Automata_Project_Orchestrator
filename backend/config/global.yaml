@@ -1,0 +1,45 @@
+# Global configuration for the AUTOMATA GUI Orchestrator
+# All default values live here. Override via CLI args or environment.
+
+mqtt:
+  broker: localhost
+  port: 1883
+
+frontend:
+  host: 0.0.0.0
+  port: 8080
+
+simulation:
+  default_num_objects: 3
+
+object_workflow:
+  # State display order and colors for the frontend
+  state_order:
+    - identified_in_box
+    - moving_to_disk
+    - HSI_3DI_analysis
+    - object_going_second_position
+    - XRF_RAMAN_analysis
+    - object_going_first_position
+    - moving_to_box
+    - object_analyzed
+
+  state_colors:
+    identified_in_box: gray
+    moving_to_disk: blue
+    HSI_3DI_analysis: purple
+    object_going_second_position: cyan
+    XRF_RAMAN_analysis: orange
+    object_going_first_position: cyan
+    moving_to_box: blue
+    object_analyzed: green
+
+workflow_states:
+  idle: "Waiting for operator input"
+  starting: "Initializing subsystems..."
+  running: "Workflow in progress"
+  paused: "Workflow paused"
+  stopping: "Stopping workflow..."
+  stopped: "Workflow stopped by operator"
+  completing: "Finalizing and uploading data..."
+  error: "Error: Workflow interrupted"

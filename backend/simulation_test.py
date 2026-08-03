@@ -568,6 +568,25 @@ async def test_pause_resume_gui() -> None:
         "After stop sequence, state is 'stopped'",
     )
 
+    # Reset from stopped back to idle
+    runner.fire_event("reset_requested")
+    time.sleep(0.2)
+
+    results.check(
+        runner.current_state_name == "idle",
+        "After reset from stopped, state transitions to 'idle'",
+    )
+
+    results.check(
+        runner.orchestrator._progress == 0,
+        "Progress reset to 0 after reset from stopped",
+    )
+
+    results.check(
+        runner.orchestrator._current_object is None,
+        "Current object cleared after reset from stopped",
+    )
+
     # Cleanup
     runner.stop()
     for sim in simulators.values():
@@ -1135,37 +1154,29 @@ async def test_object_in_orchestrator() -> None:
         f"Status includes {len(status.objects)} object(s)",
     )
 
-    # Verify event handler mapping
+    # Verify workflow actions config is loaded (config-driven event mapping)
     orch = runner.orchestrator
-    event_handlers = orch._object_event_handlers
     results.check(
-        "trigger_robot_first_pick" in event_handlers,
-        "Event handler registered for 'trigger_robot_first_pick'",
+        hasattr(orch, 'workflow_actions'),
+        "Orchestrator has workflow_actions config",
     )
-    results.check(
-        "trigger_imaging_capture" in event_handlers,
-        "Event handler registered for 'trigger_imaging_capture'",
-    )
-    results.check(
-        "trigger_platform_rotate_to_second" in event_handlers,
-        "Event handler registered for 'trigger_platform_rotate_to_second'",
-    )
-    results.check(
-        "trigger_measurements" in event_handlers,
-        "Event handler registered for 'trigger_measurements'",
-    )
-    results.check(
-        "trigger_platform_rotate_to_first" in event_handlers,
-        "Event handler registered for 'trigger_platform_rotate_to_first'",
-    )
-    results.check(
-        "trigger_robot_first_return" in event_handlers,
-        "Event handler registered for 'trigger_robot_first_return'",
-    )
-    results.check(
-        "trigger_cloud_upload" in event_handlers,
-        "Event handler registered for 'trigger_cloud_upload'",
-    )
+    if hasattr(orch, 'workflow_actions'):
+        results.check(
+            len(orch.workflow_actions.actions) > 0,
+            f"Workflow actions loaded: {list(orch.workflow_actions.actions.keys())}",
+        )
+        results.check(
+            "trigger_robot_first_pick" in orch.workflow_actions.actions,
+            "Workflow action 'trigger_robot_first_pick' is configured",
+        )
+        results.check(
+            "trigger_imaging_capture" in orch.workflow_actions.actions,
+            "Workflow action 'trigger_imaging_capture' is configured",
+        )
+        results.check(
+            "trigger_cloud_upload" in orch.workflow_actions.actions,
+            "Workflow action 'trigger_cloud_upload' is configured",
+        )
 
     # Cleanup
     runner.stop()

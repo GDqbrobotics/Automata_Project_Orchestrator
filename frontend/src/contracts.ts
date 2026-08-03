@@ -5,7 +5,8 @@ export type WorkflowCommand =
   | 'pause_workflow'
   | 'resume_workflow'
   | 'stop_workflow'
-  | 'request_status';
+  | 'request_status'
+  | 'reset_workflow';
 
 export type WorkflowEvent =
   | 'workflow_state_changed'

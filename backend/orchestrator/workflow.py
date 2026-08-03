@@ -21,6 +21,9 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+# Placeholder for the project root to resolve config paths
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
 from backend.adapters.subsystem import (
     SubsystemAdapter,
     SubsystemAdapterFactory,
@@ -30,9 +33,12 @@ from backend.domain.models import (
     BackendEvent,
     Command,
     EventPayload,
+    GlobalConfig,
     ObjectInfo,
     SubsystemConfig,
     SubsystemInfo,
+    WorkflowActionCommand,
+    WorkflowActionsConfig,
     WorkflowCommand,
     WorkflowState,
     WorkflowStatus,
@@ -60,11 +66,18 @@ class WorkflowOrchestrator:
         self,
         config_path: str | Path,
         subsystems_config_path: str | Path | None = None,
+        global_config: GlobalConfig | None = None,
         use_simulation: bool = False,
-        num_objects: int = 3,
+        num_objects: int | None = None,
     ) -> None:
+        # Apply global config (CLI args may have overridden defaults)
+        self._global_config = global_config or GlobalConfig()
+
         # MQTT client (created first so it can be passed to the state machines)
-        self.mqtt = MqttClient(broker="localhost", port=1883)
+        self.mqtt = MqttClient(
+            broker=self._global_config.mqtt_broker,
+            port=self._global_config.mqtt_port,
+        )
 
         # State machine (passes mqtt_client so action handlers can publish)
         self.state_machine = StateMachineEngine(config_path, mqtt_client=self.mqtt)
@@ -77,12 +90,15 @@ class WorkflowOrchestrator:
         self.adapter_factory = SubsystemAdapterFactory(
             self.mqtt,
             self.subsystems_config,
-            config_dir=Path(__file__).resolve().parent.parent / "config" / "subsystems",
+            config_dir=_PROJECT_ROOT / "backend" / "config" / "subsystems",
         )
         self.adapters: Dict[str, SubsystemAdapter] = self.adapter_factory.get_all()
 
-        # Frontend server
-        self.frontend = FrontendServer(host="0.0.0.0", port=8080)
+        # Frontend server (use global config defaults)
+        self.frontend = FrontendServer(
+            host=self._global_config.frontend_host,
+            port=self._global_config.frontend_port,
+        )
 
         # Current workflow status
         self._status = WorkflowStatus(
@@ -90,14 +106,14 @@ class WorkflowOrchestrator:
             total_objects=0,
             active_subsystems={name: adapter.info for name, adapter in self.adapters.items()},
         )
-        self._total_objects = 0
+        self._total_objects = num_objects or self._global_config.simulation_default_num_objects
         self._progress = 0
         self._current_object: Optional[str] = None
         self._lock = threading.Lock()
 
         # Object state machines (per-object analysis workflows)
-        object_config_path = Path(__file__).resolve().parent.parent / "config" / "object.yaml"
-        object_storage_dir = Path(__file__).resolve().parent.parent / "object_states"
+        object_config_path = _PROJECT_ROOT / "backend" / "config" / "object.yaml"
+        object_storage_dir = _PROJECT_ROOT / "backend" / "object_states"
         self.object_manager = ObjectStateMachines(
             config_path=object_config_path,
             storage_dir=object_storage_dir,
@@ -107,17 +123,8 @@ class WorkflowOrchestrator:
         # Register callback for events fired on transition completion
         self.object_manager.on_event(self._on_object_event)
 
-        # Object event → subsystem action mapping
-        # Maps object events to the subsystem action to trigger
-        self._object_event_handlers: Dict[str, Callable[[str], None]] = {
-            "trigger_robot_first_pick": self._trigger_robot_first_pick,
-            "trigger_imaging_capture": self._trigger_imaging_capture,
-            "trigger_platform_rotate_to_second": self._trigger_platform_rotate_to_second,
-            "trigger_measurements": self._trigger_measurements,
-            "trigger_platform_rotate_to_first": self._trigger_platform_rotate_to_first,
-            "trigger_robot_first_return": self._trigger_robot_first_return,
-            "trigger_cloud_upload": self._trigger_cloud_upload,
-        }
+        # Load workflow actions config (event → subsystem command mapping)
+        self.workflow_actions = self._load_workflow_actions()
 
         # Simulation mode
         self._use_simulation = use_simulation
@@ -130,12 +137,27 @@ class WorkflowOrchestrator:
         self.frontend.set_command_handler(WorkflowCommand.STOP_WORKFLOW, self._handle_stop)
         self.frontend.set_command_handler(WorkflowCommand.REQUEST_STATUS, self._handle_status)
         self.frontend.set_status_callback(self._get_status)
+        self.frontend.set_command_handler(WorkflowCommand.RESET_WORKFLOW, self._handle_reset)
 
         # MQTT message dispatcher
         self.mqtt._on_message = self._on_mqtt_message
 
         # Registered subsystem callbacks
         self._subsystem_callbacks: Dict[str, callable] = {}
+
+    # ------------------------------------------------------------------
+    # Workflow actions loading (event → subsystem command mapping)
+    # ------------------------------------------------------------------
+    def _load_workflow_actions(self) -> WorkflowActionsConfig:
+        """Load the workflow actions config from YAML.
+
+        This config maps object state machine events to subsystem commands.
+        """
+        actions_path = _PROJECT_ROOT / "backend" / "config" / "workflow_actions.yaml"
+        if actions_path.exists():
+            return WorkflowActionsConfig.from_yaml(actions_path)
+        logger.warning("Workflow actions config not found at %s, using empty config", actions_path)
+        return WorkflowActionsConfig()
 
     # ------------------------------------------------------------------
     # Subsystem configuration loading
@@ -278,6 +300,7 @@ class WorkflowOrchestrator:
             broker_port=self.mqtt.port,
             num_objects=self._total_objects or 3,
             subsystems_config=self.subsystems_config,
+            global_config=self._global_config,
         )
         self._simulator.start()
         logger.info("Simulation mode: starting workflow with %d objects", self._simulator.num_objects)
@@ -369,6 +392,90 @@ class WorkflowOrchestrator:
                 BackendEvent.ERROR_REPORTED.value,
                 {"message": str(exc)},
             )
+
+    def _handle_reset(self, data: Dict[str, Any]) -> None:
+        """Handle workflow reset (from error or stopped state back to idle).
+
+        This resets the entire workflow: clears all object state machines,
+        resets progress, and transitions the workflow state machine to idle.
+        If all required subsystems are already ready, it immediately starts
+        the workflow (idle → starting → running) without waiting for
+        init_complete events.
+        """
+        logger.info("Operator: reset_workflow")
+        try:
+            # Clear all object state machines
+            self.object_manager.clear()
+            logger.info("All object state machines cleared")
+
+            # Reset progress and current object
+            self._progress = 0
+            self._current_object = None
+            self._status.progress = 0
+            self._status.current_object = None
+            self._status.objects = []
+
+            # Fire reset_requested on the workflow state machine
+            new_state = self.state_machine.fire("reset_requested", self._status)
+            self._update_state(WorkflowState(new_state))
+            self._fire_frontend_event(
+                BackendEvent.WORKFLOW_STATE_CHANGED.value,
+                {"new_state": new_state, "source": "operator"},
+            )
+            self._fire_frontend_event(
+                BackendEvent.OBJECT_REMOVED.value,
+                {"message": "All objects cleared on workflow reset"},
+            )
+
+            # Check if all required subsystems are already ready.
+            # If so, immediately start the workflow (idle → starting → running)
+            # without waiting for init_complete events.
+            required_adapters = self.adapter_factory.get_required()
+            all_ready = all(
+                a.state == SubsystemState.READY for a in required_adapters
+            )
+            if all_ready:
+                logger.info("All required subsystems already ready after reset – starting workflow immediately")
+                self._start_workflow_immediately()
+            else:
+                logger.info("Not all required subsystems ready after reset – waiting for operator to start")
+                # Update subsystem info in status
+                for name, adapter in self.adapters.items():
+                    self._status.active_subsystems[name] = adapter.info
+
+        except StateMachineError as exc:
+            logger.error("Reset rejected: %s", exc)
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": str(exc)},
+            )
+
+    def _start_workflow_immediately(self) -> None:
+        """Start the workflow immediately from idle when all subsystems are ready.
+
+        This is called after a reset when all required subsystems are already
+        in ready state. It transitions: idle → starting → running.
+        """
+        try:
+            # idle → starting
+            new_state = self.state_machine.fire("start_requested", self._status)
+            self._update_state(WorkflowState(new_state))
+            self._fire_frontend_event(
+                BackendEvent.WORKFLOW_STATE_CHANGED.value,
+                {"new_state": new_state, "source": "subsystems_ready"},
+            )
+
+            # starting → running (subsystems already ready)
+            new_state = self.state_machine.fire("subsystem_ready", self._status)
+            self._update_state(WorkflowState(new_state))
+            self._fire_frontend_event(
+                BackendEvent.WORKFLOW_STATE_CHANGED.value,
+                {"new_state": new_state, "source": "subsystems_ready"},
+            )
+
+            logger.info("Workflow started immediately from idle (all subsystems ready)")
+        except StateMachineError as exc:
+            logger.error("Failed to start workflow immediately: %s", exc)
 
     def _handle_status(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: request_status")
@@ -464,23 +571,25 @@ class WorkflowOrchestrator:
         """Handle events fired by object state machine transitions.
 
         When an object state machine transition completes with an 'event' action,
-        this method is called to trigger the appropriate subsystem action.
+        this method looks up the corresponding subsystem commands in the
+        workflow_actions config and executes them.
 
         Args:
             object_id: The object that fired the event.
             event_name: The event name (e.g., 'trigger_robot_first_pick').
         """
-        handler = self._object_event_handlers.get(event_name)
-        if handler:
+        action = self.workflow_actions.actions.get(event_name)
+        if action:
             logger.info(
-                "Object '%s' event '%s' → triggering subsystem action",
-                object_id, event_name,
+                "Object '%s' event '%s' → executing %d subsystem command(s)",
+                object_id, event_name, len(action.commands),
             )
-            handler(object_id)
+            self._execute_workflow_action(object_id, action)
         else:
             logger.warning(
-                "No handler registered for object event '%s' (object: %s)",
-                event_name, object_id,
+                "No workflow action registered for event '%s' (object: %s). "
+                "Available events: %s",
+                event_name, object_id, list(self.workflow_actions.actions.keys()),
             )
 
     def _broadcast_objects(self) -> None:
@@ -495,58 +604,86 @@ class WorkflowOrchestrator:
         self.frontend.broadcast_status(self._status)
 
     # ------------------------------------------------------------------
-    # Object event → subsystem trigger methods
+    # Object event → subsystem command execution (config-driven)
     # ------------------------------------------------------------------
-    def _trigger_robot_first_pick(self, object_id: str) -> None:
-        """Trigger first robot to pick object from box."""
-        logger.info("[Event] Triggering robot_first_pick for object '%s'", object_id)
-        self._fire_subsystem_command("robot_first", "pick_object", {"object_id": object_id})
+    def _execute_workflow_action(self, object_id: str, action: WorkflowAction) -> None:
+        """Execute all subsystem commands for a workflow action.
 
-    def _trigger_robot_first_return(self, object_id: str) -> None:
-        """Trigger first robot to return object to box."""
-        logger.info("[Event] Triggering robot_first_return for object '%s'", object_id)
-        self._fire_subsystem_command("robot_first", "return_object", {"object_id": object_id})
+        Reads commands from the workflow_actions config and fires them
+        for the given object.
 
-    def _trigger_imaging_capture(self, object_id: str) -> None:
-        """Trigger 3DI/HSI imaging capture."""
-        logger.info("[Event] Triggering imaging_capture for object '%s'", object_id)
-        self._fire_subsystem_command("imaging_3di_hsi", "start_capture", {"object_id": object_id})
+        Args:
+            object_id: The object that triggered this action.
+            action: The WorkflowAction containing subsystem commands.
+        """
+        for cmd in action.commands:
+            self._fire_subsystem_command(object_id, cmd)
 
-    def _trigger_platform_rotate_to_second(self, object_id: str) -> None:
-        """Trigger rotating platform to move object to second position."""
-        logger.info("[Event] Triggering platform_rotate_to_second for object '%s'", object_id)
-        self._fire_subsystem_command("rotating_platform", "rotate_to_second", {"object_id": object_id})
+    def _fire_subsystem_command(
+        self,
+        object_id: str,
+        cmd: WorkflowActionCommand,
+    ) -> None:
+        """Publish a command to a subsystem via MQTT.
 
-    def _trigger_platform_rotate_to_first(self, object_id: str) -> None:
-        """Trigger rotating platform to move object back to first position."""
-        logger.info("[Event] Triggering platform_rotate_to_first for object '%s'", object_id)
-        self._fire_subsystem_command("rotating_platform", "rotate_to_first", {"object_id": object_id})
+        Resolves {{object_id}} placeholders in the payload before sending.
 
-    def _trigger_measurements(self, object_id: str) -> None:
-        """Trigger XRF/Raman measurements."""
-        logger.info("[Event] Triggering measurements for object '%s'", object_id)
-        self._fire_subsystem_command("xrf", "start_measurement", {"object_id": object_id})
-        self._fire_subsystem_command("raman", "start_measurement", {"object_id": object_id})
-        self._fire_subsystem_command("ai_analysis", "plan_measurements", {"object_id": object_id})
-
-    def _trigger_cloud_upload(self, object_id: str) -> None:
-        """Trigger cloud database upload."""
-        logger.info("[Event] Triggering cloud_upload for object '%s'", object_id)
-        self._fire_subsystem_command("cloud_database", "upload_data", {"object_id": object_id})
-
-    def _fire_subsystem_command(self, subsystem_name: str, command: str, payload: Dict[str, Any]) -> None:
-        """Publish a command to a subsystem via MQTT."""
-        adapter = self.adapters.get(subsystem_name)
+        Args:
+            object_id: The current object ID (used for placeholder resolution).
+            cmd: The WorkflowActionCommand specifying subsystem, command, and payload.
+        """
+        adapter = self.adapters.get(cmd.subsystem)
         if adapter:
-            # Get command topic from the adapter's config
-            config = adapter.config
-            topic = config.command_topic
-            self.mqtt.publish(topic, {"command": command, **payload})
-            logger.info("Published command '%s' to subsystem '%s' (topic: %s)",
-                       command, subsystem_name, topic)
+            # Resolve {{object_id}} placeholders in payload
+            resolved_payload = self._resolve_placeholders(cmd.payload, object_id)
+            topic = adapter.config.command_topic
+            self.mqtt.publish(topic, {"command": cmd.command, **resolved_payload})
+            logger.info(
+                "Published command '%s' to subsystem '%s' (topic: %s, payload: %s)",
+                cmd.command, cmd.subsystem, topic, resolved_payload,
+            )
         else:
-            logger.warning("No adapter found for subsystem '%s' to fire command '%s'",
-                          subsystem_name, command)
+            logger.warning(
+                "No adapter found for subsystem '%s' to fire command '%s'"
+                " (object: %s)",
+                cmd.subsystem, cmd.command, object_id,
+            )
+
+    @staticmethod
+    def _resolve_placeholders(
+        payload: Dict[str, Any],
+        object_id: str,
+    ) -> Dict[str, Any]:
+        """Resolve {{object_id}} placeholders in a payload dict.
+
+        Recursively processes nested dicts and lists.
+
+        Args:
+            payload: The payload dict that may contain {{object_id}} placeholders.
+            object_id: The object ID to substitute.
+
+        Returns:
+            A new dict with all placeholders resolved.
+        """
+        result: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                result[key] = value.replace("{{object_id}}", object_id)
+            elif isinstance(value, dict):
+                result[key] = {
+                    k: v.replace("{{object_id}}", object_id)
+                    if isinstance(v, str) else v
+                    for k, v in value.items()
+                }
+            elif isinstance(value, list):
+                result[key] = [
+                    item.replace("{{object_id}}", object_id)
+                    if isinstance(item, str) else item
+                    for item in value
+                ]
+            else:
+                result[key] = value
+        return result
 
     # ------------------------------------------------------------------
     # MQTT message dispatcher

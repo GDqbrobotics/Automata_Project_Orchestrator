@@ -1,6 +1,14 @@
 import type { FrontendMessage, WorkflowCommand, WorkflowStateType } from '../contracts.js';
 import { FrontendClient } from '../api/client.js';
 import { createInitialState, reduceState } from '../state/store.js';
+import {
+  buildStateStyles,
+  getObjectStateIndex,
+  getStateColor,
+  getTotalSteps,
+} from '../config/object-styles.js';
+import { getButtonRules } from '../config/button-rules.js';
+import { getStateMessage } from '../config/state-messages.js';
 
 interface AppConfig {
   wsUrl?: string;
@@ -60,6 +68,9 @@ export class App {
     this.updateWorkflowMessage();
   }
 
+  /** Cached state styles, built from config or defaults. */
+  private _stateStyles: Record<string, { colorClass: string; stepIndex: number }> = buildStateStyles();
+
   private updateStateBadge(): void {
     const badge = document.getElementById('stateBadge');
     if (!badge) return;
@@ -70,7 +81,8 @@ export class App {
   private updateWorkflowMessage(): void {
     const el = document.getElementById('workflowMessage');
     if (!el) return;
-    el.textContent = this.state.message;
+    const msg = getStateMessage(this.state.workflowState, this.state.error || undefined);
+    el.textContent = msg;
   }
 
   private updateProgress(): void {
@@ -135,24 +147,18 @@ export class App {
   }
 
   private updateActionButtons(): void {
-    const state = this.state.workflowState;
+    const rules = getButtonRules(this.state.workflowState);
     const startBtn = document.getElementById('btnStart') as HTMLButtonElement | null;
     const pauseBtn = document.getElementById('btnPause') as HTMLButtonElement | null;
     const resumeBtn = document.getElementById('btnResume') as HTMLButtonElement | null;
     const stopBtn = document.getElementById('btnStop') as HTMLButtonElement | null;
     const resetBtn = document.getElementById('btnReset') as HTMLButtonElement | null;
 
-    const canStart = state === 'idle';
-    const canPause = state === 'running';
-    const canResume = state === 'paused';
-    const canStop = state === 'running' || state === 'paused' || state === 'starting';
-    const canReset = state === 'error';
-
-    if (startBtn) startBtn.disabled = !canStart;
-    if (pauseBtn) pauseBtn.disabled = !canPause;
-    if (resumeBtn) resumeBtn.disabled = !canResume;
-    if (stopBtn) stopBtn.disabled = !canStop;
-    if (resetBtn) resetBtn.disabled = !canReset;
+    if (startBtn) startBtn.disabled = !rules.start;
+    if (pauseBtn) pauseBtn.disabled = !rules.pause;
+    if (resumeBtn) resumeBtn.disabled = !rules.resume;
+    if (stopBtn) stopBtn.disabled = !rules.stop;
+    if (resetBtn) resetBtn.disabled = !rules.reset;
   }
 
   private updateConnectionIndicator(): void {
@@ -188,34 +194,29 @@ export class App {
       return;
     }
 
+    // Build state styles from config (backend overrides preferred)
+    const stateOrder = this.state.subsystemsConfig.length > 0
+      ? this._extractStateOrder()
+      : undefined;
+    const stateColors = this._extractStateColors();
+    this._stateStyles = buildStateStyles(stateOrder, stateColors);
+    const totalSteps = getTotalSteps(stateOrder);
+
     for (const obj of objects) {
       const card = document.createElement('div');
       card.className = 'object-card';
 
-      // Determine state class - map object states to color classes
-      let stateClass = 'state-identified';
-      if (obj.state === 'object_analyzed') {
-        stateClass = 'state-analyzed';
-      } else if (obj.state === 'moving_to_disk' || obj.state === 'moving_to_box') {
-        stateClass = 'state-moving';
-      } else if (obj.state === 'HSI_3DI_analysis') {
-        stateClass = 'state-imaging';
-      } else if (obj.state === 'XRF_RAMAN_analysis') {
-        stateClass = 'state-measuring';
-      } else if (obj.state === 'object_going_second_position' || obj.state === 'object_going_first_position') {
-        stateClass = 'state-rotating';
-      }
-
-      // Determine progress: count transitions completed
+      const style = this._stateStyles[obj.state] || { colorClass: 'gray', stepIndex: 0 };
+      const stateClass = `state-${style.colorClass}`;
       const transitionCount = obj.transitions.length;
-      const stateIndex = this._getObjectStateIndex(obj.state);
+      const stepIndex = style.stepIndex;
 
       card.innerHTML = `
         <div class="object-name">${obj.object_id}</div>
         <div class="object-state ${stateClass}">${obj.state}</div>
         <div class="object-state-desc">${obj.state_description || ''}</div>
         <div class="object-progress">
-          <span class="object-step">Step ${stateIndex + 1} / 8</span>
+          <span class="object-step">Step ${stepIndex + 1} / ${totalSteps}</span>
           <span class="object-transitions">${transitionCount} transitions</span>
         </div>
       `;
@@ -223,18 +224,24 @@ export class App {
     }
   }
 
-  private _getObjectStateIndex(state: string): number {
-    const stateOrder = [
-      'identified_in_box',
-      'moving_to_disk',
-      'HSI_3DI_analysis',
-      'object_going_second_position',
-      'XRF_RAMAN_analysis',
-      'object_going_first_position',
-      'moving_to_box',
-      'object_analyzed',
-    ];
-    return stateOrder.indexOf(state);
+  /**
+   * Extract state order from backend config if available.
+   * Falls back to defaults from config/object-styles.ts.
+   */
+  private _extractStateOrder(): string[] | undefined {
+    // If the backend sends state_order in a message, it would be in
+    // the state config. For now, use the default.
+    return undefined;
+  }
+
+  /**
+   * Extract state colors from backend config if available.
+   * Falls back to defaults from config/object-styles.ts.
+   */
+  private _extractStateColors(): Record<string, string> {
+    // If the backend sends state_colors in a message, it would be in
+    // the state config. For now, use the default.
+    return {};
   }
 
   // Public API for binding buttons

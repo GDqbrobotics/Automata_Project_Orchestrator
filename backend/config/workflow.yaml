@@ -66,7 +66,13 @@ states:
           - log_event
 
   stopped:
-    description: Workflow ended by operator request
+    description: Workflow ended by operator request (can be reset to idle)
+    transitions:
+      - event: reset_requested
+        target: idle
+        actions:
+          - log_event
+          - clear_error_state
 
   error:
     description: Workflow interrupted by error
