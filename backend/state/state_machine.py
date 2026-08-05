@@ -1,8 +1,22 @@
-"""Declarative state-machine engine loaded from YAML config."""
+"""Declarative state-machine engine loaded from YAML config.
+
+This engine is MQTT-agnostic. It handles:
+  - State transitions triggered by events
+  - Action execution after transitions
+  - Event firing on transition completion (on_complete_event)
+
+Events and actions support subsystem scoping:
+  - event: measure_request         → internal event
+  - event: robot_first/pick        → routed to robot_first subsystem
+  - action: error                  → broadcast action
+  - action: raman/measure_request  → subsystem-specific action
+
+The engine fires events via a callback mechanism. Subsystem adapters
+override the event callback to publish MQTT messages (boundary layer).
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,9 +38,7 @@ class TransitionConfig:
     """Configuration for a single state transition."""
     event: str
     target: str
-    actions: List[str] = field(default_factory=list)
-    # Additional event to fire after transition (for cross-level communication)
-    on_complete_event: Optional[str] = None
+    actions: List[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -53,18 +65,10 @@ class StateMachineConfig:
         for state_name, state_data in data.get("states", {}).items():
             transitions: List[TransitionConfig] = []
             for t in state_data.get("transitions", []):
-                actions = t.get("actions", [])
-                on_complete_event = None
-                # Check if any action is an event action: {event: <name>}
-                for action in actions:
-                    if isinstance(action, dict) and "event" in action:
-                        on_complete_event = action["event"]
-                        break
                 transitions.append(TransitionConfig(
                     event=t["event"],
                     target=t["target"],
-                    actions=actions,
-                    on_complete_event=on_complete_event,
+                    actions=t.get("actions", []),
                 ))
             states[state_name] = StateConfig(
                 name=state_name,
@@ -79,22 +83,34 @@ class StateMachineConfig:
         )
 
 
+def _parse_subsystem_prefix(name: str) -> tuple[str, str]:
+    """Parse a scoped name like 'robot_first/measure_request'.
+
+    Returns:
+        (scope, local_name) - e.g. ("robot_first", "measure_request")
+        If no '/' is found, scope is empty and local_name is the full name.
+    """
+    if "/" in name:
+        parts = name.split("/", 1)
+        return parts[0], parts[1]
+    return "", name
+
+
 class StateMachineEngine:
     """
-    State-machine engine that reads its configuration from a YAML file.
+    MQTT-agnostic state-machine engine.
 
-    Supports:
-      - explicit states and transitions
-      - event-driven transitions
-      - action execution during transitions
-      - custom action handlers for extensibility
+    Events and actions support subsystem scoping via the '/' separator:
+      - 'robot_first/measure_request' has scope='robot_first', name='measure_request'
 
-    Actions supported by default:
-      - log_event: log the transition event
-      - update_operator_ui: notify UI update
-      - publish_mqtt_message: publish to an MQTT topic
+    The engine fires events via a callback (_on_event_callback). Subsystem
+    adapters wire this up to publish MQTT messages. The workflow and object
+    state machines wire it up to propagate events internally.
 
-    Custom actions can be registered via register_action().
+    Actions are executed after a transition completes. Action handlers are
+    registered via register_action(). Default handlers include:
+      - log_event: log the action
+      - (custom handlers registered by the orchestrator)
     """
 
     def __init__(
@@ -109,12 +125,10 @@ class StateMachineEngine:
         self.config: StateMachineConfig = StateMachineConfig.from_yaml(config_path)
         self.current_state: str = self.config.initial_state
         self._action_handlers: Dict[str, Callable] = {}
-        self._on_complete_event: Optional[Callable[[str], None]] = None
+        self._on_event_callback: Optional[Callable[[str], None]] = None
 
         # Register default action handlers
         self.register_action("log_event", self._action_log_event)
-        self.register_action("update_operator_ui", self._action_update_ui)
-        self.register_action("publish_mqtt_message", self._action_publish_mqtt)
 
         logger.info("State machine loaded: %s (initial: %s)",
                      self.config_name, self.current_state)
@@ -129,23 +143,22 @@ class StateMachineEngine:
         self._action_handlers[name] = handler
         logger.debug("Registered action handler: %s", name)
 
-    def set_on_complete_event_callback(
+    def set_on_event_callback(
         self,
         callback: Callable[[str], None],
     ) -> None:
         """Set callback for events fired on transition completion.
 
         When a transition completes and has an 'event' action, this callback
-        is invoked with the event name. Used for cross-level state machine
-        communication (e.g., object state machine → orchestrator).
+        is invoked with the event name. This is how state machines communicate
+        across layers (e.g., object SM → orchestrator, subsystem SM → MQTT).
 
         Args:
             callback: Called with (event_name) when a transition completes
                       with an event action.
         """
-        self._on_complete_event = callback
-        logger.debug("Registered on_complete_event callback for %s",
-                     self.config_name)
+        self._on_event_callback = callback
+        logger.debug("Registered on_event callback for %s", self.config_name)
 
     # ------------------------------------------------------------------
     # Configuration
@@ -176,8 +189,14 @@ class StateMachineEngine:
         """
         Fire an event through the state machine.
 
-        Returns the new state name.
-        Raises StateMachineError if the transition is invalid.
+        Args:
+            event: The event name (optionally scoped: 'robot_first/pick').
+            status: Optional status data passed to action handlers.
+
+        Returns:
+            The new state name.
+        Raises:
+            StateMachineError: If the transition is invalid.
         """
         current = self.current_state
         states = self.config.states
@@ -197,9 +216,8 @@ class StateMachineEngine:
                         "State machine '%s': %s -> %s (event: %s)",
                         self.config_name, current, target, event,
                     )
-                    # Fire the on_complete_event if defined
-                    if transition.on_complete_event and self._on_complete_event:
-                        self._on_complete_event(transition.on_complete_event)
+                    # Fire the on_complete event if defined
+                    self._fire_event_actions(transition.actions, event, status)
                     return target
                 else:
                     raise StateMachineError(f"Invalid target state: {target}")
@@ -213,13 +231,13 @@ class StateMachineEngine:
     # ------------------------------------------------------------------
     def _execute_actions(
         self,
-        actions: List[str],
+        actions: List[Any],
         event: str,
         status: Any = None,
     ) -> None:
+        """Execute non-event actions during a transition."""
         for action in actions:
             if isinstance(action, str):
-                # Simple string action - look up handler
                 handler = self._action_handlers.get(action)
                 if handler:
                     try:
@@ -229,10 +247,8 @@ class StateMachineEngine:
                 else:
                     logger.warning("Unknown action: %s", action)
             elif isinstance(action, dict):
-                # Dict action: {action_name: value}
                 for key, value in action.items():
-                    # Skip 'event' actions - they are handled by on_complete_event
-                    # callback after the transition, not during action execution
+                    # Skip 'event' keys - handled by _fire_event_actions
                     if key == "event":
                         continue
                     handler = self._action_handlers.get(key)
@@ -246,15 +262,33 @@ class StateMachineEngine:
                     else:
                         logger.warning("Unknown action: %s", key)
 
+    def _fire_event_actions(
+        self,
+        actions: List[Any],
+        event: str,
+        status: Any = None,
+    ) -> None:
+        """Fire event actions (on_complete events) via the callback.
+
+        Event actions are defined in the YAML as:
+          actions:
+            - event: some_event_name
+
+        The callback receives the event name and handles cross-layer
+        communication (internal routing or MQTT publishing).
+        """
+        for action in actions:
+            if isinstance(action, dict) and "event" in action:
+                event_name = action["event"]
+                if event_name and self._on_event_callback:
+                    logger.debug(
+                        "Firing event '%s' from state machine '%s'",
+                        event_name, self.config_name,
+                    )
+                    self._on_event_callback(event_name)
+
     # ------------------------------------------------------------------
     # Default action handlers
     # ------------------------------------------------------------------
     def _action_log_event(self, value: Any, event: str, status: Any = None) -> None:
         logger.info("Action: log_event (event=%s)", event)
-
-    def _action_update_ui(self, value: Any, event: str, status: Any = None) -> None:
-        logger.info("Action: update_operator_ui")
-
-    def _action_publish_mqtt(self, value: Any, event: str, status: Any = None) -> None:
-        if self.mqtt_client:
-            self.mqtt_client.publish(f"automata/{value}", {"event": value})

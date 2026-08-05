@@ -1,12 +1,43 @@
 """
 Workflow orchestrator – the heart of the GUI.
 
-Ties together:
-  - State machine engine (declarative YAML config)
-  - Subsystem configuration (per-subsystem YAML files)
-  - MQTT messaging (subsystem communication)
-  - Subsystem adapters with per-subsystem state machines
-  - Frontend WebSocket server
+Architecture:
+  ┌─────────────────────────────────────────────────────────┐
+  │  Orchestrator (internal event bus)                       │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐  │
+  │  │Workflow SM│──│Object SM │──│ Internal Events      │  │
+  │  │(workflow) │  │(objects) │  │ "robot_first/pick"   │  │
+  │  └──────────┘  └──────────┘  └──────────────────────┘  │
+  └──────────────────────────┬──────────────────────────────┘
+                             │ Internal Events
+               ┌─────────────┴─────────────┐
+               │  Subsystem Adapters       │
+               │  ┌──────────────────┐     │
+               │  │ Subsystem SM 1   │     │  ← Only layer with MQTT
+               │  │ (robot_first)    │───┼──→ MQTT → real robot
+               │  └──────────────────┘     │
+               │  ┌──────────────────┐     │
+               │  │ Subsystem SM 2   │     │
+               │  │ (raman)          │───┼──→ MQTT → real raman
+               │  └──────────────────┘     │
+               └───────────────────────────┘
+
+Rules:
+  - Workflow, Object, and Subsystem interact ONLY internally (no MQTT)
+  - Subsystem SMs are the BOUNDARY: they publish MQTT to real subsystems
+  - Events in YAML can be scoped: "robot_first/measure_request"
+  - Actions in YAML can be scoped: "raman/measure_request" sends to raman
+
+Event scoping:
+  - event: measure_request          → internal, handled by this engine
+  - event: robot_first/pick         → routed to robot_first subsystem SM
+  - action: error                   → broadcast to ALL subsystems
+  - action: raman/measure_request   → send to raman subsystem only
+
+Action scoping:
+  - action: log_event               → internal logging
+  - action: subsystem_command       → send MQTT command to subsystem
+  - action: broadcast_error         → broadcast error to all subsystems
 """
 
 from __future__ import annotations
@@ -17,11 +48,11 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 
-# Placeholder for the project root to resolve config paths
+# Placeholder for the project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 from backend.adapters.subsystem import (
@@ -37,8 +68,6 @@ from backend.domain.models import (
     ObjectInfo,
     SubsystemConfig,
     SubsystemInfo,
-    WorkflowActionCommand,
-    WorkflowActionsConfig,
     WorkflowCommand,
     WorkflowState,
     WorkflowStatus,
@@ -51,15 +80,29 @@ from backend.orchestrator.object_state_machines import ObjectStateMachines
 logger = logging.getLogger(__name__)
 
 
+def _parse_subsystem_prefix(name: str) -> Tuple[str, str]:
+    """Parse a scoped name like 'robot_first/measure_request'.
+
+    Returns:
+        (scope, local_name) - e.g. ("robot_first", "measure_request")
+        If no '/' is found, scope is empty and local_name is the full name.
+    """
+    if "/" in name:
+        parts = name.split("/", 1)
+        return parts[0], parts[1]
+    return "", name
+
+
 class WorkflowOrchestrator:
     """
     Central orchestrator that:
-      1. Manages the workflow state machine
-      2. Loads subsystem configuration from individual YAML files
-      3. Creates and manages per-subsystem state machines
-      4. Communicates with subsystems via MQTT
-      5. Exposes state to the frontend via WebSocket
-      6. Handles operator commands
+      1. Manages the workflow state machine (internal events only)
+      2. Manages per-object state machines (internal events only)
+      3. Creates and manages per-subsystem state machines (boundary layer)
+      4. Routes internal events between layers
+      5. Subsystem SMs publish MQTT to real hardware (boundary)
+      6. Exposes state to the frontend via WebSocket
+      7. Handles operator commands
     """
 
     def __init__(
@@ -73,20 +116,24 @@ class WorkflowOrchestrator:
         # Apply global config (CLI args may have overridden defaults)
         self._global_config = global_config or GlobalConfig()
 
-        # MQTT client (created first so it can be passed to the state machines)
+        # MQTT client (used by subsystem adapters only)
         self.mqtt = MqttClient(
             broker=self._global_config.mqtt_broker,
             port=self._global_config.mqtt_port,
         )
 
-        # State machine (passes mqtt_client so action handlers can publish)
-        self.state_machine = StateMachineEngine(config_path, mqtt_client=self.mqtt)
+        # ─── Workflow State Machine ───
+        # No MQTT client passed – workflow SM only uses internal events
+        self.state_machine = StateMachineEngine(
+            config_path, mqtt_client=None,
+        )
+        # Wire up internal event routing for the workflow SM
+        self.state_machine.set_on_event_callback(self._on_event)
 
-        # Load subsystem configuration from YAML files
+        # ─── Subsystem Configuration & Adapters ───
         self.subsystems_config: List[SubsystemConfig] = []
         self._load_subsystems_config(subsystems_config_path)
 
-        # Create adapters with per-subsystem state machines
         self.adapter_factory = SubsystemAdapterFactory(
             self.mqtt,
             self.subsystems_config,
@@ -94,181 +141,220 @@ class WorkflowOrchestrator:
         )
         self.adapters: Dict[str, SubsystemAdapter] = self.adapter_factory.get_all()
 
-        # Frontend server (use global config defaults)
+        # Wire up subsystem SM event callbacks to publish MQTT (boundary)
+        self._setup_subsystem_event_callbacks()
+
+        # ─── Frontend Server ───
         self.frontend = FrontendServer(
             host=self._global_config.frontend_host,
             port=self._global_config.frontend_port,
         )
 
-        # Current workflow status
+        # ─── Workflow Status ───
         self._status = WorkflowStatus(
             state=WorkflowState.IDLE,
             total_objects=0,
-            active_subsystems={name: adapter.info for name, adapter in self.adapters.items()},
+            active_subsystems={
+                name: adapter.info
+                for name, adapter in self.adapters.items()
+            },
         )
         self._total_objects = num_objects or self._global_config.simulation_default_num_objects
         self._progress = 0
         self._current_object: Optional[str] = None
         self._lock = threading.Lock()
 
-        # Object state machines (per-object analysis workflows)
+        # ─── Object State Machines ───
         object_config_path = _PROJECT_ROOT / "backend" / "config" / "object.yaml"
         object_storage_dir = _PROJECT_ROOT / "backend" / "object_states"
         self.object_manager = ObjectStateMachines(
             config_path=object_config_path,
             storage_dir=object_storage_dir,
         )
-        # Register callback for object state changes
+        # Wire up object SM callbacks
         self.object_manager.on_change(self._on_object_state_change)
-        # Register callback for events fired on transition completion
         self.object_manager.on_event(self._on_object_event)
 
-        # Load workflow actions config (event → subsystem command mapping)
-        self.workflow_actions = self._load_workflow_actions()
+        # ─── MQTT Message Dispatcher ───
+        self.mqtt._on_message = self._on_mqtt_message
+        self._subsystem_callbacks: Dict[str, Callable] = {}
 
-        # Simulation mode
+        # ─── Simulation Mode ───
         self._use_simulation = use_simulation
         self._simulator: Any = None
 
-        # Register command handlers with frontend server
+        # ─── Command Handlers ───
         self.frontend.set_command_handler(WorkflowCommand.START_WORKFLOW, self._handle_start)
         self.frontend.set_command_handler(WorkflowCommand.PAUSE_WORKFLOW, self._handle_pause)
         self.frontend.set_command_handler(WorkflowCommand.RESUME_WORKFLOW, self._handle_resume)
         self.frontend.set_command_handler(WorkflowCommand.STOP_WORKFLOW, self._handle_stop)
         self.frontend.set_command_handler(WorkflowCommand.REQUEST_STATUS, self._handle_status)
-        self.frontend.set_status_callback(self._get_status)
         self.frontend.set_command_handler(WorkflowCommand.RESET_WORKFLOW, self._handle_reset)
 
-        # MQTT message dispatcher
-        self.mqtt._on_message = self._on_mqtt_message
-
-        # Registered subsystem callbacks
-        self._subsystem_callbacks: Dict[str, callable] = {}
-
     # ------------------------------------------------------------------
-    # Workflow actions loading (event → subsystem command mapping)
+    # Subsystem Event Callbacks (Boundary Layer)
     # ------------------------------------------------------------------
-    def _load_workflow_actions(self) -> WorkflowActionsConfig:
-        """Load the workflow actions config from YAML.
+    def _setup_subsystem_event_callbacks(self) -> None:
+        """Wire up subsystem SM event callbacks to publish MQTT.
 
-        This config maps object state machine events to subsystem commands.
+        This is the boundary layer: subsystem SMs fire events via their
+        on_event_callback, which publishes MQTT messages to real subsystems.
         """
-        actions_path = _PROJECT_ROOT / "backend" / "config" / "workflow_actions.yaml"
-        if actions_path.exists():
-            return WorkflowActionsConfig.from_yaml(actions_path)
-        logger.warning("Workflow actions config not found at %s, using empty config", actions_path)
-        return WorkflowActionsConfig()
+        for cfg in self.subsystems_config:
+            adapter = self.adapters.get(cfg.name)
+            if adapter and adapter.state_machine:
+                adapter.state_machine.set_on_event_callback(
+                    lambda event_name, name=cfg.name: self._publish_subsystem_event(name, event_name),
+                )
 
-    # ------------------------------------------------------------------
-    # Subsystem configuration loading
-    # ------------------------------------------------------------------
-    def _load_subsystems_config(self, config_path: str | Path | None) -> None:
-        """Load subsystem configuration from YAML file.
+    def _publish_subsystem_event(self, subsystem_name: str, event_name: str) -> None:
+        """Publish an event from a subsystem SM to MQTT (boundary layer).
 
-        The config file can be either:
-        - The old format: a single file with a 'subsystems' list
-        - A directory of per-subsystem YAML files (new format)
+        This is the ONLY place in the system that publishes MQTT messages
+        triggered by state machine transitions. Subsystem SMs are the
+        boundary between internal events and external hardware communication.
 
-        If config_path is a directory, it looks for *.yaml files.
-        If config_path is a file, it loads the old format.
-        If config_path is None, it tries the default locations.
+        Args:
+            subsystem_name: The subsystem that fired the event.
+            event_name: The event name (may be scoped or unscoped).
         """
-        # Determine config directory
-        config_dir = Path(__file__).resolve().parent.parent / "config" / "subsystems"
-
-        # If config_path is provided and is a file, try old format first
-        if config_path is not None:
-            config_path = Path(config_path)
-            if config_path.is_file():
-                self._load_old_format(config_path)
-                return
-            elif config_path.is_dir():
-                config_dir = config_path
-
-        # Try new format: load from config_dir/*.yaml
-        yaml_files = sorted(config_dir.glob("*.yaml"))
-        if yaml_files:
-            self._load_new_format(config_dir, yaml_files)
-            return
-
-        # Fallback: try old format at default location
-        old_config_path = Path(__file__).resolve().parent.parent.parent / "backend" / "config" / "subsystems.yaml"
-        if old_config_path.exists():
-            logger.info("Falling back to legacy subsystems.yaml")
-            self._load_old_format(old_config_path)
-            return
-
-        logger.warning("No subsystem configuration found, using empty config")
-        self.subsystems_config = []
-
-    def _load_old_format(self, config_path: Path) -> None:
-        """Load subsystem config from the old single-file format."""
-        with open(config_path, "r") as f:
-            data = yaml.safe_load(f)
-
-        if not data or "subsystems" not in data:
-            logger.warning("No subsystems section in config file")
-            self.subsystems_config = []
-            return
-
-        self.subsystems_config = []
-        config_dir = config_path.parent.parent / "config" / "subsystems"
-        for item in data["subsystems"]:
-            cfg = SubsystemConfig(
-                name=item["name"],
-                display_name=item.get("display_name", item["name"]),
-                type=item.get("type", "generic"),
-                mqtt_topic=item.get("mqtt_topic", "automata/subsystem/{name}"),
-                initial_state=item.get("initial_state", "ready"),
-                required=item.get("required", True),
-                metadata=item.get("metadata", {}),
-                state_machine_path=str(config_dir / f"{item['name']}.yaml"),
-            )
-            self.subsystems_config.append(cfg)
-            logger.info("Loaded subsystem config: %s (%s) – required=%s",
-                        cfg.name, cfg.type, cfg.required)
-
-    def _load_new_format(self, config_dir: Path, yaml_files: List[Path]) -> None:
-        """Load subsystem config from individual YAML files."""
-        self.subsystems_config = []
-        for yaml_file in yaml_files:
-            with open(yaml_file, "r") as f:
-                data = yaml.safe_load(f)
-
-            if not data or "name" not in data:
-                logger.warning("Skipping invalid subsystem YAML: %s", yaml_file)
-                continue
-
-            cfg = SubsystemConfig(
-                name=data["name"],
-                display_name=data.get("display_name", data["name"]),
-                type=data.get("type", "generic"),
-                mqtt_topic=data.get("mqtt_topic", "automata/subsystem/{name}"),
-                initial_state=data.get("initial_state", "ready"),
-                required=data.get("required", True),
-                metadata=data.get("metadata", {}),
-                state_machine_path=str(yaml_file),
-            )
-            self.subsystems_config.append(cfg)
-            logger.info("Loaded subsystem config: %s (%s) – required=%s – state_machine=%s",
-                        cfg.name, cfg.type, cfg.required, yaml_file.name)
-
-    @property
-    def subsystem_names(self) -> List[str]:
-        """Return the list of configured subsystem names."""
-        return self.adapter_factory.get_names()
-
-    @property
-    def required_subsystem_names(self) -> List[str]:
-        """Return the list of required subsystem names."""
-        return self.adapter_factory.get_required_names()
+        # Publish the event to the subsystem's status topic
+        topic = f"automata/subsystem/{subsystem_name}/event"
+        self.mqtt.publish(topic, {
+            "event": event_name,
+            "source": subsystem_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info(
+            "[Boundary] Subsystem '%s' event '%s' → MQTT topic '%s'",
+            subsystem_name, event_name, topic,
+        )
 
     # ------------------------------------------------------------------
-    # Operator command handlers
+    # Internal Event Routing (Workflow ↔ Object ↔ Subsystems)
+    # ------------------------------------------------------------------
+    def _on_event(self, event_name: str) -> None:
+        """Route internal events fired by state machines.
+
+        Events can be:
+          - Unscoped: "error" → broadcast to all subsystems
+          - Scoped: "robot_first/pick" → route to robot_first subsystem SM
+          - Workflow events: "subsystems_start" → handle workflow-level action
+
+        The event flows:
+          1. Workflow SM fires event → _on_event (this method)
+          2. If scoped (has '/'), route to target subsystem SM
+          3. If unscoped "error", broadcast to all subsystems
+          4. Object SM fires event → _on_object_event (separate callback)
+        """
+        scope, local_event = _parse_subsystem_prefix(event_name)
+
+        if scope:
+            # Scoped event: route to the specified subsystem
+            logger.info(
+                "Routing scoped event '%s' → subsystem '%s'",
+                event_name, scope,
+            )
+            self._route_event_to_subsystem(scope, local_event)
+        else:
+            # Unscoped event: broadcast to all subsystems
+            logger.info("Broadcasting unscoped event '%s' to all subsystems", event_name)
+            self._broadcast_event_to_subsystems(event_name)
+
+    def _route_event_to_subsystem(
+        self,
+        subsystem_name: str,
+        event_name: str,
+    ) -> None:
+        """Fire an event on a specific subsystem's state machine.
+
+        This is internal communication only – no MQTT involved.
+        The subsystem's state machine handles the event and may fire
+        its own on_event_callback to publish MQTT.
+
+        Args:
+            subsystem_name: The target subsystem.
+            event_name: The event to fire on that subsystem.
+        """
+        adapter = self.adapters.get(subsystem_name)
+        if adapter is None:
+            logger.warning("No adapter found for scoped event target '%s'", subsystem_name)
+            return
+
+        if adapter.state_machine is None:
+            logger.warning("No state machine for subsystem '%s'", subsystem_name)
+            return
+
+        try:
+            new_state = adapter.fire_transition(event_name)
+            logger.info(
+                "Subsystem '%s' transitioned: %s (event: %s)",
+                subsystem_name, new_state, event_name,
+            )
+            # Update frontend with subsystem state change
+            self._fire_frontend_event(
+                BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
+                {
+                    "subsystem": subsystem_name,
+                    "new_state": new_state,
+                    "event": event_name,
+                },
+            )
+        except StateMachineError as exc:
+            logger.warning(
+                "Subsystem '%s' rejected event '%s': %s",
+                subsystem_name, event_name, exc,
+            )
+
+    def _broadcast_event_to_subsystems(self, event_name: str) -> None:
+        """Broadcast an event to all subsystems.
+
+        Args:
+            event_name: The event name to broadcast.
+        """
+        for cfg in self.subsystems_config:
+            adapter = self.adapters.get(cfg.name)
+            if adapter and adapter.state_machine:
+                try:
+                    adapter.fire_transition(event_name)
+                except StateMachineError:
+                    # Some subsystems may not have a transition for this event
+                    logger.debug(
+                        "Subsystem '%s' has no transition for event '%s'",
+                        cfg.name, event_name,
+                    )
+
+    # ------------------------------------------------------------------
+    # Object Event Handler
+    # ------------------------------------------------------------------
+    def _on_object_event(self, object_id: str, event_name: str) -> None:
+        """Handle events fired by object state machine transitions.
+
+        Object SM events are routed like other internal events:
+          - Scoped: "robot_first/pick" → route to robot_first subsystem
+          - Unscoped: "error" → broadcast to all subsystems
+
+        Args:
+            object_id: The object that fired the event.
+            event_name: The event name (may be scoped).
+        """
+        logger.info(
+            "Object '%s' fired event '%s'",
+            object_id, event_name,
+        )
+        # Reuse the same routing logic as workflow events
+        self._on_event(event_name)
+
+    # ------------------------------------------------------------------
+    # Operator Command Handlers
     # ------------------------------------------------------------------
     def _handle_start(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: start_workflow")
         try:
+            # Always clear previous state before starting a new workflow.
+            # This handles starting from stopped, error, or idle.
+            self._reset_workflow_state()
+
             new_state = self.state_machine.fire("start_requested", self._status)
             self._update_state(WorkflowState(new_state))
             self._fire_frontend_event(
@@ -276,7 +362,6 @@ class WorkflowOrchestrator:
                 {"new_state": new_state, "source": "operator"},
             )
 
-            # If in simulation mode, start simulators and run workflow
             if self._use_simulation and new_state == "starting":
                 self._start_simulation()
         except StateMachineError as exc:
@@ -284,65 +369,6 @@ class WorkflowOrchestrator:
             self._fire_frontend_event(
                 BackendEvent.ERROR_REPORTED.value,
                 {"message": str(exc)},
-            )
-
-    def _start_simulation(self) -> None:
-        """Start simulation subsystems and run the full workflow."""
-        from backend.orchestrator.simulation import WorkflowSimulator  # noqa: E402
-
-        if self._simulator is not None:
-            logger.warning("Simulation already running")
-            return
-
-        self._simulator = WorkflowSimulator(
-            orchestrator=self,
-            broker_host=self.mqtt.broker,
-            broker_port=self.mqtt.port,
-            num_objects=self._total_objects or 3,
-            subsystems_config=self.subsystems_config,
-            global_config=self._global_config,
-        )
-        self._simulator.start()
-        logger.info("Simulation mode: starting workflow with %d objects", self._simulator.num_objects)
-
-        # Run simulation in a background thread so it doesn't block the main loop
-        thread = threading.Thread(target=self._run_simulation_direct, daemon=True)
-        thread.start()
-
-    def _run_simulation(self) -> None:
-        """Run the full workflow simulation."""
-        try:
-            # Wait for orchestrator to reach 'running' state
-            logger.info("Waiting for orchestrator to reach 'running' state...")
-            for _ in range(60):  # Wait up to 30 seconds
-                if self.state_machine.current_state == "running":
-                    logger.info("Orchestrator reached 'running' state")
-                    break
-                logger.debug("Waiting for orchestrator to reach 'running' state... current state: %s", self.state_machine.current_state)
-                time.sleep(0.5)
-            else:
-                logger.error("Orchestrator did not reach 'running' state. Current state: %s", self.state_machine.current_state)
-                return
-
-            # Now run the simulation
-            self._simulator.simulate_full_workflow()
-        except Exception as exc:
-            logger.error("Simulation error: %s", exc, exc_info=True)
-            self._fire_frontend_event(
-                BackendEvent.ERROR_REPORTED.value,
-                {"message": f"Simulation error: {exc}"},
-            )
-
-    def _run_simulation_direct(self) -> None:
-        """Run the full workflow simulation without waiting for 'running' state."""
-        try:
-            logger.info("Starting simulation workflow immediately...")
-            self._simulator.simulate_full_workflow()
-        except Exception as exc:
-            logger.error("Simulation error: %s", exc, exc_info=True)
-            self._fire_frontend_event(
-                BackendEvent.ERROR_REPORTED.value,
-                {"message": f"Simulation error: {exc}"},
             )
 
     def _handle_pause(self, data: Dict[str, Any]) -> None:
@@ -396,26 +422,13 @@ class WorkflowOrchestrator:
     def _handle_reset(self, data: Dict[str, Any]) -> None:
         """Handle workflow reset (from error or stopped state back to idle).
 
-        This resets the entire workflow: clears all object state machines,
+        Resets the entire workflow: clears all object state machines,
         resets progress, and transitions the workflow state machine to idle.
-        If all required subsystems are already ready, it immediately starts
-        the workflow (idle → starting → running) without waiting for
-        init_complete events.
         """
         logger.info("Operator: reset_workflow")
         try:
-            # Clear all object state machines
-            self.object_manager.clear()
-            logger.info("All object state machines cleared")
+            self._reset_workflow_state()
 
-            # Reset progress and current object
-            self._progress = 0
-            self._current_object = None
-            self._status.progress = 0
-            self._status.current_object = None
-            self._status.objects = []
-
-            # Fire reset_requested on the workflow state machine
             new_state = self.state_machine.fire("reset_requested", self._status)
             self._update_state(WorkflowState(new_state))
             self._fire_frontend_event(
@@ -427,19 +440,15 @@ class WorkflowOrchestrator:
                 {"message": "All objects cleared on workflow reset"},
             )
 
-            # Check if all required subsystems are already ready.
-            # If so, immediately start the workflow (idle → starting → running)
-            # without waiting for init_complete events.
+            # If all required subsystems are already ready, start immediately
             required_adapters = self.adapter_factory.get_required()
             all_ready = all(
                 a.state == SubsystemState.READY for a in required_adapters
             )
             if all_ready:
-                logger.info("All required subsystems already ready after reset – starting workflow immediately")
                 self._start_workflow_immediately()
             else:
-                logger.info("Not all required subsystems ready after reset – waiting for operator to start")
-                # Update subsystem info in status
+                logger.info("Not all required subsystems ready after reset")
                 for name, adapter in self.adapters.items():
                     self._status.active_subsystems[name] = adapter.info
 
@@ -450,14 +459,31 @@ class WorkflowOrchestrator:
                 {"message": str(exc)},
             )
 
-    def _start_workflow_immediately(self) -> None:
-        """Start the workflow immediately from idle when all subsystems are ready.
+    def _handle_status(self, data: Dict[str, Any]) -> None:
+        logger.info("Operator: request_status")
+        self.frontend.broadcast_status(self._status)
 
-        This is called after a reset when all required subsystems are already
-        in ready state. It transitions: idle → starting → running.
+    # ------------------------------------------------------------------
+    # Workflow Helpers
+    # ------------------------------------------------------------------
+    def _reset_workflow_state(self) -> None:
+        """Reset all workflow state (objects, progress, etc.) before starting a new workflow.
+
+        This is called when the operator starts a new workflow from any terminal
+        state (stopped, error, idle). It clears all objects, resets progress,
+        and broadcasts the cleanup to the frontend.
         """
+        self.object_manager.clear()
+        self._progress = 0
+        self._current_object = None
+        self._status.progress = 0
+        self._status.current_object = None
+        self._status.objects = []
+        logger.info("Workflow state reset: cleared objects and progress")
+
+    def _start_workflow_immediately(self) -> None:
+        """Start the workflow immediately from idle when all subsystems are ready."""
         try:
-            # idle → starting
             new_state = self.state_machine.fire("start_requested", self._status)
             self._update_state(WorkflowState(new_state))
             self._fire_frontend_event(
@@ -465,7 +491,6 @@ class WorkflowOrchestrator:
                 {"new_state": new_state, "source": "subsystems_ready"},
             )
 
-            # starting → running (subsystems already ready)
             new_state = self.state_machine.fire("subsystem_ready", self._status)
             self._update_state(WorkflowState(new_state))
             self._fire_frontend_event(
@@ -473,26 +498,53 @@ class WorkflowOrchestrator:
                 {"new_state": new_state, "source": "subsystems_ready"},
             )
 
-            logger.info("Workflow started immediately from idle (all subsystems ready)")
+            logger.info("Workflow started immediately (all subsystems ready)")
         except StateMachineError as exc:
             logger.error("Failed to start workflow immediately: %s", exc)
 
-    def _handle_status(self, data: Dict[str, Any]) -> None:
-        logger.info("Operator: request_status")
-        self.frontend.broadcast_status(self._status)
+    # ------------------------------------------------------------------
+    # Simulation
+    # ------------------------------------------------------------------
+    def _start_simulation(self) -> None:
+        """Start simulation subsystems and run the full workflow."""
+        from backend.orchestrator.simulation import WorkflowSimulator
+
+        if self._simulator is not None:
+            logger.warning("Simulation already running")
+            return
+
+        self._simulator = WorkflowSimulator(
+            orchestrator=self,
+            broker_host=self.mqtt.broker,
+            broker_port=self.mqtt.port,
+            num_objects=self._total_objects or 3,
+            subsystems_config=self.subsystems_config,
+            global_config=self._global_config,
+        )
+        self._simulator.start()
+
+        thread = threading.Thread(target=self._run_simulation_direct, daemon=True)
+        thread.start()
+
+    def _run_simulation_direct(self) -> None:
+        """Run the full workflow simulation in a background thread."""
+        try:
+            logger.info("Starting simulation workflow immediately...")
+            self._simulator.simulate_full_workflow()
+        except Exception as exc:
+            logger.error("Simulation error: %s", exc, exc_info=True)
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": f"Simulation error: {exc}"},
+            )
 
     # ------------------------------------------------------------------
-    # Object state machine management
+    # Object State Machine Management
     # ------------------------------------------------------------------
     def create_object(self, object_id: str) -> None:
-        """Create a new object state machine instance.
-
-        Called when the vision system identifies a new object, or when
-        the simulation generates an object for analysis.
-        """
+        """Create a new object state machine instance."""
         with self._lock:
             self.object_manager.create_object(object_id)
-
         logger.info("Created object state machine: %s", object_id)
 
         self._fire_frontend_event(
@@ -509,7 +561,6 @@ class WorkflowOrchestrator:
         """Remove an object state machine instance."""
         with self._lock:
             self.object_manager.remove_object(object_id)
-
         logger.info("Removed object state machine: %s", object_id)
 
         self._fire_frontend_event(
@@ -518,179 +569,50 @@ class WorkflowOrchestrator:
         )
         self._broadcast_objects()
 
-    def fire_object_transition(self, object_id: str, event: str) -> Optional[str]:
-        """Fire a transition on an object's state machine.
-
-        This is called when subsystem events indicate an object should
-        advance to the next phase of analysis.
-
-        Args:
-            object_id: The object to transition.
-            event: The event name (e.g., "object_placed_on_disk").
-
-        Returns:
-            The new state name, or None if the transition failed.
-        """
+    def fire_object_transition(
+        self,
+        object_id: str,
+        event: str,
+    ) -> Optional[str]:
+        """Fire a transition on an object's state machine."""
         with self._lock:
             new_state = self.object_manager.fire_transition(object_id, event)
 
         if new_state:
             self._fire_frontend_event(
                 BackendEvent.OBJECT_STATE_CHANGED.value,
-                {
-                    "object_id": object_id,
-                    "new_state": new_state,
-                },
+                {"object_id": object_id, "new_state": new_state},
             )
             self._broadcast_objects()
 
-            # Check if the object has reached the final state
             if new_state == "object_analyzed":
                 logger.info("Object '%s' analysis complete", object_id)
-                # Update progress
                 self._progress = len(self.object_manager.get_object_ids())
                 self._fire_frontend_event(
                     BackendEvent.PROGRESS_UPDATED.value,
-                    {
-                        "progress": self._progress,
-                        "total": self._total_objects,
-                    },
+                    {"progress": self._progress, "total": self._total_objects},
                 )
 
         return new_state
 
-    def _on_object_state_change(self, object_id: str, new_state: str, event: str) -> None:
-        """Callback for object state machine transitions."""
-        logger.info(
-            "Object '%s' state change: %s -> %s (event: %s)",
-            object_id, self.object_manager.get_object_state(object_id),
-            new_state, event,
-        )
-
-    def _on_object_event(self, object_id: str, event_name: str) -> None:
-        """Handle events fired by object state machine transitions.
-
-        When an object state machine transition completes with an 'event' action,
-        this method looks up the corresponding subsystem commands in the
-        workflow_actions config and executes them.
-
-        Args:
-            object_id: The object that fired the event.
-            event_name: The event name (e.g., 'trigger_robot_first_pick').
-        """
-        action = self.workflow_actions.actions.get(event_name)
-        if action:
-            logger.info(
-                "Object '%s' event '%s' → executing %d subsystem command(s)",
-                object_id, event_name, len(action.commands),
-            )
-            self._execute_workflow_action(object_id, action)
-        else:
-            logger.warning(
-                "No workflow action registered for event '%s' (object: %s). "
-                "Available events: %s",
-                event_name, object_id, list(self.workflow_actions.actions.keys()),
-            )
-
-    def _broadcast_objects(self) -> None:
-        """Broadcast the current list of objects to the frontend."""
-        with self._lock:
-            objects_info = self.object_manager.get_all_objects_info()
-
-        self._fire_frontend_event(
-            BackendEvent.WORKFLOW_STATE_CHANGED.value,
-            {"objects": objects_info},
-        )
-        self.frontend.broadcast_status(self._status)
-
-    # ------------------------------------------------------------------
-    # Object event → subsystem command execution (config-driven)
-    # ------------------------------------------------------------------
-    def _execute_workflow_action(self, object_id: str, action: WorkflowAction) -> None:
-        """Execute all subsystem commands for a workflow action.
-
-        Reads commands from the workflow_actions config and fires them
-        for the given object.
-
-        Args:
-            object_id: The object that triggered this action.
-            action: The WorkflowAction containing subsystem commands.
-        """
-        for cmd in action.commands:
-            self._fire_subsystem_command(object_id, cmd)
-
-    def _fire_subsystem_command(
+    def _on_object_state_change(
         self,
         object_id: str,
-        cmd: WorkflowActionCommand,
+        new_state: str,
+        event: str,
     ) -> None:
-        """Publish a command to a subsystem via MQTT.
-
-        Resolves {{object_id}} placeholders in the payload before sending.
-
-        Args:
-            object_id: The current object ID (used for placeholder resolution).
-            cmd: The WorkflowActionCommand specifying subsystem, command, and payload.
-        """
-        adapter = self.adapters.get(cmd.subsystem)
-        if adapter:
-            # Resolve {{object_id}} placeholders in payload
-            resolved_payload = self._resolve_placeholders(cmd.payload, object_id)
-            topic = adapter.config.command_topic
-            self.mqtt.publish(topic, {"command": cmd.command, **resolved_payload})
-            logger.info(
-                "Published command '%s' to subsystem '%s' (topic: %s, payload: %s)",
-                cmd.command, cmd.subsystem, topic, resolved_payload,
-            )
-        else:
-            logger.warning(
-                "No adapter found for subsystem '%s' to fire command '%s'"
-                " (object: %s)",
-                cmd.subsystem, cmd.command, object_id,
-            )
-
-    @staticmethod
-    def _resolve_placeholders(
-        payload: Dict[str, Any],
-        object_id: str,
-    ) -> Dict[str, Any]:
-        """Resolve {{object_id}} placeholders in a payload dict.
-
-        Recursively processes nested dicts and lists.
-
-        Args:
-            payload: The payload dict that may contain {{object_id}} placeholders.
-            object_id: The object ID to substitute.
-
-        Returns:
-            A new dict with all placeholders resolved.
-        """
-        result: Dict[str, Any] = {}
-        for key, value in payload.items():
-            if isinstance(value, str):
-                result[key] = value.replace("{{object_id}}", object_id)
-            elif isinstance(value, dict):
-                result[key] = {
-                    k: v.replace("{{object_id}}", object_id)
-                    if isinstance(v, str) else v
-                    for k, v in value.items()
-                }
-            elif isinstance(value, list):
-                result[key] = [
-                    item.replace("{{object_id}}", object_id)
-                    if isinstance(item, str) else item
-                    for item in value
-                ]
-            else:
-                result[key] = value
-        return result
+        """Callback for object state machine transitions."""
+        logger.info(
+            "Object '%s': %s -> %s (event: %s)",
+            object_id, new_state, event,
+        )
 
     # ------------------------------------------------------------------
-    # MQTT message dispatcher
+    # MQTT Message Dispatcher
     # ------------------------------------------------------------------
     def _on_mqtt_message(self, topic: str, payload: bytes) -> None:
         """Route incoming MQTT messages to appropriate handlers."""
-        logger.info("[Orchestrator] _on_mqtt_message called for topic=%s", topic)
+        logger.info("[Orchestrator] MQTT message on topic=%s", topic)
         topic_str = topic
         try:
             data = json.loads(payload.decode())
@@ -714,14 +636,22 @@ class WorkflowOrchestrator:
                 if subsystem_name in self.adapters:
                     self._update_subsystem_status(subsystem_name, data)
 
-    def register_subsystem_callback(self, topic_pattern: str, callback: callable) -> None:
+    def register_subsystem_callback(
+        self,
+        topic_pattern: str,
+        callback: Callable,
+    ) -> None:
         """Register a callback for MQTT messages matching a topic pattern."""
         self._subsystem_callbacks[topic_pattern] = callback
 
     # ------------------------------------------------------------------
-    # Subsystem status updates
+    # Subsystem Status Updates
     # ------------------------------------------------------------------
-    def _update_subsystem_status(self, subsystem_name: str, data: Dict[str, Any]) -> None:
+    def _update_subsystem_status(
+        self,
+        subsystem_name: str,
+        data: Dict[str, Any],
+    ) -> None:
         if subsystem_name not in self.adapters:
             return
         adapter = self.adapters[subsystem_name]
@@ -742,7 +672,7 @@ class WorkflowOrchestrator:
             },
         )
 
-        # Check if all required subsystems are ready (for starting -> running transition)
+        # Check if all required subsystems are ready (for starting → running)
         if self.state_machine.state == WorkflowState.STARTING:
             required_adapters = self.adapter_factory.get_required()
             all_ready = all(
@@ -758,7 +688,7 @@ class WorkflowOrchestrator:
                 )
 
     # ------------------------------------------------------------------
-    # Subsystem state machine transitions
+    # Subsystem State Machine Transitions
     # ------------------------------------------------------------------
     def fire_subsystem_transition(
         self,
@@ -767,13 +697,8 @@ class WorkflowOrchestrator:
     ) -> bool:
         """Fire a transition on a subsystem's state machine.
 
-        This method:
-        1. Fires the event on the subsystem's state machine
-        2. Publishes the new state via MQTT
-        3. Updates the frontend with the new subsystem state
-        4. Checks if the transition affects the main workflow state
-
-        Returns True if successful, False otherwise.
+        This is used by the simulation and external callers.
+        The subsystem SM handles MQTT publishing via its boundary callback.
         """
         adapter = self.adapters.get(subsystem_name)
         if adapter is None:
@@ -792,15 +717,6 @@ class WorkflowOrchestrator:
                 new_state, event,
             )
 
-            # Publish the state change via MQTT
-            topic = f"automata/subsystem/{subsystem_name}/status"
-            self.mqtt.publish(topic, {
-                "state": new_state,
-                "name": subsystem_name,
-                "ready": new_state == "ready",
-            })
-
-            # Update the frontend with the new subsystem state
             self._fire_frontend_event(
                 BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
                 {
@@ -810,19 +726,19 @@ class WorkflowOrchestrator:
                 },
             )
 
-            # Update the subsystem info in the status
             if subsystem_name in self._status.active_subsystems:
                 info = self._status.active_subsystems[subsystem_name]
                 info.current_state = new_state
                 info.state_description = adapter._get_state_description()
 
-            # Check if this transition affects the main workflow state
             self._check_workflow_state_on_subsystem_change(subsystem_name, new_state)
-
             return True
 
         except Exception as exc:
-            logger.error("Failed to fire transition on subsystem '%s': %s", subsystem_name, exc)
+            logger.error(
+                "Failed to fire transition on subsystem '%s': %s",
+                subsystem_name, exc,
+            )
             return False
 
     def _check_workflow_state_on_subsystem_change(
@@ -831,7 +747,6 @@ class WorkflowOrchestrator:
         new_state: str,
     ) -> None:
         """Check if a subsystem state change should trigger a workflow state transition."""
-        # If all subsystems become ready and we're in STARTING, move to RUNNING
         if new_state == "ready" and self.state_machine.state == WorkflowState.STARTING:
             required_adapters = self.adapter_factory.get_required()
             all_ready = all(
@@ -847,7 +762,7 @@ class WorkflowOrchestrator:
                 )
 
     # ------------------------------------------------------------------
-    # State management
+    # State Management
     # ------------------------------------------------------------------
     def _update_state(self, new_state: WorkflowState) -> None:
         self._status.state = new_state
@@ -855,9 +770,14 @@ class WorkflowOrchestrator:
             BackendEvent.WORKFLOW_STATE_CHANGED.value,
             {"new_state": new_state.value},
         )
+        # Broadcast full status including objects for the frontend
         self.frontend.broadcast_status(self._status)
 
-    def _fire_frontend_event(self, event_type: str, details: Dict[str, Any]) -> None:
+    def _fire_frontend_event(
+        self,
+        event_type: str,
+        details: Dict[str, Any],
+    ) -> None:
         payload = EventPayload(
             event_type=event_type,
             details=details,
@@ -865,7 +785,6 @@ class WorkflowOrchestrator:
         self.frontend.broadcast(payload)
 
     def _get_status(self) -> WorkflowStatus:
-        # Update objects list in the status
         with self._lock:
             self._status.objects = [
                 ObjectInfo(
@@ -880,11 +799,22 @@ class WorkflowOrchestrator:
             ]
         return self._status
 
+    def _broadcast_objects(self) -> None:
+        """Broadcast the current list of objects to the frontend."""
+        with self._lock:
+            objects_info = self.object_manager.get_all_objects_info()
+
+        self._fire_frontend_event(
+            BackendEvent.WORKFLOW_STATE_CHANGED.value,
+            {"objects": objects_info},
+        )
+        self.frontend.broadcast_status(self._status)
+
     # ------------------------------------------------------------------
-    # Convenience: fire internal events
+    # Convenience Methods
     # ------------------------------------------------------------------
     def fire_event(self, event: str) -> bool:
-        """Fire an internal event through the state machine."""
+        """Fire an internal event through the workflow state machine."""
         try:
             new_state = self.state_machine.fire(event, self._status)
             self._update_state(WorkflowState(new_state))
@@ -901,7 +831,12 @@ class WorkflowOrchestrator:
         self._current_object = object_id
         self._status.current_object = object_id
 
-    def set_subsystem_state(self, subsystem_name: str, state: SubsystemState, error: Optional[str] = None) -> None:
+    def set_subsystem_state(
+        self,
+        subsystem_name: str,
+        state: SubsystemState,
+        error: Optional[str] = None,
+    ) -> None:
         """Directly set a subsystem's state (useful for testing)."""
         if subsystem_name not in self.adapters:
             return
@@ -909,27 +844,10 @@ class WorkflowOrchestrator:
         adapter.update_state(state, error=error)
         logger.info("Subsystem %s set to %s", subsystem_name, state.value)
 
-        # Check if all required subsystems are ready (for starting -> running transition)
-        if self.state_machine.state == WorkflowState.STARTING:
-            required_adapters = self.adapter_factory.get_required()
-            all_ready = all(
-                a.state == SubsystemState.READY for a in required_adapters
-            )
-            logger.info("All required subsystems ready check: %s", all_ready)
-            if all_ready:
-                logger.info("All required subsystems ready!")
-                self.state_machine.fire("subsystem_ready", self._status)
-                self._update_state(WorkflowState.RUNNING)
-                self._fire_frontend_event(
-                    BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                    {"new_state": "running", "source": "subsystems_ready"},
-                )
-
     def update_all_subsystems_ready(self) -> None:
-        """Mark all required subsystems as ready and trigger the transition check."""
+        """Mark all required subsystems as ready."""
         for adapter in self.adapter_factory.get_required():
             adapter.update_state(SubsystemState.READY)
-        # Now check if all required are ready
         if self.state_machine.state == WorkflowState.STARTING:
             required_adapters = self.adapter_factory.get_required()
             all_ready = all(
@@ -944,6 +862,103 @@ class WorkflowOrchestrator:
                 )
 
     # ------------------------------------------------------------------
+    # Configuration Loading
+    # ------------------------------------------------------------------
+    def _load_subsystems_config(
+        self,
+        config_path: str | Path | None,
+    ) -> None:
+        """Load subsystem configuration from YAML files."""
+        config_dir = Path(__file__).resolve().parent.parent / "config" / "subsystems"
+
+        if config_path is not None:
+            config_path = Path(config_path)
+            if config_path.is_file():
+                self._load_old_format(config_path)
+                return
+            elif config_path.is_dir():
+                config_dir = config_path
+
+        yaml_files = sorted(config_dir.glob("*.yaml"))
+        if yaml_files:
+            self._load_new_format(config_dir, yaml_files)
+            return
+
+        old_config_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "backend" / "config" / "subsystems.yaml"
+        )
+        if old_config_path.exists():
+            logger.info("Falling back to legacy subsystems.yaml")
+            self._load_old_format(old_config_path)
+            return
+
+        logger.warning("No subsystem configuration found")
+        self.subsystems_config = []
+
+    def _load_old_format(self, config_path: Path) -> None:
+        """Load subsystem config from the old single-file format."""
+        with open(config_path, "r") as f:
+            data = yaml.safe_load(f)
+
+        if not data or "subsystems" not in data:
+            logger.warning("No subsystems section in config file")
+            self.subsystems_config = []
+            return
+
+        self.subsystems_config = []
+        config_dir = config_path.parent.parent / "config" / "subsystems"
+        for item in data["subsystems"]:
+            cfg = SubsystemConfig(
+                name=item["name"],
+                display_name=item.get("display_name", item["name"]),
+                type=item.get("type", "generic"),
+                mqtt_topic=item.get("mqtt_topic", "automata/subsystem/{name}"),
+                initial_state=item.get("initial_state", "ready"),
+                required=item.get("required", True),
+                metadata=item.get("metadata", {}),
+                state_machine_path=str(config_dir / f"{item['name']}.yaml"),
+            )
+            self.subsystems_config.append(cfg)
+
+    def _load_new_format(
+        self,
+        config_dir: Path,
+        yaml_files: List[Path],
+    ) -> None:
+        """Load subsystem config from individual YAML files."""
+        self.subsystems_config = []
+        for yaml_file in yaml_files:
+            with open(yaml_file, "r") as f:
+                data = yaml.safe_load(f)
+
+            if not data or "name" not in data:
+                logger.warning("Skipping invalid subsystem YAML: %s", yaml_file)
+                continue
+
+            cfg = SubsystemConfig(
+                name=data["name"],
+                display_name=data.get("display_name", data["name"]),
+                type=data.get("type", "generic"),
+                mqtt_topic=data.get("mqtt_topic", "automata/subsystem/{name}"),
+                initial_state=data.get("initial_state", "ready"),
+                required=data.get("required", True),
+                metadata=data.get("metadata", {}),
+                state_machine_path=str(yaml_file),
+            )
+            self.subsystems_config.append(cfg)
+
+    @property
+    def subsystem_names(self) -> List[str]:
+        """Return the list of configured subsystem names."""
+        return self.adapter_factory.get_names()
+
+    @property
+    def required_subsystem_names(self) -> List[str]:
+        """Return the list of required subsystem names."""
+        return self.adapter_factory.get_required_names()
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -954,16 +969,13 @@ class WorkflowOrchestrator:
             logger.info("  - %s (%s) [required=%s]", cfg.name, cfg.type, cfg.required)
 
         self.mqtt.connect()
-        # Subscribe to all configured subsystem status topics
         for cfg in self.subsystems_config:
             self.mqtt.subscribe(cfg.status_topic, qos=1)
             self.mqtt.subscribe(cfg.response_topic, qos=1)
-        # Also subscribe to wildcard topics for flexibility
         self.mqtt.subscribe(f"{TOPIC_SUBSYSTEM}/*/status", qos=1)
         self.mqtt.subscribe(f"{TOPIC_SUBSYSTEM}/*/response", qos=1)
         self.frontend.start()
 
-        # Set subsystem configuration for frontend broadcasts
         self.frontend.set_subsystem_config(
             [cfg.to_dict() for cfg in self.subsystems_config]
         )
@@ -979,7 +991,6 @@ class WorkflowOrchestrator:
     def stop(self) -> None:
         """Stop the orchestrator cleanly."""
         logger.info("Stopping workflow orchestrator...")
-        # Stop simulation if running
         if self._simulator is not None:
             self._simulator.stop()
             self._simulator = None

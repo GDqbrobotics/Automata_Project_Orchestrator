@@ -84,10 +84,13 @@ class ObjectStateMachines:
     def on_event(self, callback: Callable[[str, str], None]) -> None:
         """Register a callback for events fired on transition completion.
 
+        Called with (object_id, event_name) when a transition completes
+        with an 'event' action. The orchestrator routes these events
+        internally (scoped events go to specific subsystems, unscoped
+        events broadcast to all).
+
         Args:
-            callback: Called with (object_id, event_name) when a transition
-                      completes with an 'event' action. The orchestrator uses
-                      this to trigger subsystem actions.
+            callback: Called with (object_id, event_name).
         """
         self._on_event = callback
 
@@ -110,8 +113,8 @@ class ObjectStateMachines:
                 config_path=self.config_path,
                 config_name=f"object:{object_id}",
             )
-            # Wire up the on_complete_event callback
-            engine.set_on_complete_event_callback(
+            # Wire up the on_event callback for internal event routing
+            engine.set_on_event_callback(
                 lambda event_name, oid=object_id: self._fire_event(oid, event_name),
             )
             self._machines[object_id] = engine
@@ -315,8 +318,8 @@ class ObjectStateMachines:
                 config_path=self.config_path,
                 config_name=f"object:{object_id}",
             )
-            # Wire up the on_complete_event callback
-            engine.set_on_complete_event_callback(
+            # Wire up the on_event callback for internal event routing
+            engine.set_on_event_callback(
                 lambda event_name, oid=object_id: self._fire_event(oid, event_name),
             )
             # Restore the persisted state
@@ -350,11 +353,12 @@ class ObjectStateMachines:
 
         Called by the state machine engine when a transition completes
         with an 'event' action. The callback notifies the orchestrator
-        so it can trigger the appropriate subsystem action.
+        so it can route the event internally (scoped events go to
+        specific subsystems, unscoped events broadcast to all).
 
         Args:
             object_id: The object that fired the event.
-            event_name: The event name (e.g., 'trigger_robot_first_pick').
+            event_name: The event name (may be scoped like 'robot_first/pick').
         """
         if self._on_event:
             self._on_event(object_id, event_name)

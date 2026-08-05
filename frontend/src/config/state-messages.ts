@@ -16,7 +16,6 @@ export const DEFAULT_STATE_MESSAGES: Record<WorkflowStateType, string | ((err?: 
   paused: 'Workflow paused',
   stopping: 'Stopping workflow...',
   stopped: 'Workflow stopped by operator',
-  completing: 'Finalizing and uploading data...',
   error: (error?: string) => `Error: ${error || 'Workflow interrupted'}`,
 };
 

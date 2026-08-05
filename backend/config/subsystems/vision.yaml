@@ -17,7 +17,6 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/vision/ready
 
       - event: error
         target: error
@@ -27,25 +26,28 @@ states:
   ready:
     description: "Camera is ready and idle"
     transitions:
-      - event: start
-        target: running
+      - event: capture
+        target: capturing
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/vision/running
 
       - event: error
         target: error
         actions:
           - log_event
 
-  running:
+  capturing:
     description: "Camera is actively capturing"
     transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+
       - event: stop
         target: stopped
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/vision/stopped
 
       - event: error
         target: error
@@ -55,13 +57,13 @@ states:
   stopped:
     description: "Camera has stopped capturing"
     transitions:
-      - event: start
-        target: running
+      - event: ready
+        target: ready
         actions:
           - log_event
 
-      - event: ready
-        target: ready
+      - event: capture
+        target: capturing
         actions:
           - log_event
 

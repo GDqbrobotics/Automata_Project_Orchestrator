@@ -41,5 +41,4 @@ workflow_states:
   paused: "Workflow paused"
   stopping: "Stopping workflow..."
   stopped: "Workflow stopped by operator"
-  completing: "Finalizing and uploading data..."
   error: "Error: Workflow interrupted"

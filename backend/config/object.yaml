@@ -9,7 +9,7 @@ states:
         target: moving_to_disk
         actions:
           - log_event
-          - event: trigger_robot_first_pick
+          - event: robot_first/pick
 
   moving_to_disk:
     description: Object is being moved from the box to the rotating platform disk
@@ -18,8 +18,7 @@ states:
         target: HSI_3DI_analysis
         actions:
           - log_event
-          - update_operator_ui
-          - event: trigger_imaging_capture
+          - event: imaging_3di_hsi/capture
 
   HSI_3DI_analysis:
     description: 3D imaging and hyperspectral imaging capture is being performed
@@ -28,7 +27,7 @@ states:
         target: object_going_second_position
         actions:
           - log_event
-          - event: trigger_platform_rotate_to_second
+          - event: rotating_platform/rotate_to_second
 
   object_going_second_position:
     description: Rotating platform is moving the object to the second measurement position
@@ -37,7 +36,9 @@ states:
         target: XRF_RAMAN_analysis
         actions:
           - log_event
-          - event: trigger_measurements
+          - event: ai_analysis/plan
+          - event: xrf/measure
+          - event: raman/measure
 
   XRF_RAMAN_analysis:
     description: XRF and Raman puntual measurements are being performed at AI-extracted points
@@ -46,7 +47,7 @@ states:
         target: object_going_first_position
         actions:
           - log_event
-          - event: trigger_platform_rotate_to_first
+          - event: rotating_platform/rotate_to_first
 
   object_going_first_position:
     description: Rotating platform is moving the object back to the first position
@@ -55,7 +56,7 @@ states:
         target: moving_to_box
         actions:
           - log_event
-          - event: trigger_robot_first_return
+          - event: robot_first/return
 
   moving_to_box:
     description: Object is being moved from the disk back to its original position in the box
@@ -64,8 +65,7 @@ states:
         target: object_analyzed
         actions:
           - log_event
-          - update_operator_ui
-          - event: trigger_cloud_upload
+          - event: cloud_database/upload
 
   object_analyzed:
-    description: Object analysis is complete – data will be uploaded to the cloud database
+    description: Object analysis is complete – data has been uploaded to the cloud database

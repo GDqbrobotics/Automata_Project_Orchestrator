@@ -25,7 +25,6 @@ export type WorkflowStateType =
   | 'paused'
   | 'stopping'
   | 'stopped'
-  | 'completing'
   | 'error';
 
 export interface WorkflowStatus {

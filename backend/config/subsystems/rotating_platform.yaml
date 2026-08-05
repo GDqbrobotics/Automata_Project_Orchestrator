@@ -1,7 +1,4 @@
 # Rotating Platform Subsystem Configuration
-# This file defines both the subsystem metadata and its state machine.
-
-# Subsystem metadata
 name: rotating_platform
 display_name: Rotating Platform
 type: platform
@@ -12,7 +9,6 @@ metadata:
   description: "Motorized rotary stage with transparent disks"
   hardware: "Motorized rotary stage"
 
-# State machine definition for this subsystem
 states:
   initializing:
     description: "Subsystem is initializing"
@@ -21,7 +17,6 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/rotating_platform/ready
 
       - event: error
         target: error
@@ -31,27 +26,31 @@ states:
   ready:
     description: "Subsystem is ready and idle"
     transitions:
-      - event: start
-        target: running
+      - event: rotate_to_second
+        target: rotating
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/rotating_platform/running
+
+      - event: rotate_to_first
+        target: rotating
+        actions:
+          - log_event
+
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
 
       - event: error
         target: error
         actions:
           - log_event
 
-      - event: stop
-        target: stopped
-        actions:
-          - log_event
-
-  running:
-    description: "Subsystem is actively performing operations"
+  rotating:
+    description: "Subsystem is rotating"
     transitions:
-      - event: pause
-        target: paused
+      - event: complete
+        target: ready
         actions:
           - log_event
 
@@ -59,36 +58,27 @@ states:
         target: stopped
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/rotating_platform/stopped
 
       - event: error
         target: error
-        actions:
-          - log_event
-
-  paused:
-    description: "Subsystem is paused, waiting for resume"
-    transitions:
-      - event: resume
-        target: running
-        actions:
-          - log_event
-
-      - event: stop
-        target: stopped
         actions:
           - log_event
 
   stopped:
     description: "Subsystem has stopped"
     transitions:
-      - event: start
-        target: running
+      - event: ready
+        target: ready
         actions:
           - log_event
 
-      - event: ready
-        target: ready
+      - event: rotate_to_second
+        target: rotating
+        actions:
+          - log_event
+
+      - event: rotate_to_first
+        target: rotating
         actions:
           - log_event
 

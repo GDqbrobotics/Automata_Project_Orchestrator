@@ -18,7 +18,6 @@ class WorkflowState(str, enum.Enum):
     PAUSED = "paused"
     STOPPING = "stopping"
     STOPPED = "stopped"
-    COMPLETING = "completing"
     ERROR = "error"
 
 
@@ -107,58 +106,6 @@ class SubsystemConfig:
             "required": self.required,
             "metadata": self.metadata,
         }
-
-
-@dataclass
-class WorkflowActionCommand:
-    """A single subsystem command from the workflow_actions config."""
-
-    subsystem: str
-    command: str
-    payload: Dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "WorkflowActionCommand":
-        return cls(
-            subsystem=data["subsystem"],
-            command=data["command"],
-            payload=data.get("payload", {}),
-        )
-
-
-@dataclass
-class WorkflowAction:
-    """A workflow action: one object event triggers N subsystem commands."""
-
-    commands: List[WorkflowActionCommand] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "WorkflowAction":
-        return cls(
-            commands=[
-                WorkflowActionCommand.from_dict(cmd)
-                for cmd in data
-            ],
-        )
-
-
-@dataclass
-class WorkflowActionsConfig:
-    """Full workflow actions configuration loaded from YAML.
-
-    Maps object state machine events to subsystem commands.
-    """
-
-    actions: Dict[str, WorkflowAction] = field(default_factory=dict)
-
-    @classmethod
-    def from_yaml(cls, config_path: str | Path) -> "WorkflowActionsConfig":
-        with open(config_path, "r") as f:
-            data = yaml.safe_load(f)
-        actions: Dict[str, WorkflowAction] = {}
-        for event_name, commands in data.get("event_actions", {}).items():
-            actions[event_name] = WorkflowAction.from_dict(commands)
-        return cls(actions=actions)
 
 
 @dataclass

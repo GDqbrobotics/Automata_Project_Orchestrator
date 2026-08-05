@@ -3,6 +3,13 @@
 Adapters are created dynamically from individual subsystem YAML files
 (e.g., rotating_platform.yaml, vision.yaml). Each adapter owns its own
 state machine engine that drives the subsystem's internal state transitions.
+
+IMPORTANT: Subsystem SMs are the BOUNDARY LAYER between internal events
+and external MQTT communication. The orchestrator wires up the boundary
+callback that publishes MQTT messages when subsystem SMs fire events.
+
+Subsystems communicate with each other ONLY through internal events
+routed by the orchestrator – they never send MQTT to each other directly.
 """
 
 from __future__ import annotations
@@ -28,6 +35,9 @@ class SubsystemAdapter:
 
     Each adapter owns its own state machine engine that manages
     the subsystem's internal state (ready, running, paused, error, etc.).
+
+    The state machine boundary callback (set by the orchestrator)
+    publishes MQTT messages when the subsystem fires events.
     """
 
     name: str
@@ -171,10 +181,6 @@ class SubsystemAdapterFactory:
 # ------------------------------------------------------------------
 # Legacy constants for backward compatibility (simulation_test.py)
 # ------------------------------------------------------------------
-# NOTE: These are kept for backward compatibility with simulation_test.py.
-# New code should derive subsystem names from the config instead of using
-# these hardcoded constants. Use SubsystemAdapterFactory.get_names() or
-# get_required_names() to get the actual configured subsystems.
 ALL_SUBSYSTEMS: List[str] = [
     "vision",
     "robot_first",

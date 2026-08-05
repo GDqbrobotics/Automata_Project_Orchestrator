@@ -16,7 +16,6 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/xrf/ready
 
       - event: error
         target: error
@@ -26,11 +25,10 @@ states:
   ready:
     description: "Analyzer is ready and idle"
     transitions:
-      - event: start
+      - event: measure
         target: measuring
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/xrf/measuring
 
       - event: error
         target: error
@@ -44,13 +42,11 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/xrf/ready
 
       - event: stop
         target: stopped
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/xrf/stopped
 
       - event: error
         target: error
@@ -60,13 +56,13 @@ states:
   stopped:
     description: "Analyzer has stopped"
     transitions:
-      - event: start
-        target: measuring
+      - event: ready
+        target: ready
         actions:
           - log_event
 
-      - event: ready
-        target: ready
+      - event: measure
+        target: measuring
         actions:
           - log_event
 

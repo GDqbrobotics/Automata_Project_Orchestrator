@@ -16,7 +16,6 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/cloud_database/ready
 
       - event: error
         target: error
@@ -26,11 +25,10 @@ states:
   ready:
     description: "Cloud connection is ready and idle"
     transitions:
-      - event: start
+      - event: upload
         target: uploading
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/cloud_database/uploading
 
       - event: error
         target: error
@@ -44,13 +42,11 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/cloud_database/ready
 
       - event: stop
         target: stopped
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/cloud_database/stopped
 
       - event: error
         target: error
@@ -60,13 +56,13 @@ states:
   stopped:
     description: "Cloud operation has stopped"
     transitions:
-      - event: start
-        target: uploading
+      - event: ready
+        target: ready
         actions:
           - log_event
 
-      - event: ready
-        target: ready
+      - event: upload
+        target: uploading
         actions:
           - log_event
 

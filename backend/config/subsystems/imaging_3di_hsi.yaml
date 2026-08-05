@@ -16,7 +16,6 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/imaging_3di_hsi/ready
 
       - event: error
         target: error
@@ -26,11 +25,10 @@ states:
   ready:
     description: "Imaging system is ready and idle"
     transitions:
-      - event: start
+      - event: capture
         target: capturing
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/imaging_3di_hsi/capturing
 
       - event: error
         target: error
@@ -44,13 +42,11 @@ states:
         target: ready
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/imaging_3di_hsi/ready
 
       - event: stop
         target: stopped
         actions:
           - log_event
-          - publish_mqtt_message: subsystem/imaging_3di_hsi/stopped
 
       - event: error
         target: error
@@ -60,13 +56,13 @@ states:
   stopped:
     description: "Imaging system has stopped"
     transitions:
-      - event: start
-        target: capturing
+      - event: ready
+        target: ready
         actions:
           - log_event
 
-      - event: ready
-        target: ready
+      - event: capture
+        target: capturing
         actions:
           - log_event
 

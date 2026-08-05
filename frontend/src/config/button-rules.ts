@@ -54,21 +54,14 @@ export const BUTTON_RULES: Record<WorkflowStateType, ButtonRule> = {
     reset: false,
   },
   stopped: {
-    start: false,
+    start: true,
     pause: false,
     resume: false,
     stop: false,
     reset: true,
   },
-  completing: {
-    start: false,
-    pause: false,
-    resume: false,
-    stop: false,
-    reset: false,
-  },
   error: {
-    start: false,
+    start: true,
     pause: false,
     resume: false,
     stop: false,

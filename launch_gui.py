@@ -5,6 +5,12 @@ Unified launcher for the AUTOMATA GUI Orchestrator.
 This script starts both the backend (with optional simulation mode) and the
 frontend development server in a single command.
 
+Architecture:
+  - Workflow, Object, and Subsystem SMs interact ONLY internally
+  - Subsystem SMs are the BOUNDARY LAYER (publish MQTT to real hardware)
+  - Events can be scoped: "robot_first/pick" → routed to robot_first subsystem
+  - Events can be unscoped: "error" → broadcast to all subsystems
+
 Usage:
     # Normal mode (no simulation)
     python launch_gui.py

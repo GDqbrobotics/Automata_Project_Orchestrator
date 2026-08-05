@@ -1,241 +1,228 @@
-# GUI orchestrator for AUTOMATA
+# AUTOMATA GUI Orchestrator
 
-This repository contains the GUI orchestrator for the AUTOMATA machine. Its role is to provide the human-facing control interface and coordinate the workflow across the different subsystems.
-
-## Repository scope
-
-This repository is focused on:
-
-- the operator interface,
-- workflow orchestration,
-- state-machine driven control,
-- MQTT communication with external subsystems,
-- **configuration-based behavior** – all workflow logic lives in YAML files.
-
-## Broader project context
-
-The wider AUTOMATA project includes robotics, imaging systems, analyzers, AI processing, and cloud data storage. The high-level project context is described in [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md).
+The AUTOMATA GUI Orchestrator is the operator-facing control system for the AUTOMATA analytical machine. It manages workflow orchestration, object tracking, and subsystem communication through a clean, layered state-machine architecture.
 
 ## Architecture
 
 ```
-┌──────────────────┐     ┌──────────────────────────┐     ┌─────────────────┐
-│   Frontend (TS)  │────▶│   Orchestrator (PY)      │────▶│  Subsystems     │
-│  • State badge   │     │  • State Machine (YAML)  │     │  • Vision       │
-│  • Progress bar  │     │  • Config-driven logic   │     │  • Robots       │
-│  • Subsystem cards│    │  • MQTT routing          │     │  • Analyzers    │
-│  • Event log     │     │  • WebSocket server      │     │  • Cloud DB     │
-└──────────────────┘     └──────────────────────────┘     └─────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Frontend (TypeScript/React)                                     │
+│  - Operator-facing UI                                            │
+│  - WebSocket communication                                       │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ WebSocket
+┌──────────────────────────────┴──────────────────────────────────┐
+│  Orchestrator (Python) – Internal Event Bus                      │
+│                                                                  │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
+│  │  Workflow SM │───▶│  Object SMs  │───▶│  Internal Events  │  │
+│  │  (workflow)  │    │  (per-object)│    │  "robot_first/pick"│  │
+│  └──────────────┘    └──────────────┘    └──────────────────┘  │
+│                                                                  │
+│  Event Routing:                                                  │
+│    - Scoped events: "robot_first/pick" → routed to robot_first   │
+│    - Unscoped events: "error" → broadcast to all subsystems      │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ Internal Events
+              ┌────────────┴────────────┐
+              │  Subsystem Adapters      │
+              │  ┌──────────────────┐   │
+              │  │ Subsystem SM 1   │   │  ← BOUNDARY LAYER
+              │  │ (robot_first)    │───┼──→ MQTT → Real Robot
+              │  └──────────────────┘   │
+              │  ┌──────────────────┐   │
+              │  │ Subsystem SM 2   │   │
+              │  │ (raman)          │───┼──→ MQTT → Real Raman
+              │  └──────────────────┘   │
+              └─────────────────────────┘
+                           │ MQTT
+              ┌────────────┴────────────┐
+              │  Real Hardware Subsystems │
+              │  (Robots, Analyzers, etc.)│
+              └───────────────────────────┘
 ```
 
-The system is built on **configuration-driven** principles:
+### Key Design Principles
 
-1. **Declarative state machine** – All workflow behavior is defined in YAML configuration files. States, transitions, events, and actions are externalized and easily extensible.
+1. **Internal Communication Only**: Workflow, Object, and Subsystem state machines interact ONLY through internal events. No MQTT between them.
 
-2. **Declarative subsystem configuration** – Each subsystem has its own YAML file in `backend/config/subsystems/`. Each file defines both subsystem metadata (name, type, required, metadata) and a complete state machine. The orchestrator dynamically creates adapters with per-subsystem state machines.
+2. **Subsystem SMs are the Boundary**: Only subsystem state machines publish MQTT messages to real hardware. They are the sole interface between the internal event system and external devices.
 
-3. **Declarative per-object sub-workflows** – Each analyzed object has its own YAML-driven state machine (`backend/config/object.yaml`) that tracks the detailed analysis cycle from identification to completion. Object states are persisted to disk.
+3. **Scoped Events**: Events can be scoped to target specific subsystems:
+   - `event: measure_request` → internal event, handled by the engine
+   - `event: robot_first/pick` → routed to the robot_first subsystem's state machine
 
-4. **Declarative event-to-command mapping** – The mapping between object state machine events and subsystem commands is defined in `backend/config/workflow_actions.yaml`. No hardcoded Python methods.
+4. **Scoped Actions**: Actions can target specific subsystems:
+   - `action: error` → broadcast to all subsystems
+   - `action: raman/measure_request` → send to raman subsystem only
 
-5. **Declarative global defaults** – All default values (MQTT broker, ports, simulation defaults, state colors, messages) are centralized in `backend/config/global.yaml`.
+5. **Configuration-Driven**: All state machines are defined in YAML files. Behavior changes by editing configs, not code.
 
-6. **Thin frontend** – The TypeScript UI is purely declarative: it renders state, captures operator actions, and displays logs. All business logic lives in the Python backend, driven by config.
-
-## Configuration files
-
-| File | Purpose |
-|---|---|
-| `backend/config/workflow.yaml` | Workflow lifecycle states and transitions |
-| `backend/config/object.yaml` | Per-object analysis workflow blueprint |
-| `backend/config/subsystems/*.yaml` | Subsystem metadata and state machine definitions |
-| `backend/config/workflow_actions.yaml` | Maps object events to subsystem commands |
-| `backend/config/global.yaml` | Global defaults (MQTT, ports, state colors, messages) |
-
-To add a new analysis step, edit `object.yaml` and `workflow_actions.yaml` — no code changes needed.
-
-## Current status
-
-A working prototype is complete with integrated frontend, backend, and simulation. The system can be launched with a single command and validated with simulation tests.
-
-### Core components
-
-| Component | Status | Description |
-|---|---|---|
-| State machine engine | ✅ Complete | YAML-driven engine with full transition validation |
-| Workflow state machine | ✅ Complete | 7 states with full lifecycle (idle → error → reset) |
-| Subsystem config | ✅ Complete | Per-subsystem YAML files with state machine definitions |
-| Subsystem adapters | ✅ Dynamic | Adapters created from config — add new subsystems by adding YAML |
-| Object state machines | ✅ Complete | Per-object YAML-driven analysis workflows with disk persistence |
-| Event-to-command mapping | ✅ Config-driven | `workflow_actions.yaml` replaces hardcoded Python trigger methods |
-| Global defaults | ✅ Config-driven | `global.yaml` replaces hardcoded CLI defaults |
-| MQTT messaging | ✅ Complete | Publish/subscribe with topic routing to configured subsystems |
-| Domain models | ✅ Complete | Typed dataclasses for workflow, subsystems, objects, events |
-| Frontend UI | ✅ Complete | Real-time state display, progress, subsystem/object cards, event log |
-| WebSocket server | ✅ Complete | Frontend-backend communication |
-| Simulation mode | ✅ Config-driven | Simulation derives event chain from `object.yaml` + `workflow_actions.yaml` |
-| Unified launch | ✅ Complete | Single command to start frontend + backend + simulation |
-| Test suite | ✅ Complete | **123 passing tests** covering all state machines, workflow, MQTT, objects, and integration |
-
-## Subsystem configuration
-
-Each subsystem has its own YAML file in `backend/config/subsystems/`. To adapt the system for a real machine:
-
-1. Add a new YAML file in `backend/config/subsystems/` with subsystem metadata and state machine definition.
-2. The orchestrator will automatically:
-   - Create an adapter for the new subsystem
-   - Subscribe to its MQTT topics
-   - Show it in the frontend subsystem grid
-   - Include it in the simulation (if simulation mode is enabled)
-
-3. To remove a subsystem, simply delete its YAML file.
-
-### Subsystem YAML structure
-
-Each subsystem YAML file defines both metadata and a state machine.
-
-**Supported actions**:
-- `log_event` – Log the transition event
-- `update_operator_ui` – Notify UI update
-- `publish_mqtt_message: <topic>` – Publish to an MQTT topic
-
-Custom actions can be registered via `register_action()` in the `StateMachineEngine`.
-
-### Frontend subsystem cards
-
-The frontend renders a card for each subsystem showing:
-- **Display name** (from YAML `display_name`)
-- **Required indicator** (*) for required subsystems
-- **Current state** (colored badge: ready=green, running=blue, error=red, etc.)
-- **State description** (from the state machine YAML)
-
-When a subsystem's state machine transitions, the change is:
-1. Published via MQTT to `automata/subsystem/{name}/status`
-2. Broadcast to the frontend via WebSocket
-3. Displayed in the subsystem card with a state description
-
-### Object configuration
-
-Each analyzed object follows a declarative sub-workflow defined in `backend/config/object.yaml`. When the vision system identifies an object (or in simulation), the orchestrator creates a state machine instance for it.
-
-**Design principle**: Object state machines do NOT publish MQTT messages. MQTT publishing is reserved for subsystem state machines only. Interactions between state machine levels are internal and driven by `event` actions in the YAML.
-
-**Event-driven flow** (internal, no MQTT from object state machines):
+## Directory Structure
 
 ```
-1. Vision identifies object → orchestrator fires object_picked transition
-2. Object transitions to moving_to_disk → fires event: trigger_robot_first_pick
-3. Orchestrator handles event → publishes MQTT to robot_first (command: pick_object)
-4. Robot completes → orchestrator fires object_placed_on_disk transition
-5. Object transitions to HSI_3DI_analysis → fires event: trigger_imaging_capture
-6. Orchestrator handles event → publishes MQTT to imaging_3di_hsi (command: start_capture)
-7. 3DI/HSI completes → orchestrator fires imaging_capture_complete transition
-... (continues until object_analyzed)
+backend/
+├── adapters/
+│   └── subsystem.py          # Subsystem adapter factory & classes
+├── config/
+│   ├── global.yaml           # Global config (MQTT, ports, simulation)
+│   ├── workflow.yaml         # Workflow state machine definition
+│   ├── object.yaml           # Object analysis state machine definition
+│   └── subsystems/           # Per-subsystem YAML configs
+│       ├── robot_first.yaml
+│       ├── vision.yaml
+│       ├── rotating_platform.yaml
+│       ├── xrf.yaml
+│       ├── raman.yaml
+│       ├── imaging_3di_hsi.yaml
+│       ├── ai_analysis.yaml
+│       ├── cloud_database.yaml
+│       └── robot_second.yaml
+├── domain/
+│   └── models.py             # Domain models (WorkflowState, SubsystemState, etc.)
+├── messaging/
+│   └── mqtt_client.py        # MQTT client wrapper
+├── orchestrator/
+│   ├── workflow.py           # Main orchestrator (event routing, command handling)
+│   ├── object_state_machines.py  # Per-object state machine manager
+│   └── simulation.py         # Simulation mode
+├── services/
+│   └── frontend_server.py    # WebSocket server for frontend
+├── state/
+│   └── state_machine.py      # MQTT-agnostic state machine engine
+└── simulation_test.py        # End-to-end test suite
+frontend/                       # TypeScript/React frontend
+launch_gui.py                   # Unified launcher
 ```
 
-**Object lifecycle**:
-1. Vision system identifies an object → `orchestrator.create_object(object_id)`
-2. Subsystem events trigger object transitions (e.g., `object_placed_on_disk`)
-3. Each transition is persisted to `backend/object_states/{object_id}.json`
-4. Object reaches `object_analyzed` → progress counter increments
-5. State survives orchestrator restarts via disk persistence
+## State Machine Layers
 
-**Frontend object cards** show:
-- **Object ID**
-- **Current analysis phase** (color-coded badge)
-- **State description**
-- **Step number** (e.g., "Step 3 / 8")
-- **Transition count**
+### 1. Workflow State Machine (`workflow.yaml`)
 
-### Object-to-subsystem event mapping
+Manages the overall workflow lifecycle:
+- `idle` → `starting` → `running` → `paused` / `stopping` → `stopped` / `error`
 
-Object state machine transitions fire internal events that the orchestrator handles by triggering subsystem actions. This mapping is defined in `backend/config/workflow_actions.yaml`:
+Events:
+- `start_requested`, `pause_requested`, `resume_requested`, `stop_requested`
+- `subsystem_ready`, `subsystem_error`, `reset_requested`
+- Scoped actions: `all/stop`, `all/pause`, `all/resume`
 
-| Object Event | Subsystem(s) | Command(s) |
-|---|---|---|
-| `trigger_robot_first_pick` | robot_first | `pick_object` |
-| `trigger_imaging_capture` | imaging_3di_hsi | `start_capture` |
-| `trigger_platform_rotate_to_second` | rotating_platform | `rotate_to_second` |
-| `trigger_measurements` | xrf, raman, ai_analysis | `start_measurement`, `start_measurement`, `plan_measurements` |
-| `trigger_platform_rotate_to_first` | rotating_platform | `rotate_to_first` |
-| `trigger_robot_first_return` | robot_first | `return_object` |
-| `trigger_cloud_upload` | cloud_database | `upload_data` |
+### 2. Object State Machine (`object.yaml`)
 
-To add a new analysis step, add an entry to `workflow_actions.yaml`.
+Manages per-object analysis workflow:
+- `identified_in_box` → `moving_to_disk` → `HSI_3DI_analysis` → ... → `object_analyzed`
 
-## How to run
+Events are scoped to target specific subsystems:
+- `robot_first/pick` → triggers robot_first subsystem
+- `imaging_3di_hsi/capture` → triggers imaging subsystem
+- `xrf/measure` → triggers XRF subsystem
+- `raman/measure` → triggers Raman subsystem
+- `cloud_database/upload` → triggers cloud upload
 
-### Prerequisites
+### 3. Subsystem State Machines (per-subsystem YAML files)
 
-- Python 3.10+
-- Node.js 18+
-- Mosquitto MQTT broker (installed automatically)
+Each subsystem has its own state machine with states like:
+- `initializing` → `ready` → `measuring`/`capturing`/`picking` → `ready`
+- Error recovery: `error` → `reset` → `ready`
 
-### Quick start
+**Important**: Subsystem SMs only use `log_event` actions. MQTT publishing is handled automatically by the orchestrator's boundary layer callback when events are fired.
 
+## Configuration Files
+
+### workflow.yaml
+```yaml
+states:
+  idle:
+    transitions:
+      - event: start_requested
+        target: starting
+        actions:
+          - log_event
+  running:
+    transitions:
+      - event: pause_requested
+        target: paused
+        actions:
+          - event: all/pause    # Broadcast to all subsystems
+```
+
+### object.yaml
+```yaml
+states:
+  HSI_3DI_analysis:
+    transitions:
+      - event: imaging_capture_complete
+        target: object_going_second_position
+        actions:
+          - log_event
+          - event: rotating_platform/rotate_to_second  # Scoped event
+```
+
+### subsystem/robot_first.yaml
+```yaml
+states:
+  ready:
+    transitions:
+      - event: pick
+        target: picking
+        actions:
+          - log_event
+  picking:
+    transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+```
+
+## Running
+
+### Normal Mode
 ```bash
-# Launch everything with simulation (default 3 objects)
-python launch_gui.py --simulation
-
-# Launch with custom number of objects
-python launch_gui.py --simulation --num-objects 5
-
-# Launch without simulation (no auto-subsystem responses)
 python launch_gui.py
 ```
 
-Then open `http://localhost:3000` in a browser.
-
-### Backend
-
+### Simulation Mode
 ```bash
-cd backend
-pip install -r requirements.txt
-
-# Start orchestrator (loads defaults from global.yaml)
-python -m backend.orchestrator.main
-
-# With simulation mode
-python -m backend.orchestrator.main --simulation --num-objects 3
+python launch_gui.py --simulation --num-objects 5
 ```
 
-### Frontend
-
+### With Custom Broker
 ```bash
-cd frontend
-npm install
-npm run dev
+python launch_gui.py --broker 192.168.1.100 --simulation
 ```
 
-### Testing
-
+### Verbose Logging
 ```bash
-# Run simulation tests (123 tests, validates full workflow)
-cd backend
-python simulation_test.py
-
-# Test with custom number of objects
-python simulation_test.py --num-objects 5
+python launch_gui.py --simulation --verbose
 ```
 
-**Test coverage**:
-- State machine configuration and transitions
-- Full workflow simulation via WebSocket GUI commands
-- Pause/resume/stop workflow states
-- MQTT topic publishing and subscription
-- Error recovery (error → idle transitions)
-- Subsystem state machine transitions
-- Subsystem YAML configuration loading
-- Object state machine configuration and transitions
-- Object state persistence to disk
-- Object orchestrator integration
-- Config-driven event-to-command mapping
-- Config-driven simulation event chain
+### Run Tests
+```bash
+python backend/simulation_test.py
+python backend/simulation_test.py --num-objects 5
+```
 
-## Development
+## Event Scoping Reference
 
-- [AGENTS.md](AGENTS.md) — agent instructions for this repo
-- [docs/GUI_ARCHITECTURE.md](docs/GUI_ARCHITECTURE.md) — recommended software architecture
-- [docs/STATE_MACHINE.md](docs/STATE_MACHINE.md) — state machine design principles
-- [docs/FRONTEND_BACKEND_BOUNDARY.md](docs/FRONTEND_BACKEND_BOUNDARY.md) — frontend/backend communication boundary
-- [DEVELOPEMENT_JOURNAL.md](DEVELOPEMENT_JOURNAL.md) — development log and next steps
+| Format | Example | Meaning |
+|--------|---------|---------|
+| Unscoped | `error` | Broadcast to all subsystems |
+| Scoped | `robot_first/pick` | Route to robot_first subsystem |
+| Scoped | `xrf/measure` | Route to xrf subsystem |
+| Scoped | `all/stop` | Broadcast to all subsystems (alias) |
+
+## MQTT Topics
+
+Subsystem SMs are the only layer that publishes MQTT. Topics follow the pattern:
+- `automata/subsystem/{name}/status` - Subsystem status updates
+- `automata/subsystem/{name}/event` - Events fired by subsystem state machines
+- `automata/subsystem/{name}/command` - Commands to subsystems
+- `automata/subsystem/{name}/response` - Responses from subsystems
+
+## Adding a New Subsystem
+
+1. Create a YAML file in `backend/config/subsystems/` with the subsystem's name
+2. Define the state machine with appropriate states and transitions
+3. Use scoped events in `workflow.yaml` and `object.yaml` to communicate with it
+4. The subsystem will be automatically discovered and its state machine loaded
