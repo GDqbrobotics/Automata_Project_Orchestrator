@@ -44,6 +44,7 @@ class FrontendServer:
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
+        self._workflow_display_config: Dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Registration
@@ -111,7 +112,7 @@ class FrontendServer:
     # ------------------------------------------------------------------
     # Broadcasting state
     # ------------------------------------------------------------------
-    def broadcast_status(self, status: WorkflowStatus) -> None:
+    def broadcast_status(self, status: WorkflowStatus, extra_details: Dict[str, Any] | None = None) -> None:
         """Push current workflow status to all connected clients.
 
         Includes subsystem configuration so the frontend can build its
@@ -124,6 +125,9 @@ class FrontendServer:
             logger.debug("Including subsystem_config in broadcast (%d subsystems)", len(self._subsystem_config))
         else:
             logger.debug("subsystem_config is None, not including in broadcast")
+        # Include any extra details (e.g. object workflow state order/colors)
+        if extra_details:
+            status_dict.update(extra_details)
 
         payload = EventPayload(
             event_type=BackendEvent.WORKFLOW_STATE_CHANGED.value,
@@ -152,6 +156,11 @@ class FrontendServer:
         self._subsystem_config = config_list
         logger.info("Subsystem config set: %d subsystems", len(config_list))
 
+    def set_workflow_display_config(self, state_order: List[str], state_colors: Dict[str, str]) -> None:
+        """Set object workflow display config (state order and colors) to broadcast with status updates."""
+        self._workflow_display_config = {"state_order": state_order, "state_colors": state_colors}
+        logger.info("Workflow display config set: %d states", len(state_order))
+
 
 
     async def _broadcast(self, payload: Dict[str, Any], clients: list) -> None:
@@ -160,6 +169,13 @@ class FrontendServer:
                 await ws.send(json.dumps(payload))
             except Exception:
                 pass
+
+    def broadcast_with_display_config(self, status: WorkflowStatus) -> None:
+        """Broadcast status including workflow display config (state order/colors)."""
+        extra = None
+        if self._workflow_display_config is not None:
+            extra = self._workflow_display_config
+        self.broadcast_status(status, extra_details=extra)
 
     # ------------------------------------------------------------------
     # Lifecycle

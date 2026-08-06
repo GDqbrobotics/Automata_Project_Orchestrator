@@ -18,6 +18,10 @@ export interface UiState {
   subsystemsConfig: SubsystemConfig[];
   objects: ObjectInfo[];
   connectionStatus: 'connected' | 'disconnected';
+  /** Object workflow state display order, sent by backend from global.yaml */
+  objectStateOrder: string[];
+  /** Object workflow state colors, sent by backend from global.yaml */
+  objectStateColors: Record<string, string>;
   logs: Array<{ time: string; source: string; message: string; level: 'info' | 'error' | 'success' | 'warning' }>;
 }
 
@@ -38,6 +42,8 @@ export function createInitialState(): UiState {
     subsystemsConfig: [],
     objects: [],
     connectionStatus: 'disconnected',
+    objectStateOrder: [],
+    objectStateColors: {},
     logs: [],
   };
 }
@@ -100,7 +106,11 @@ export function reduceState(state: UiState, msg: unknown): UiState {
   if (m.event === 'progress_updated') {
     if (m.details) {
       const d = m.details as Record<string, unknown>;
-      updated.progress = (d.progress as number) ?? updated.progress + 1;
+      if (d.progress !== undefined) {
+        updated.progress = d.progress as number;
+      } else {
+        updated.progress += 1;
+      }
     } else {
       updated.progress += 1;
     }
@@ -108,7 +118,9 @@ export function reduceState(state: UiState, msg: unknown): UiState {
   }
 
   if (m.event === 'error_reported') {
-    updated.error = m.message as string || 'Unknown error';
+    // Backend sends errors as {event: 'error_reported', details: {message: '...'}}
+    const errDetails = m.details as Record<string, unknown> | undefined;
+    updated.error = (errDetails && (errDetails.message as string)) || 'Unknown error';
     logs.push({ time: now(), source: 'error', message: updated.error, level: 'error' });
   }
 
@@ -147,35 +159,50 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     }
   }
 
-  // Handle subsystem state changes from state machine transitions
-  if (m.event === 'subsystem_state_changed' && m.details) {
+  // Handle object list updates from workflow_state_changed details
+  if (m.event === 'workflow_state_changed' && m.details) {
     const d = m.details as Record<string, unknown>;
-    const name = d.subsystem as string;
-    const newState = d.new_state as string;
-    if (name && newState) {
-      // Update or create subsystem status
-      const existing = updated.subsystems[name] || { name };
-      updated.subsystems = {
-        ...updated.subsystems,
-        [name]: {
-          ...existing,
-          name,
-          state: newState,
-          ready: newState === 'ready',
-        } as SubsystemStatus,
-      };
-      logs.push({
-        time: now(),
-        source: 'subsystem',
-        message: `${name}: ${existing.state || 'unknown'} → ${newState}`,
-        level: 'info',
-      });
+    // Update objects list from status
+    if (d.objects && Array.isArray(d.objects)) {
+      updated.objects = d.objects as ObjectInfo[];
+      if (updated.objects.length > 0) {
+        logs.push({
+          time: now(),
+          source: 'objects',
+          message: `Updated ${updated.objects.length} object(s)`,
+          level: 'info',
+        });
+      }
+    }
+    // Update progress from status
+    if (d.progress !== undefined && typeof d.progress === 'number') {
+      updated.progress = d.progress;
+    }
+    if (d.total_objects !== undefined) {
+      updated.totalObjects = d.total_objects as number;
+    }
+    // Update subsystems from status
+    if (d.subsystems && typeof d.subsystems === 'object') {
+      updated.subsystems = d.subsystems as Record<string, SubsystemStatus>;
+    }
+    // Update current object from status
+    if (d.current_object !== undefined) {
+      updated.currentObject = d.current_object as string | null;
+    }
+    // Update object workflow display config (state order + colors)
+    if (d.state_order && Array.isArray(d.state_order)) {
+      updated.objectStateOrder = d.state_order as string[];
+      logs.push({ time: now(), source: 'config', message: `State order updated (${updated.objectStateOrder.length} states)`, level: 'info' });
+    }
+    if (d.state_colors && typeof d.state_colors === 'object') {
+      updated.objectStateColors = d.state_colors as Record<string, string>;
+      logs.push({ time: now(), source: 'config', message: `State colors updated (${Object.keys(updated.objectStateColors).length} colors)`, level: 'info' });
     }
   }
 
-  // Also handle top-level status updates
+  // Handle top-level status updates (broadcast_status payload)
   if (m.state) {
-    const s = m as unknown as WorkflowStatus & { subsystems_config?: SubsystemConfig[]; objects?: ObjectInfo[] };
+    const s = m as unknown as WorkflowStatus & { subsystems_config?: SubsystemConfig[]; objects?: ObjectInfo[]; state_order?: string[]; state_colors?: Record<string, string> };
     updated.workflowState = s.state;
     updated.progress = s.progress;
     updated.totalObjects = s.total_objects;
@@ -204,21 +231,12 @@ export function reduceState(state: UiState, msg: unknown): UiState {
         });
       }
     }
-  }
-
-  // Handle object list updates from status
-  if (m.event === 'workflow_state_changed' && m.details) {
-    const d = m.details as Record<string, unknown>;
-    if (d.objects && Array.isArray(d.objects)) {
-      updated.objects = d.objects as ObjectInfo[];
-      if (updated.objects.length > 0) {
-        logs.push({
-          time: now(),
-          source: 'objects',
-          message: `Updated ${updated.objects.length} object(s)`,
-          level: 'info',
-        });
-      }
+    // Update object workflow display config from top-level payload
+    if (s.state_order && Array.isArray(s.state_order)) {
+      updated.objectStateOrder = s.state_order as string[];
+    }
+    if (s.state_colors && typeof s.state_colors === 'object') {
+      updated.objectStateColors = s.state_colors as Record<string, string>;
     }
   }
 

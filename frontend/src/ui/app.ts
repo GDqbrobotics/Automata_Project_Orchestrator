@@ -70,6 +70,8 @@ export class App {
 
   /** Cached state styles, built from config or defaults. */
   private _stateStyles: Record<string, { colorClass: string; stepIndex: number }> = buildStateStyles();
+  /** Whether backend has sent us a custom state order / colors. */
+  private _backendConfigApplied = false;
 
   private updateStateBadge(): void {
     const badge = document.getElementById('stateBadge');
@@ -194,12 +196,15 @@ export class App {
       return;
     }
 
-    // Build state styles from config (backend overrides preferred)
-    const stateOrder = this.state.subsystemsConfig.length > 0
-      ? this._extractStateOrder()
+    // Build state styles — use backend config if available, else defaults
+    const stateOrder = this.state.objectStateOrder?.length > 0
+      ? this.state.objectStateOrder
       : undefined;
-    const stateColors = this._extractStateColors();
+    const stateColors = Object.keys(this.state.objectStateColors || {}).length > 0
+      ? this.state.objectStateColors!
+      : undefined;
     this._stateStyles = buildStateStyles(stateOrder, stateColors);
+    this._backendConfigApplied = true;
     const totalSteps = getTotalSteps(stateOrder);
 
     for (const obj of objects) {
@@ -229,8 +234,9 @@ export class App {
    * Falls back to defaults from config/object-styles.ts.
    */
   private _extractStateOrder(): string[] | undefined {
-    // If the backend sends state_order in a message, it would be in
-    // the state config. For now, use the default.
+    if (this.state.objectStateOrder && this.state.objectStateOrder.length > 0) {
+      return this.state.objectStateOrder;
+    }
     return undefined;
   }
 
@@ -239,8 +245,9 @@ export class App {
    * Falls back to defaults from config/object-styles.ts.
    */
   private _extractStateColors(): Record<string, string> {
-    // If the backend sends state_colors in a message, it would be in
-    // the state config. For now, use the default.
+    if (this.state.objectStateColors && Object.keys(this.state.objectStateColors).length > 0) {
+      return this.state.objectStateColors;
+    }
     return {};
   }
 

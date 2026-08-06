@@ -25,13 +25,13 @@ states:
   ready:
     description: "Robot is ready and idle"
     transitions:
-      - event: pick
-        target: picking
+      - event: use_xrf
+        target: using_xrf
         actions:
           - log_event
 
-      - event: return
-        target: returning
+      - event: use_raman
+        target: using_raman
         actions:
           - log_event
 
@@ -45,8 +45,8 @@ states:
         actions:
           - log_event
 
-  picking:
-    description: "Robot is picking object"
+  using_xrf:
+    description: "Robot is using XRF"
     transitions:
       - event: complete
         target: ready
@@ -63,8 +63,8 @@ states:
         actions:
           - log_event
 
-  returning:
-    description: "Robot is returning object"
+  using_raman:
+    description: "Robot is using Raman"
     transitions:
       - event: complete
         target: ready

@@ -443,9 +443,9 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
 
     # ---- Phase 3: Wait for simulation to complete ----
     logger.info("Waiting for simulation to complete...")
-    # Terminal states: stopped/error = manual stop, starting = auto-restart after completion
-    terminal_states = {"stopped", "error", "starting"}
-    max_wait = 30  # seconds
+    # Terminal states: stopped/error = workflow completion
+    terminal_states = {"stopped", "error"}
+    max_wait = 60  # seconds (parallel pipeline takes longer)
     start_wait = time.monotonic()
     max_progress = 0
 
@@ -468,12 +468,11 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
 
     # ---- Phase 4: Verify simulation ran ----
     final_state = runner.current_state_name
-    # Use max_progress seen during simulation (auto-restart clears it)
     final_progress = max_progress
 
     results.check(
-        final_state in ("stopped", "error", "starting"),
-        f"Simulation reached terminal state ('stopped', 'error', or 'starting' for auto-restart, got '{final_state}')",
+        final_state in ("stopped", "error"),
+        f"Simulation reached terminal state ('stopped' or 'error', got '{final_state}')",
     )
 
     results.check(

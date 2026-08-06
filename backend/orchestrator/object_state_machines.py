@@ -300,6 +300,7 @@ class ObjectStateMachines:
         }
 
         state_file = self._object_state_file(object_id)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
         with open(state_file, "w") as f:
             json.dump(data, f, indent=2)
 

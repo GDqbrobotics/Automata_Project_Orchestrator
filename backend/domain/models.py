@@ -183,9 +183,17 @@ class EventPayload:
     details: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict format expected by the frontend.
+
+        The frontend expects messages structured as:
+        {"event": <type>, "details": {<key>: <value>, ...}}
+
+        This is consistent with how the frontend's reduceState function
+        parses incoming WebSocket messages.
+        """
         return {
             "event": self.event_type,
-            **self.details,
+            "details": self.details,
         }
 
 

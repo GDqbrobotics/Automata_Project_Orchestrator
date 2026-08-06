@@ -23,6 +23,11 @@ states:
         actions:
           - log_event
 
+      - event: pause_requested
+        target: paused
+        actions:
+          - event: all/pause
+
       - event: stop_requested
         target: stopping
         actions:

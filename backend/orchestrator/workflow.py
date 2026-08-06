@@ -171,6 +171,8 @@ class WorkflowOrchestrator:
             config_path=object_config_path,
             storage_dir=object_storage_dir,
         )
+        # Clear any persisted objects from previous runs
+        self.object_manager.clear()
         # Wire up object SM callbacks
         self.object_manager.on_change(self._on_object_state_change)
         self.object_manager.on_event(self._on_object_event)
@@ -239,17 +241,29 @@ class WorkflowOrchestrator:
         Events can be:
           - Unscoped: "error" → broadcast to all subsystems
           - Scoped: "robot_first/pick" → route to robot_first subsystem SM
+          - Scoped with "workflow" prefix → internal-only, no MQTT, no subsystem broadcast
           - Workflow events: "subsystems_start" → handle workflow-level action
 
         The event flows:
           1. Workflow SM fires event → _on_event (this method)
-          2. If scoped (has '/'), route to target subsystem SM
-          3. If unscoped "error", broadcast to all subsystems
-          4. Object SM fires event → _on_object_event (separate callback)
+          2. If scoped with 'workflow/' prefix → internal no-op (pipeline coordination)
+          3. If scoped (has '/'), route to target subsystem SM
+          4. If unscoped "error", broadcast to all subsystems
+          5. Object SM fires event → _on_object_event (separate callback)
         """
         scope, local_event = _parse_subsystem_prefix(event_name)
 
-        if scope:
+        if scope == "workflow":
+            # Internal pipeline coordination event — consumed by orchestrator,
+            # never broadcast to subsystems or published via MQTT.
+            logger.debug("Internal workflow event '%s' consumed (no-op)", event_name)
+            return
+
+        if scope == "all":
+            # Special scope: broadcast to all subsystems
+            logger.info("Broadcasting 'all/%s' to all subsystems", local_event)
+            self._broadcast_event_to_subsystems(local_event)
+        elif scope:
             # Scoped event: route to the specified subsystem
             logger.info(
                 "Routing scoped event '%s' → subsystem '%s'",
@@ -350,114 +364,98 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     def _handle_start(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: start_workflow")
-        try:
-            # Always clear previous state before starting a new workflow.
-            # This handles starting from stopped, error, or idle.
-            self._reset_workflow_state()
+        # Always clear previous state before starting a new workflow.
+        # This handles starting from stopped, error, or idle.
+        self._reset_workflow_state()
 
-            new_state = self.state_machine.fire("start_requested", self._status)
-            self._update_state(WorkflowState(new_state))
-            self._fire_frontend_event(
-                BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                {"new_state": new_state, "source": "operator"},
-            )
+        if not self.fire_event("start_requested"):
+            return  # error already logged by fire_event
 
-            if self._use_simulation and new_state == "starting":
-                self._start_simulation()
-        except StateMachineError as exc:
-            logger.error("Start rejected: %s", exc)
-            self._fire_frontend_event(
-                BackendEvent.ERROR_REPORTED.value,
-                {"message": str(exc)},
-            )
+        new_state = WorkflowState(self.state_machine.state)
+        self._update_state(new_state)
+
+        if self._use_simulation and new_state == WorkflowState.STARTING:
+            self._start_simulation()
 
     def _handle_pause(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: pause_workflow")
-        try:
-            new_state = self.state_machine.fire("pause_requested", self._status)
-            self._update_state(WorkflowState(new_state))
-            self._fire_frontend_event(
-                BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                {"new_state": new_state, "source": "operator"},
-            )
-        except StateMachineError as exc:
-            logger.error("Pause rejected: %s", exc)
-            self._fire_frontend_event(
-                BackendEvent.ERROR_REPORTED.value,
-                {"message": str(exc)},
-            )
+        # Pause the simulation if it is running
+        if self._simulator is not None:
+            self._simulator.pause()
+        if not self.fire_event("pause_requested"):
+            return  # error already logged by fire_event
+        self._update_state(WorkflowState(self.state_machine.state))
 
     def _handle_resume(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: resume_workflow")
-        try:
-            new_state = self.state_machine.fire("resume_requested", self._status)
-            self._update_state(WorkflowState(new_state))
-            self._fire_frontend_event(
-                BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                {"new_state": new_state, "source": "operator"},
-            )
-        except StateMachineError as exc:
-            logger.error("Resume rejected: %s", exc)
-            self._fire_frontend_event(
-                BackendEvent.ERROR_REPORTED.value,
-                {"message": str(exc)},
-            )
+        # Resume the simulation if it was paused
+        if self._simulator is not None:
+            self._simulator.resume()
+        if not self.fire_event("resume_requested"):
+            return  # error already logged by fire_event
+        self._update_state(WorkflowState(self.state_machine.state))
 
     def _handle_stop(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: stop_workflow")
-        try:
-            new_state = self.state_machine.fire("stop_requested", self._status)
-            self._update_state(WorkflowState(new_state))
-            self._fire_frontend_event(
-                BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                {"new_state": new_state, "source": "operator"},
-            )
-        except StateMachineError as exc:
-            logger.error("Stop rejected: %s", exc)
-            self._fire_frontend_event(
-                BackendEvent.ERROR_REPORTED.value,
-                {"message": str(exc)},
-            )
+        # Stop the simulation if it is running
+        if self._simulator is not None:
+            self._simulator.stop()
+            self._simulator = None
+        # running → stopping
+        if not self.fire_event("stop_requested"):
+            return  # error already logged by fire_event
+        # stopping → stopped (complete the transition immediately when
+        # the operator initiates the stop, since the simulator is already
+        # stopped and _simulate_completion will not run)
+        if self.state_machine.state == WorkflowState.STOPPING:
+            self.fire_event("stopped")
+            self._update_state(WorkflowState.STOPPED)
 
     def _handle_reset(self, data: Dict[str, Any]) -> None:
         """Handle workflow reset (from error or stopped state back to idle).
 
         Resets the entire workflow: clears all object state machines,
         resets progress, and transitions the workflow state machine to idle.
+        Stops any running simulation first to avoid race conditions.
         """
         logger.info("Operator: reset_workflow")
-        try:
-            self._reset_workflow_state()
+        # Stop any running simulation to avoid race conditions
+        if self._simulator is not None:
+            self._simulator.stop()
+            self._simulator = None
 
-            new_state = self.state_machine.fire("reset_requested", self._status)
-            self._update_state(WorkflowState(new_state))
-            self._fire_frontend_event(
-                BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                {"new_state": new_state, "source": "operator"},
-            )
-            self._fire_frontend_event(
-                BackendEvent.OBJECT_REMOVED.value,
-                {"message": "All objects cleared on workflow reset"},
-            )
+        self._reset_workflow_state()
 
-            # If all required subsystems are already ready, start immediately
-            required_adapters = self.adapter_factory.get_required()
-            all_ready = all(
-                a.state == SubsystemState.READY for a in required_adapters
-            )
-            if all_ready:
-                self._start_workflow_immediately()
-            else:
-                logger.info("Not all required subsystems ready after reset")
-                for name, adapter in self.adapters.items():
-                    self._status.active_subsystems[name] = adapter.info
+        if not self.fire_event("reset_requested"):
+            return  # error already logged by fire_event
 
-        except StateMachineError as exc:
-            logger.error("Reset rejected: %s", exc)
-            self._fire_frontend_event(
-                BackendEvent.ERROR_REPORTED.value,
-                {"message": str(exc)},
+        new_state = WorkflowState(self.state_machine.state)
+        self._update_state(new_state)
+        self._fire_frontend_event(
+            BackendEvent.WORKFLOW_STATE_CHANGED.value,
+            {"new_state": new_state.value, "source": "operator"},
+        )
+        self._fire_frontend_event(
+            BackendEvent.OBJECT_REMOVED.value,
+            {"message": "All objects cleared on workflow reset"},
+        )
+
+        # Only auto-start after reset if simulation is NOT enabled.
+        # In simulation mode the operator must press Start to begin a new run.
+        required_adapters = self.adapter_factory.get_required()
+        all_ready = all(
+            a.state == SubsystemState.READY for a in required_adapters
+        )
+        if all_ready and not self._use_simulation:
+            self._start_workflow_immediately()
+        else:
+            logger.info(
+                "Not all required subsystems ready after reset"
+                if not all_ready
+                else "Simulation mode: waiting for operator start after reset"
             )
+            for name, adapter in self.adapters.items():
+                self._status.active_subsystems[name] = adapter.info
 
     def _handle_status(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: request_status")
@@ -603,7 +601,7 @@ class WorkflowOrchestrator:
     ) -> None:
         """Callback for object state machine transitions."""
         logger.info(
-            "Object '%s': %s -> %s (event: %s)",
+            "Object '%s': %s (event: %s)",
             object_id, new_state, event,
         )
 
@@ -771,7 +769,7 @@ class WorkflowOrchestrator:
             {"new_state": new_state.value},
         )
         # Broadcast full status including objects for the frontend
-        self.frontend.broadcast_status(self._status)
+        self.frontend.broadcast_with_display_config(self._status)
 
     def _fire_frontend_event(
         self,
@@ -803,12 +801,26 @@ class WorkflowOrchestrator:
         """Broadcast the current list of objects to the frontend."""
         with self._lock:
             objects_info = self.object_manager.get_all_objects_info()
+            # Keep _status in sync so broadcast_with_display_config sends
+            # the correct objects list (not an empty array that would
+            # overwrite the frontend's objects with []).
+            self._status.objects = [
+                ObjectInfo(
+                    object_id=obj["object_id"],
+                    state=obj.get("state", "identified_in_box"),
+                    state_description=obj.get("state_description", ""),
+                    created=obj.get("created", ""),
+                    last_state_change=obj.get("last_state_change", ""),
+                    transitions=obj.get("transitions", []),
+                )
+                for obj in objects_info
+            ]
 
         self._fire_frontend_event(
             BackendEvent.WORKFLOW_STATE_CHANGED.value,
             {"objects": objects_info},
         )
-        self.frontend.broadcast_status(self._status)
+        self.frontend.broadcast_with_display_config(self._status)
 
     # ------------------------------------------------------------------
     # Convenience Methods
@@ -843,6 +855,32 @@ class WorkflowOrchestrator:
         adapter = self.adapters[subsystem_name]
         adapter.update_state(state, error=error)
         logger.info("Subsystem %s set to %s", subsystem_name, state.value)
+
+    def notify_subsystem_ready(self, subsystem_name: str) -> None:
+        """Notify the frontend that a subsystem has reached ready state.
+
+        Used by the simulator after directly manipulating subsystem state
+        machines (e.g. during initialization), where the normal event-driven
+        broadcast path is bypassed.
+        """
+        adapter = self.adapters.get(subsystem_name)
+        if not adapter:
+            return
+        new_state = adapter.state_machine.current_state if adapter.state_machine else "ready"
+        self._fire_frontend_event(
+            BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
+            {
+                "subsystem": subsystem_name,
+                "new_state": new_state,
+                "source": "simulation_init",
+            },
+        )
+        # Keep the status dict in sync so broadcast_with_display_config is correct
+        if subsystem_name in self._status.active_subsystems:
+            info = self._status.active_subsystems[subsystem_name]
+            info.current_state = new_state
+            info.state_description = adapter._get_state_description()
+        logger.info("Subsystem '%s' notified as ready for frontend", subsystem_name)
 
     def update_all_subsystems_ready(self) -> None:
         """Mark all required subsystems as ready."""
@@ -978,6 +1016,11 @@ class WorkflowOrchestrator:
 
         self.frontend.set_subsystem_config(
             [cfg.to_dict() for cfg in self.subsystems_config]
+        )
+        # Send object workflow display config (state order + colors) to frontend
+        self.frontend.set_workflow_display_config(
+            self._global_config.object_state_order,
+            self._global_config.object_state_colors,
         )
 
         self._fire_frontend_event(
