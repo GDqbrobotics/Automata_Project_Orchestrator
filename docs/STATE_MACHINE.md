@@ -2,48 +2,34 @@
 
 This document describes the design principles and configuration patterns used by the AUTOMATA GUI orchestrator.
 
-## Overview
+## Three-Level Architecture
 
-The system uses **three levels** of state machines, all driven by declarative YAML configuration:
+The system uses three layers of declarative state machines, all driven by YAML configuration:
 
-1. **Workflow state machine** – High-level workflow lifecycle (idle → starting → running → paused → stopping → stopped → error). Defined in `backend/config/workflow.yaml`.
+| Level | Scope | Blueprint | Persistence |
+|---|---|---|---|
+| **Workflow** | Whole system lifecycle | `backend/config/workflow.yaml` | No |
+| **Subsystem** | One per hardware/software subsystem | `backend/config/subsystems/<name>.yaml` | No |
+| **Object** | One instance per analyzed sample | `backend/config/object.yaml` | `backend/object_states/<id>.json` |
 
-2. **Subsystem state machines** – Each subsystem has its own state machine with its own states, transitions, and actions. Defined in individual YAML files in `backend/config/subsystems/`.
+Each level is independent. Communication flows upward through **internal events** (not MQTT):
 
-3. **Object state machines** – Each analyzed object has its own state machine instance tracking the detailed analysis cycle. The blueprint is in `backend/config/object.yaml`.
+```
+Object SM ──event──► Orchestrator ──► Subsystem SM ──MQTT──► Hardware
+Workflow SM ──event──► Orchestrator ──► (broadcast / route to subsystems)
+```
+
+Subsystem state machines are the **boundary layer**: they are the only level that publishes MQTT.
 
 ## Core Concepts
 
-### State
-A state represents the current condition of a workflow, subsystem, or object.
+**State** — A named condition (`idle`, `running`, `error`, `ready`, `identified_in_box`, …). Every state machine has an `initial_state` and a set of named states, each with an optional description.
 
-- **Workflow states**: `idle`, `starting`, `running`, `paused`, `stopping`, `stopped`, `error`
-- **Subsystem states**: Varies per subsystem (typically `initializing`, `ready`, `running`, `paused`, `stopped`, `error`)
-- **Object states**: Defined per-object workflow (e.g., `identified_in_box`, `moving_to_disk`, `object_analyzed`)
+**Event** — A trigger that causes the engine to look up a transition. Events can be **unscoped** (`error`, `start_requested`) or **scoped** (`robot_first/pick`, `all/resume`). Scoping routes the event to a specific subsystem; the special `all/` scope broadcasts to every subsystem.
 
-### Event
-An event is a trigger that causes a state machine to evaluate a transition.
+**Transition** — A mapping from `(current_state, event)` → `(target_state, actions)`. Defined entirely in YAML. Invalid transitions raise `StateMachineError`.
 
-- **Workflow events**: `start_requested`, `pause_requested`, `resume_requested`, `stop_requested`, `subsystem_ready`, `subsystem_error`, `reset_requested`
-- **Subsystem events**: `init_complete`, `start`, `stop`, `pause`, `resume`, `complete`, `error`, `reset`
-- **Object events**: `object_picked`, `object_placed_on_disk`, `imaging_capture_complete`, `measurements_complete`, etc.
-
-### Transition
-A transition moves a state machine from one state to another, triggered by an event. Defined in YAML with:
-- `event` – The triggering event
-- `target` – The destination state
-- `actions` – Side effects to execute (e.g., `log_event`, `update_operator_ui`, `event: trigger_robot_first_pick`)
-
-### Action
-An action is a side effect executed during a transition.
-
-**Built-in actions**:
-- `log_event` – Log the transition
-- `update_operator_ui` – Notify UI update
-- `publish_mqtt_message: <topic>` – Publish to an MQTT topic
-- `event: <name>` – Fire an internal event after transition (for cross-level communication)
-
-Custom actions can be registered via `StateMachineEngine.register_action()`.
+**Action** — A side effect executed during a transition. Actions are either strings (built-in handlers) or dicts with a single key (custom handlers). The only built-in action is `log_event`. Custom actions are registered at runtime via `StateMachineEngine.register_action()`. Event actions (`event: name`) fire the on-transition-completion callback for cross-level communication.
 
 ## Configuration Files
 
@@ -52,69 +38,26 @@ Custom actions can be registered via `StateMachineEngine.register_action()`.
 | `backend/config/workflow.yaml` | Workflow lifecycle states and transitions |
 | `backend/config/object.yaml` | Per-object analysis workflow blueprint |
 | `backend/config/subsystems/*.yaml` | Subsystem metadata and state machine definitions |
-| `backend/config/workflow_actions.yaml` | Maps object events to subsystem commands |
-| `backend/config/global.yaml` | Global defaults (MQTT, ports, state colors, messages) |
-
-## Three-Level Architecture
-
-### Level 1: Workflow State Machine
-Manages the high-level workflow lifecycle. Transitions are triggered by operator actions (via WebSocket) or subsystem events (via MQTT).
-
-### Level 2: Subsystem State Machines
-Each subsystem has its own state machine. The orchestrator drives transitions via `fire_subsystem_transition(subsystem_name, event)`. State changes are published via MQTT and broadcast to the frontend.
-
-### Level 3: Object State Machines
-Each analyzed object gets a state machine instance from the `object.yaml` blueprint. Transitions are driven by subsystem completions. State is persisted to `backend/object_states/{object_id}.json`.
-
-## Cross-Level Communication
-
-Object state machines fire internal events (not MQTT) that the orchestrator handles by triggering subsystem actions:
-
-```
-Object event → Orchestrator → Subsystem command → MQTT → Hardware
-```
-
-This keeps MQTT publishing centralized in the orchestrator's subsystem trigger methods.
+| `backend/config/global.yaml` | Global defaults (MQTT broker, frontend port, state colors/order) |
 
 ## Design Principles
 
-1. **All behavior is configuration-driven** – States, transitions, events, and actions are defined in YAML. Code provides the engine, not the logic.
+1. **Behavior lives in config, not code.** States, transitions, events, and actions are defined in YAML. The engine provides the mechanism; configuration provides the logic.
 
-2. **No hardcoded workflow logic** – The object-to-subsystem event mapping (`workflow_actions.yaml`), simulation event chain, and UI display rules are all derived from config.
+2. **MQTT is confined to the boundary.** Object and workflow state machines never publish MQTT. Only subsystem state machines do, via the orchestrator's boundary callback.
 
-3. **MQTT only at the subsystem level** – Object state machines fire internal events. Subsystem state machines publish MQTT.
+3. **Internal events drive cross-level communication.** State machines communicate through scoped internal events routed by the orchestrator, not through shared memory or direct method calls.
 
-4. **State machines are independent** – Workflow, subsystem, and object state machines are decoupled. Each level communicates through events.
+4. **Object state is persistent.** Each object's state machine is saved to `backend/object_states/<id>.json` on every transition and restored on restart.
 
-5. **Object state persists to disk** – Survives orchestrator restarts via JSON files in `backend/object_states/`.
+5. **Invalid transitions are rejected.** The engine validates at runtime and raises `StateMachineError` for undefined events in the current state.
 
-6. **Invalid transitions are rejected** – The state machine engine validates transitions at runtime and raises `StateMachineError` for invalid events.
+6. **Subsystem adapters are pluggable.** Adding a new subsystem requires only a YAML file — no code changes.
 
-7. **Frontend is reactive** – The UI renders state and captures operator actions. All business logic lives in the backend.
+7. **Error and recovery are first-class states.** `error` and `stopped` have explicit transitions back to `idle` via `reset_requested`.
 
-8. **Subsystem adapters are dynamic** – New subsystems are added by creating a YAML file. No code changes needed.
+8. **The frontend is reactive, not decisional.** The UI renders state and captures operator intent; all workflow logic resides in the backend state machines.
 
-9. **Error and recovery are first-class states** – `error` and `stopped` states have explicit transitions back to `idle` via `reset_requested`.
+9. **Simulation follows config.** The simulator derives its event chain from `object.yaml` and the pipeline stage definitions — no hardcoded workflow lists.
 
-10. **Simulation follows config** – The simulator derives its event chain from `object.yaml` and `workflow_actions.yaml`, not from hardcoded lists.
-
-## Recommended Rules
-
-1. All workflow behavior should be driven by state machine configuration.
-2. The UI should react to state changes, not directly decide the next step.
-3. Subsystem communication should be encapsulated behind adapters.
-4. Each transition should be explicit and easy to inspect.
-5. Invalid transitions should be rejected with a clear error.
-6. Errors and recovery paths should be modeled as first-class states.
-7. Subsystem state machines should be independent of the workflow state machine.
-8. Object state machines should be independent of both workflow and subsystem state machines.
-9. Object states should be persisted to disk for crash recovery.
-10. Object transitions are driven by subsystem completions, not by direct operator input.
-
-## Validation
-
-The state-machine engine validates that:
-- The initial state exists.
-- Every transition target exists.
-- The configuration is syntactically valid YAML.
-- The orchestration runtime can load and execute it safely.
+10. **Scoping is uniform.** The same `scope/event` syntax works for both event actions and action targets, enabling consistent routing across all three levels.

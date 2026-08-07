@@ -450,12 +450,9 @@ class WorkflowSimulator:
     ) -> None:
         """Execute a single pipeline stage for an object.
 
-        For each subsystem in the stage, ensure it goes through:
-        ready → working → ready (completing the full cycle).
-
-        If a subsystem is already busy (from a previous object's event in
-        the same round), the scoped event is skipped and the subsystem's
-        complete event is fired when it becomes ready.
+        Each subsystem goes through: ready → working → ready.
+        Transitions are routed through the orchestrator so the frontend
+        receives state-change notifications at each phase.
         """
         stage_name = stage["name"]
         subsystems = stage["subsystems"]
@@ -490,7 +487,10 @@ class WorkflowSimulator:
             else:
                 self.orchestrator._on_event(object_event)
 
-        # Simulate subsystem processing - ensure full cycle
+        # Simulate subsystem processing — full cycle with visible working state.
+        # Each subsystem transitions: ready → working (start event) → ready (complete).
+        # We use fire_subsystem_transition so the orchestrator broadcasts the
+        # state change to the frontend at each step.
         for subsystem_name in subsystems:
             adapter = self.orchestrator.adapters.get(subsystem_name)
             if not adapter or not adapter.state_machine:
@@ -499,43 +499,27 @@ class WorkflowSimulator:
             sm = adapter.state_machine
             current_state = sm.current_state
 
-            # Ensure subsystem goes through full cycle: ready → working → ready
             if current_state == "ready":
-                # Fire start event to begin working
+                # Transition to working state — visible to the frontend
                 if start_event in sm.get_available_transitions():
-                    try:
-                        sm.fire(start_event, None)
-                    except Exception:
-                        pass
-                # Immediately fire complete to return to ready
+                    self.orchestrator.fire_subsystem_transition(subsystem_name, start_event)
+                    time.sleep(0.4)
+                # Transition back to ready
                 if "complete" in sm.get_available_transitions():
-                    try:
-                        sm.fire("complete", None)
-                    except Exception:
-                        pass
+                    self.orchestrator.fire_subsystem_transition(subsystem_name, "complete")
             elif current_state in ("picking", "returning", "rotating",
                                     "measuring", "capturing", "analyzing",
                                     "uploading"):
-                # Subsystem is already working, fire complete
+                # Subsystem is already working from a previous object — complete it
                 if "complete" in sm.get_available_transitions():
-                    try:
-                        sm.fire("complete", None)
-                    except Exception:
-                        pass
+                    self.orchestrator.fire_subsystem_transition(subsystem_name, "complete")
             elif current_state in ("initializing",):
                 # Subsystem hasn't been initialized yet
                 if "init_complete" in sm.get_available_transitions():
-                    try:
-                        sm.fire("init_complete", None)
-                    except Exception:
-                        pass
-
-            # Force subsystem to ready state as final guarantee
-            if sm.current_state not in ("ready",):
-                sm.current_state = "ready"
+                    self.orchestrator.fire_subsystem_transition(subsystem_name, "init_complete")
 
         # Simulate processing time (slowed for GUI visibility)
-        time.sleep(delay * 2.5)
+        time.sleep(delay * 1.5)
 
     def _get_state_for_stage(self, stage_name: str) -> str:
         """Get the object state corresponding to a pipeline stage."""

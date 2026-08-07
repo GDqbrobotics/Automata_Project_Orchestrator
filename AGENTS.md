@@ -52,4 +52,6 @@ Use a layered structure such as:
 
 ## Notes for agents
 
-If a contribution affects the workflow, the UI, or subsystem integration, review the architecture notes in docs/GUI_ARCHITECTURE.md before making changes.
+If a contribution affects the workflow, the UI, or subsystem integration, review the architecture notes in docs/GUI_ARCHITECTURE.md before making changes. The fundamental concepts that must guide the devoloping are described in docs/PROJECT_CONTEXT.md
+README.md, DEVELOPING_JOURNAL.md are meant to be constantly updated (the first is for human users and the second is for human/agentic developers) keep them brief.
+IMPORTANT: for a bug not already solved, simulation_test.py do not terminate at the end of the script so all the time it is directly executed or indirectly via pytest, use a timeout or the agent session will stuck forever.
