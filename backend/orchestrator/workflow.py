@@ -585,13 +585,27 @@ class WorkflowOrchestrator:
 
             if new_state == "object_analyzed":
                 logger.info("Object '%s' analysis complete", object_id)
-                self._progress = len(self.object_manager.get_object_ids())
+                analyzed = self._count_analyzed_objects()
+                with self._lock:
+                    self._progress = analyzed
                 self._fire_frontend_event(
                     BackendEvent.PROGRESS_UPDATED.value,
-                    {"progress": self._progress, "total": self._total_objects},
+                    {"progress": analyzed, "total": self._total_objects},
                 )
 
         return new_state
+
+    def _count_analyzed_objects(self) -> int:
+        """Count objects that have reached the final 'object_analyzed' state.
+
+        Progress must reflect *completed* objects, not the total number of
+        known objects (which would make the UI show 100% prematurely).
+        """
+        return sum(
+            1
+            for oid in self.object_manager.get_object_ids()
+            if self.object_manager.get_object_state(oid) == "object_analyzed"
+        )
 
     def _on_object_state_change(
         self,
@@ -1017,10 +1031,12 @@ class WorkflowOrchestrator:
         self.frontend.set_subsystem_config(
             [cfg.to_dict() for cfg in self.subsystems_config]
         )
-        # Send object workflow display config (state order + colors) to frontend
+        # Send object workflow display config (state order, colors and
+        # per-workflow-state messages) to the frontend
         self.frontend.set_workflow_display_config(
             self._global_config.object_state_order,
             self._global_config.object_state_colors,
+            self._global_config.workflow_state_messages,
         )
 
         self._fire_frontend_event(

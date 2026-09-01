@@ -373,12 +373,24 @@ class ObjectStateMachines:
     # Cleanup
     # ------------------------------------------------------------------
     def clear(self) -> None:
-        """Remove all object state machines."""
+        """Remove all object state machines and their persisted state files."""
         with self._lock:
             self._machines.clear()
             self._state_descriptions.clear()
             self._timestamps.clear()
             self._transition_logs.clear()
+            # Also remove persisted files so stale state from previous runs
+            # does not accumulate on disk (the orchestrator clears objects
+            # on every start, so leftovers are never restored into a run).
+            if self.storage_dir.exists():
+                for state_file in self.storage_dir.glob("*.json"):
+                    try:
+                        state_file.unlink()
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not remove persisted state %s: %s",
+                            state_file, exc,
+                        )
             logger.info("All object state machines cleared")
 
 

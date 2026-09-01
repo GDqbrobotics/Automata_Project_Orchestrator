@@ -83,8 +83,17 @@ export class App {
   private updateWorkflowMessage(): void {
     const el = document.getElementById('workflowMessage');
     if (!el) return;
-    const msg = getStateMessage(this.state.workflowState, this.state.error || undefined);
-    el.textContent = msg;
+    // Error state: always show the concrete error detail
+    if (this.state.workflowState === 'error') {
+      el.textContent = getStateMessage('error', this.state.error || undefined);
+      return;
+    }
+    // Prefer messages sent by the backend (from global.yaml),
+    // fall back to the frontend defaults from config/state-messages.ts
+    const backendMsg = this.state.workflowStateMessages[this.state.workflowState];
+    el.textContent =
+      backendMsg ||
+      getStateMessage(this.state.workflowState, this.state.error || undefined);
   }
 
   private updateProgress(): void {

@@ -1,8 +1,10 @@
 import { App } from './ui/app.js';
 import type { WorkflowStateType } from './contracts.js';
 
+// launch_gui.py injects VITE_WS_URL so the UI follows --ws-port;
+// the default keeps a manual `npm run dev` working out of the box.
 const app = new App({
-  wsUrl: 'ws://localhost:8080',
+  wsUrl: (import.meta.env.VITE_WS_URL as string | undefined) || 'ws://localhost:8080',
 });
 
 // Bind UI buttons to operator commands

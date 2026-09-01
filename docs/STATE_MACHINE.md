@@ -58,6 +58,6 @@ Subsystem state machines are the **boundary layer**: they are the only level tha
 
 8. **The frontend is reactive, not decisional.** The UI renders state and captures operator intent; all workflow logic resides in the backend state machines.
 
-9. **Simulation follows config.** The simulator derives its event chain from `object.yaml` and the pipeline stage definitions — no hardcoded workflow lists.
+9. **Simulation follows config.** The simulator drives each object through the transitions defined in `object.yaml` (it has no separate object-state logic); the pipeline stage list — which subsystems act and which run in parallel — is defined in `backend/orchestrator/simulation.py`.
 
 10. **Scoping is uniform.** The same `scope/event` syntax works for both event actions and action targets, enabling consistent routing across all three levels.

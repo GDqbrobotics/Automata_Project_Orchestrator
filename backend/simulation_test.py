@@ -553,23 +553,15 @@ async def test_pause_resume_gui() -> None:
         "After resume_workflow, state transitions back to 'running'",
     )
 
-    # Stop
+    # Stop – the orchestrator completes the full sequence
+    # (running → stopping → stopped) when the operator initiates the stop
     await ws_client.send_command("stop_workflow")
     await ws_client.receive()
     time.sleep(0.2)
 
     results.check(
-        runner.current_state_name == "stopping",
-        "After stop_workflow, state transitions to 'stopping'",
-    )
-
-    # Fire the final 'stopped' event to complete the stop sequence
-    runner.fire_event("stopped")
-    time.sleep(0.2)
-
-    results.check(
         runner.current_state_name == "stopped",
-        "After stop sequence, state is 'stopped'",
+        "After stop_workflow, state transitions to 'stopped'",
     )
 
     # Reset from stopped back to idle

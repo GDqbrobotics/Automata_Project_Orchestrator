@@ -25,6 +25,10 @@ class MqttClient:
         self._client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
+        # Route incoming MQTT messages to the registered _on_message handler.
+        # Without this, paho silently drops every published message and the
+        # orchestrator never sees subsystem status/response updates.
+        self._client.on_message = self._on_message_wrapper
         self._on_message: Optional[Callable[[str, bytes], None]] = None
 
     # ------------------------------------------------------------------

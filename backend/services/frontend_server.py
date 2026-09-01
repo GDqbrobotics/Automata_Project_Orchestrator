@@ -156,10 +156,28 @@ class FrontendServer:
         self._subsystem_config = config_list
         logger.info("Subsystem config set: %d subsystems", len(config_list))
 
-    def set_workflow_display_config(self, state_order: List[str], state_colors: Dict[str, str]) -> None:
-        """Set object workflow display config (state order and colors) to broadcast with status updates."""
-        self._workflow_display_config = {"state_order": state_order, "state_colors": state_colors}
-        logger.info("Workflow display config set: %d states", len(state_order))
+    def set_workflow_display_config(
+        self,
+        state_order: List[str],
+        state_colors: Dict[str, str],
+        state_messages: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Set object workflow display config (state order, colors and
+        per-workflow-state display messages) to broadcast with status updates.
+
+        The messages come from the `workflow_states` section of global.yaml
+        so the UI text stays config-driven.
+        """
+        self._workflow_display_config = {
+            "state_order": state_order,
+            "state_colors": state_colors,
+            "state_messages": state_messages or {},
+        }
+        logger.info(
+            "Workflow display config set: %d states, %d messages",
+            len(state_order),
+            len(state_messages or {}),
+        )
 
 
 
@@ -207,13 +225,37 @@ class FrontendServer:
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop the WebSocket server and wait for it to fully shut down."""
-        # Signal shutdown by closing the server
+    async def _shutdown_server(self) -> None:
+        """Close the server and wait for all connections to drain.
+
+        Must run on the server's own event loop: websockets 14's
+        ``Server.close()`` schedules its work with ``loop.create_task()``,
+        which is NOT thread-safe when called from another thread (the loop
+        is never woken and ``wait_closed()`` hangs forever).
+        """
         if self._server is not None:
             self._server.close()
+            await self._server.wait_closed()
 
-        # Wait for the server thread to exit (with timeout)
+    def stop(self) -> None:
+        """Stop the WebSocket server and wait for it to fully shut down."""
+        # Signal shutdown on the server's event loop, from this thread, in a
+        # thread-safe way. The server thread exits on its own once the close
+        # completes (its run_until_complete(_run()) returns).
+        if (
+            self._server is not None
+            and self._event_loop is not None
+            and self._event_loop.is_running()
+        ):
+            future = asyncio.run_coroutine_threadsafe(
+                self._shutdown_server(), self._event_loop
+            )
+            try:
+                future.result(timeout=2.0)
+            except Exception:
+                logger.exception("Timed out waiting for server shutdown")
+
+        # Wait for the server thread to exit (should be immediate now).
         # We must NOT try to close the event loop from another thread.
         # The event loop will be garbage-collected when the thread exits
         # and all references are dropped.

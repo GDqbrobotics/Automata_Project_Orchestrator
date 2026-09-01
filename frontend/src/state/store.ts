@@ -22,6 +22,8 @@ export interface UiState {
   objectStateOrder: string[];
   /** Object workflow state colors, sent by backend from global.yaml */
   objectStateColors: Record<string, string>;
+  /** Workflow state display messages, sent by backend from global.yaml */
+  workflowStateMessages: Record<string, string>;
   logs: Array<{ time: string; source: string; message: string; level: 'info' | 'error' | 'success' | 'warning' }>;
 }
 
@@ -44,6 +46,7 @@ export function createInitialState(): UiState {
     connectionStatus: 'disconnected',
     objectStateOrder: [],
     objectStateColors: {},
+    workflowStateMessages: {},
     logs: [],
   };
 }
@@ -86,7 +89,9 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (d.new_state) {
       const newState = d.new_state as WorkflowStateType;
       updated.workflowState = newState;
-      updated.message = d.message as string || '';
+      // The backend does not send a display message; derive it so the
+      // stored message never degrades to an empty string.
+      updated.message = getStateMessage(newState, state.error || undefined);
       logs.push({ time: now(), source: 'workflow', message: `State → ${newState}`, level: 'info' });
     }
     // Subsystem config may be included in the details
@@ -197,6 +202,10 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (d.state_colors && typeof d.state_colors === 'object') {
       updated.objectStateColors = d.state_colors as Record<string, string>;
       logs.push({ time: now(), source: 'config', message: `State colors updated (${Object.keys(updated.objectStateColors).length} colors)`, level: 'info' });
+    }
+    // Update workflow state display messages (from global.yaml)
+    if (d.state_messages && typeof d.state_messages === 'object') {
+      updated.workflowStateMessages = d.state_messages as Record<string, string>;
     }
   }
 
