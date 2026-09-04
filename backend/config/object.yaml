@@ -5,6 +5,14 @@ states:
   identified_in_box:
     description: Object has been identified in the box by the vision system
     transitions:
+      - event: queued_for_analysis
+        target: waiting_for_disk
+        actions:
+          - log_event
+
+  waiting_for_disk:
+    description: Object is in the box, waiting for a free disk slot and the robot (the platform holds at most 2 objects, the robot carries at most 1)
+    transitions:
       - event: object_picked
         target: moving_to_disk
         actions:
@@ -19,6 +27,7 @@ states:
         actions:
           - log_event
           - event: imaging_3di_hsi/capture
+          - event: robot_first/measure_hsi_3d
 
   HSI_3DI_analysis:
     description: 3D imaging and hyperspectral imaging capture is being performed
@@ -27,10 +36,14 @@ states:
         target: object_going_second_position
         actions:
           - log_event
-          - event: rotating_platform/rotate_to_second
+          # Rotation request to the pipeline controller (workflow/ scope is
+          # internal): the platform only rotates when BOTH disk positions
+          # are stable, so the actual rotating_platform command is issued by
+          # the orchestrator, not by this transition.
+          - event: workflow/rotation_requested_second
 
   object_going_second_position:
-    description: Rotating platform is moving the object to the second measurement position
+    description: Object waits on the first disk for a platform rotation to the second measurement position
     transitions:
       - event: platform_rotated_to_second
         target: XRF_RAMAN_analysis
@@ -39,6 +52,7 @@ states:
           - event: ai_analysis/plan
           - event: xrf/measure
           - event: raman/measure
+          - event: robot_second/use_xrf
 
   XRF_RAMAN_analysis:
     description: XRF and Raman puntual measurements are being performed at AI-extracted points
@@ -47,7 +61,7 @@ states:
         target: object_going_first_position
         actions:
           - log_event
-          - event: rotating_platform/rotate_to_first
+          - event: workflow/rotation_requested_first
 
   object_going_first_position:
     description: Rotating platform is moving the object back to the first position

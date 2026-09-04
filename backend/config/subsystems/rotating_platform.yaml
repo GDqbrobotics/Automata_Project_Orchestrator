@@ -8,6 +8,10 @@ required: true
 metadata:
   description: "Motorized rotary stage with transparent disks"
   hardware: "Motorized rotary stage"
+  # Simulation timings (seconds) used by backend/simulation/rotating_platform_sim.py
+  init_duration: 1.5
+  work_durations:
+    rotating: 2.0
 
 states:
   initializing:

@@ -7,6 +7,10 @@ initial_state: initializing
 required: false
 metadata:
   description: "AI-based interest point extraction for measurement planning"
+  # Simulation timings (seconds) used by backend/simulation/ai_analysis_sim.py
+  init_duration: 1.5
+  work_durations:
+    analyzing: 5.0
 
 states:
   initializing:

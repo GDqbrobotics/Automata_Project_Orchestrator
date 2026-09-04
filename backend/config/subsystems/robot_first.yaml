@@ -8,6 +8,13 @@ required: true
 metadata:
   description: "First Universal Robot arm – pick-and-place and 3DI/HSI handling"
   hardware: "UR5e with custom end effector"
+  # Simulation timings (seconds) used by backend/simulation/robot_first_sim.py
+  init_duration: 1.5
+  work_durations:
+    picking: 2.0
+    placing: 2.0
+    measuring_hsi_3d: 4.0
+    returning: 2.5
 
 states:
   initializing:
@@ -31,8 +38,18 @@ states:
         actions:
           - log_event
 
+      - event: place
+        target: placing
+        actions:
+          - log_event
+
       - event: return
         target: returning
+        actions:
+          - log_event
+
+      - event: measure_hsi_3d
+        target: measuring_hsi_3d
         actions:
           - log_event
 
@@ -48,6 +65,24 @@ states:
 
   picking:
     description: "Robot is picking object"
+    transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
+  placing:
+    description: "Robot is placing object on the disk"
     transitions:
       - event: complete
         target: ready
@@ -82,6 +117,24 @@ states:
         actions:
           - log_event
 
+  measuring_hsi_3d:
+    description: "Robot is holding the imaging tool while 3DI/HSI is captured on the object"
+    transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+          
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
   stopped:
     description: "Robot has stopped"
     transitions:
@@ -92,6 +145,16 @@ states:
 
       - event: pick
         target: picking
+        actions:
+          - log_event
+
+      - event: place
+        target: placing
+        actions:
+          - log_event
+
+      - event: measure_hsi_3d
+        target: measuring_hsi_3d
         actions:
           - log_event
 

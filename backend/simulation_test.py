@@ -131,6 +131,27 @@ results = TestResults()
 # ---------------------------------------------------------------------------
 # Mosquitto broker management
 # ---------------------------------------------------------------------------
+def _start_pipe_drainers(proc: subprocess.Popen) -> None:
+    """Drain a child process's stdout/stderr in background threads.
+
+    Undrained pipes fill up (64 KB) and BLOCK the child on its next write.
+    A blocked mosquitto broker stops processing messages entirely, which
+    would freeze the whole simulated pipeline mid-run.
+    """
+    import threading
+
+    def _drain(stream) -> None:
+        try:
+            for _ in iter(lambda: stream.readline(), b""):
+                pass
+        except Exception:
+            pass
+
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            threading.Thread(target=_drain, args=(stream,), daemon=True).start()
+
+
 def start_mosquitto_broker(port: int = MQTT_BROKER_PORT) -> subprocess.Popen:
     """Start mosquitto broker in the background."""
     conf_file = tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False)
@@ -139,11 +160,13 @@ def start_mosquitto_broker(port: int = MQTT_BROKER_PORT) -> subprocess.Popen:
     conf_file.flush()
     conf_file.close()
 
+    # No -v: verbose mode logs every publish and would fill the pipe buffer.
     proc = subprocess.Popen(
-        ["mosquitto", "-c", conf_file.name, "-v"],
+        ["mosquitto", "-c", conf_file.name],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    _start_pipe_drainers(proc)
 
     # Wait for broker to start
     for _ in range(50):
@@ -172,6 +195,53 @@ def stop_mosquitto_broker(proc: subprocess.Popen) -> None:
     except Exception:
         proc.kill()
         proc.wait(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# Simulated subsystem processes (backend/simulation/*_sim.py)
+# ---------------------------------------------------------------------------
+# In simulation mode every subsystem is simulated as an individual process
+# that communicates with the orchestrator exclusively over MQTT – identical
+# to how the real subsystems will behave.
+ACTIVE_SIM_PROCS: List[subprocess.Popen] = []
+
+
+def start_simulator_processes(port: int, num_objects: int) -> None:
+    """Start one simulated subsystem process per configured subsystem."""
+    stop_simulator_processes()  # defensive: clean up leftovers from a failed run
+    sim_dir = Path(__file__).resolve().parent / "simulation"
+    for name in ALL_SUBSYSTEMS:
+        cmd = [
+            sys.executable, str(sim_dir / f"{name}_sim.py"),
+            "--broker", MQTT_BROKER_HOST,
+            "--port", str(port),
+        ]
+        if name == "vision":
+            cmd.extend(["--num-objects", str(num_objects)])
+        logger.info("Starting simulated subsystem process: %s", name)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        _start_pipe_drainers(proc)
+        ACTIVE_SIM_PROCS.append(proc)
+
+
+def stop_simulator_processes() -> None:
+    """Stop all simulated subsystem processes."""
+    for proc in ACTIVE_SIM_PROCS:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    for proc in ACTIVE_SIM_PROCS:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    ACTIVE_SIM_PROCS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +463,18 @@ def test_state_machine_config() -> None:
 # Test 2: Full workflow simulation with GUI commands via WebSocket
 # ---------------------------------------------------------------------------
 async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
-    """Test: Full workflow simulation with GUI commands sent via WebSocket."""
+    """Test: Full workflow simulation with GUI commands sent via WebSocket.
+
+    Every subsystem is simulated as an individual process speaking MQTT to
+    the orchestrator (identical to the real subsystems); the orchestrator
+    drives the object pipeline purely from their status reports.
+    """
     logger.info("--- TEST 2: Full Workflow Simulation (GUI via WebSocket) ---")
+
+    # Start the simulated subsystem processes (self-init over MQTT)
+    start_simulator_processes(MQTT_BROKER_PORT, num_objects)
+    # Give them time to connect to the broker and self-initialize
+    time.sleep(2.5)
 
     # Start orchestrator in simulation mode with the correct number of objects
     runner = OrchestratorRunner(
@@ -445,14 +525,41 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
     logger.info("Waiting for simulation to complete...")
     # Terminal states: stopped/error = workflow completion
     terminal_states = {"stopped", "error"}
-    max_wait = 60  # seconds (parallel pipeline takes longer)
+    # Stage durations are slowed down for GUI visibility, so the full
+    # pipeline takes a while (roughly 8-10 s per object after the first).
+    max_wait = 180  # seconds
     start_wait = time.monotonic()
     max_progress = 0
+
+    # Physical capacity of the machine (docs/PROJECT_CONTEXT.md):
+    #  - the rotating platform has 2 disk slots (imaging + measurement),
+    #  - robot 1 has a single end effector (1 object in transit),
+    #  - every other object must stay in the box.
+    # Object states occupying each physical position:
+    DISK_FIRST_STATES = {"HSI_3DI_analysis", "object_going_second_position", "moving_to_box"}
+    DISK_SECOND_STATES = {"XRF_RAMAN_analysis", "object_going_first_position"}
+    IN_BOX_STATES = {"identified_in_box", "waiting_for_disk", "object_analyzed"}
+    invariant_violations: List[tuple] = []
 
     while time.monotonic() - start_wait < max_wait:
         state = runner.current_state_name
         progress = runner.orchestrator._progress
         max_progress = max(max_progress, progress)
+
+        # Sample the object states and verify the physical invariants hold
+        object_states = [
+            runner.orchestrator.object_manager.get_object_state(oid)
+            for oid in runner.orchestrator.object_manager.get_object_ids()
+        ]
+        if object_states:
+            n_disk_first = sum(s in DISK_FIRST_STATES for s in object_states)
+            n_disk_second = sum(s in DISK_SECOND_STATES for s in object_states)
+            n_in_transit = sum(s == "moving_to_disk" for s in object_states)
+            n_out_of_box = sum(s not in IN_BOX_STATES for s in object_states)
+            if n_disk_first > 1 or n_disk_second > 1 or n_in_transit > 1 or n_out_of_box > 3:
+                invariant_violations.append(
+                    (n_in_transit, n_disk_first, n_disk_second, n_out_of_box)
+                )
 
         await ws_client.drain_messages()
 
@@ -485,9 +592,17 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
         f"All {num_objects} objects were processed (progress: {final_progress})",
     )
 
+    results.check(
+        len(invariant_violations) == 0,
+        "Physical constraints held at all times (<=1 object in robot's hand, "
+        "<=1 object per disk position, <=2 objects on the platform)"
+        + (f" [violations: {invariant_violations[:3]}...]" if invariant_violations else ""),
+    )
+
     # ---- Cleanup ----
     runner.stop()
     await ws_client.close()
+    stop_simulator_processes()
 
     logger.info("Full workflow simulation with GUI commands complete.\n")
 
@@ -856,6 +971,7 @@ def test_object_state_machine_config() -> None:
 
     expected_states = [
         "identified_in_box",
+        "waiting_for_disk",
         "moving_to_disk",
         "HSI_3DI_analysis",
         "object_going_second_position",
@@ -870,32 +986,37 @@ def test_object_state_machine_config() -> None:
             f"State '{state}' is defined in object config",
         )
 
-    # Verify event actions are scoped (e.g., "robot_first/pick")
-    # Each transition has exactly one scoped event action
+    # Verify event actions are scoped (e.g., "robot_first/pick").
+    # Note: 'waiting_for_disk' (object still in the box) is where the robot
+    # pick is triggered – objects only leave the box when a disk slot is
+    # actually free (the physical platform holds at most 2 objects).
+    # 'moving_to_disk' fires two events: the imaging subsystem starts and
+    # robot 1 takes the imaging tool (measuring_hsi_3d) for the capture.
     expected_scoped_events = {
-        "identified_in_box": "robot_first/pick",
-        "moving_to_disk": "imaging_3di_hsi/capture",
-        "HSI_3DI_analysis": "rotating_platform/rotate_to_second",
-        "object_going_second_position": "xrf/measure",
-        "XRF_RAMAN_analysis": "rotating_platform/rotate_to_first",
-        "object_going_first_position": "robot_first/return",
-        "moving_to_box": "cloud_database/upload",
+        "waiting_for_disk": ["robot_first/pick"],
+        "moving_to_disk": ["imaging_3di_hsi/capture", "robot_first/measure_hsi_3d"],
+        # Rotation requests are internal 'workflow/' events: the platform
+        # rotates BOTH disks at once, so the orchestrator (pipeline
+        # controller) decides when a rotation is physically safe and issues
+        # the actual rotating_platform command.
+        "HSI_3DI_analysis": ["workflow/rotation_requested_second"],
+        "object_going_second_position": ["xrf/measure"],
+        "XRF_RAMAN_analysis": ["workflow/rotation_requested_first"],
+        "object_going_first_position": ["robot_first/return"],
+        "moving_to_box": ["cloud_database/upload"],
     }
-    for state, expected_event in expected_scoped_events.items():
+    for state, expected_events in expected_scoped_events.items():
         transitions = manager.config.states[state].transitions
-        found = False
+        fired_events = set()
         for t in transitions:
             for action in t.actions:
                 if isinstance(action, dict) and "event" in action:
-                    if action["event"] == expected_event:
-                        found = True
-                        break
-            if found:
-                break
-        results.check(
-            found,
-            f"Transition from '{state}' fires scoped event '{expected_event}'",
-        )
+                    fired_events.add(action["event"])
+        for expected_event in expected_events:
+            results.check(
+                expected_event in fired_events,
+                f"Transition from '{state}' fires scoped event '{expected_event}'",
+            )
 
     logger.info("Object state machine configuration test complete.\n")
 
@@ -918,11 +1039,12 @@ def test_object_state_machine_transitions() -> None:
 
     available = manager.get_available_transitions("test_object_001")
     results.check(
-        "object_picked" in available,
-        "Available transition from 'identified_in_box' is 'object_picked'",
+        "queued_for_analysis" in available,
+        "Available transition from 'identified_in_box' is 'queued_for_analysis'",
     )
 
     transition_sequence = [
+        ("queued_for_analysis", "waiting_for_disk"),
         ("object_picked", "moving_to_disk"),
         ("object_placed_on_disk", "HSI_3DI_analysis"),
         ("imaging_capture_complete", "object_going_second_position"),
@@ -998,13 +1120,22 @@ async def test_object_in_orchestrator() -> None:
         "Object created via orchestrator starts in 'identified_in_box'",
     )
 
-    # Fire a transition via orchestrator
+    # Fire the queueing transition (analysis order established by vision)
+    new_state = runner.orchestrator.fire_object_transition(
+        "orch_test_001", "queued_for_analysis"
+    )
+    results.check(
+        new_state == "waiting_for_disk",
+        "Object transition via orchestrator: identified_in_box -> waiting_for_disk",
+    )
+
+    # Fire the pick (the disk slot is free, the robot takes the object)
     new_state = runner.orchestrator.fire_object_transition(
         "orch_test_001", "object_picked"
     )
     results.check(
         new_state == "moving_to_disk",
-        "Object transition via orchestrator: identified_in_box -> moving_to_disk",
+        "Object transition via orchestrator: waiting_for_disk -> moving_to_disk",
     )
 
     # Fire complete sequence
@@ -1151,6 +1282,7 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         results.check(False, f"Test suite completed without exception: {exc}")
 
     finally:
+        stop_simulator_processes()
         stop_mosquitto_broker(broker_proc)
 
     print(results.summary())

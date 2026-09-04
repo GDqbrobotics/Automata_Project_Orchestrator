@@ -7,6 +7,10 @@ initial_state: initializing
 required: true
 metadata:
   description: "Raman spectroscopy system for molecular analysis"
+  # Simulation timings (seconds) used by backend/simulation/raman_sim.py
+  init_duration: 1.5
+  work_durations:
+    measuring: 6.0
 
 states:
   initializing:

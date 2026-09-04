@@ -13,9 +13,12 @@ simulation:
   default_num_objects: 3
 
 object_workflow:
-  # State display order and colors for the frontend
+  # State display order and colors for the frontend.
+  # Color names map to the CSS classes .object-state.state-<color>
+  # defined in frontend/index.html.
   state_order:
     - identified_in_box
+    - waiting_for_disk
     - moving_to_disk
     - HSI_3DI_analysis
     - object_going_second_position
@@ -25,14 +28,15 @@ object_workflow:
     - object_analyzed
 
   state_colors:
-    identified_in_box: gray
-    moving_to_disk: blue
-    HSI_3DI_analysis: purple
-    object_going_second_position: cyan
-    XRF_RAMAN_analysis: orange
-    object_going_first_position: cyan
-    moving_to_box: blue
-    object_analyzed: green
+    identified_in_box: identified
+    waiting_for_disk: waiting
+    moving_to_disk: moving
+    HSI_3DI_analysis: imaging
+    object_going_second_position: rotating
+    XRF_RAMAN_analysis: measuring
+    object_going_first_position: rotating
+    moving_to_box: moving
+    object_analyzed: analyzed
 
 workflow_states:
   idle: "Waiting for operator input"

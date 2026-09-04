@@ -7,6 +7,11 @@ initial_state: initializing
 required: false
 metadata:
   description: "Second Universal Robot arm (optional)"
+  # Simulation timings (seconds) used by backend/simulation/robot_second_sim.py
+  init_duration: 1.5
+  work_durations:
+    using_xrf: 6.0
+    using_raman: 6.0
 
 states:
   initializing:

@@ -16,12 +16,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from backend.domain.models import SubsystemConfig, SubsystemInfo, SubsystemState
 
 logger = logging.getLogger(__name__)
+
+# Completion reports flow subsystem -> orchestrator over the /status topics.
+# When the local subsystem SM mirrors such a report it fires these events
+# locally, and they must NOT be re-published as commands.
+REPORT_EVENTS = frozenset({"complete", "init_complete"})
 
 
 class SubsystemStateMachineError(Exception):
@@ -92,14 +98,37 @@ class SubsystemAdapter:
             self.error = error
 
     def fire_transition(self, event: str) -> str:
-        """Fire a transition on the subsystem's state machine.
+        """Fire a transition on the subsystem's state machine (BOUNDARY).
+
+        The subsystem SM is the boundary layer between internal events and
+        external MQTT communication: every successful transition publishes
+        the command to automata/subsystem/<name>/event, so the (simulated or
+        real) subsystem receives it and acts on it. Completion reports
+        (complete / init_complete) are excluded: they flow the other way,
+        over the /status topic.
 
         Returns the new state name.
         Raises SubsystemStateMachineError if the transition is invalid.
         """
         if self.state_machine is None:
             raise SubsystemStateMachineError(f"No state machine for subsystem '{self.name}'")
-        return self.state_machine.fire(event, None)
+        new_state = self.state_machine.fire(event, None)
+        if event not in REPORT_EVENTS:
+            topic = f"automata/subsystem/{self.name}/event"
+            self.mqtt_client.publish(
+                topic,
+                {
+                    "event": event,
+                    "source": "orchestrator",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                qos=1,
+            )
+            logger.info(
+                "[Boundary] Subsystem '%s' command '%s' -> %s (MQTT '%s')",
+                self.name, event, new_state, topic,
+            )
+        return new_state
 
     def send_command(self, command: str, payload: Optional[Dict[str, Any]] = None) -> None:
         topic = f"automata/subsystem/{self.name}/command"
@@ -142,6 +171,10 @@ class SubsystemAdapterFactory:
                 required=cfg.required,
                 metadata=cfg.metadata,
                 state_machine_path=state_machine_path,
+                # Until the first status report arrives over MQTT the
+                # subsystem's real state is unknown – report it as offline
+                # (the readiness gate must not pass on an unconfirmed state).
+                state=SubsystemState.OFFLINE,
             )
 
             # Load the state machine if the YAML file exists

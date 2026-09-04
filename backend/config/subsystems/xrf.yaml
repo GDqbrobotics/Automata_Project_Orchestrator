@@ -7,6 +7,10 @@ initial_state: initializing
 required: true
 metadata:
   description: "Micro-X-ray fluorescence spectrometer"
+  # Simulation timings (seconds) used by backend/simulation/xrf_sim.py
+  init_duration: 1.5
+  work_durations:
+    measuring: 6.0
 
 states:
   initializing:

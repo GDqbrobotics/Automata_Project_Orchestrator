@@ -7,6 +7,10 @@ initial_state: initializing
 required: false
 metadata:
   description: "Cloud storage for digital twin records"
+  # Simulation timings (seconds) used by backend/simulation/cloud_database_sim.py
+  init_duration: 1.5
+  work_durations:
+    uploading: 2.0
 
 states:
   initializing:

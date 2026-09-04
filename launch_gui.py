@@ -49,6 +49,27 @@ logging.basicConfig(
 logger = logging.getLogger("launch_gui")
 
 
+def start_pipe_drainers(proc: subprocess.Popen) -> None:
+    """Drain a child process's stdout/stderr in background threads.
+
+    Undrained pipes fill up (64 KB) and BLOCK the child on its next write.
+    A blocked mosquitto broker stops processing messages entirely, which
+    would freeze the whole simulated pipeline mid-run.
+    """
+    import threading
+
+    def _drain(stream) -> None:
+        try:
+            for _ in iter(lambda: stream.readline(), b""):
+                pass
+        except Exception:
+            pass
+
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            threading.Thread(target=_drain, args=(stream,), daemon=True).start()
+
+
 def start_mosquitto_broker(port: int = 1883) -> subprocess.Popen:
     """Start mosquitto broker in the background."""
     import tempfile
@@ -59,11 +80,13 @@ def start_mosquitto_broker(port: int = 1883) -> subprocess.Popen:
     conf_file.flush()
     conf_file.close()
 
+    # No -v: verbose mode logs every publish and would fill the pipe buffer.
     proc = subprocess.Popen(
-        ["mosquitto", "-c", conf_file.name, "-v"],
+        ["mosquitto", "-c", conf_file.name],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    start_pipe_drainers(proc)
 
     # Wait for broker to start
     import paho.mqtt.client as mqtt
@@ -83,6 +106,51 @@ def start_mosquitto_broker(port: int = 1883) -> subprocess.Popen:
     proc.kill()
     os.unlink(conf_file.name)
     raise RuntimeError("Failed to start mosquitto broker")
+
+
+# One simulated process per subsystem (backend/simulation/<name>_sim.py).
+# Each process runs the subsystem's own state machine (the same YAML the
+# orchestrator uses) and communicates with the orchestrator exclusively
+# over MQTT – identical to how the real subsystems will behave.
+SIMULATED_SUBSYSTEMS = [
+    "vision",
+    "robot_first",
+    "robot_second",
+    "rotating_platform",
+    "imaging_3di_hsi",
+    "xrf",
+    "raman",
+    "ai_analysis",
+    "cloud_database",
+]
+
+
+def start_subsystem_simulators(
+    broker_host: str = "localhost",
+    broker_port: int = 1883,
+    num_objects: int = 3,
+) -> list[subprocess.Popen]:
+    """Start one simulated subsystem process per subsystem (simulation mode)."""
+    procs: list[subprocess.Popen] = []
+    sim_dir = project_root / "backend" / "simulation"
+    for name in SIMULATED_SUBSYSTEMS:
+        cmd = [
+            sys.executable, str(sim_dir / f"{name}_sim.py"),
+            "--broker", broker_host,
+            "--port", str(broker_port),
+        ]
+        if name == "vision":
+            cmd.extend(["--num-objects", str(num_objects)])
+        logger.info("Starting simulated subsystem: %s", name)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(project_root),
+        )
+        start_pipe_drainers(proc)
+        procs.append(proc)
+    return procs
 
 
 def start_backend(
@@ -116,6 +184,7 @@ def start_backend(
         stderr=subprocess.PIPE,
         cwd=str(project_root),
     )
+    start_pipe_drainers(proc)
     return proc
 
 
@@ -138,6 +207,7 @@ def start_frontend(ws_port: int = 8080) -> subprocess.Popen:
         cwd=str(project_root / "frontend"),
         env=env,
     )
+    start_pipe_drainers(proc)
     return proc
 
 
@@ -186,6 +256,15 @@ def main() -> None:
         broker_proc = start_mosquitto_broker(args.mqtt_port)
         processes.append(broker_proc)
         
+        # Start simulated subsystem processes (simulation mode only)
+        if args.simulation:
+            processes.extend(start_subsystem_simulators(
+                broker_host=args.broker,
+                broker_port=args.mqtt_port,
+                num_objects=args.num_objects,
+            ))
+            time.sleep(0.5)
+        
         # Start backend
         backend_proc = start_backend(
             broker_host=args.broker,
@@ -211,7 +290,10 @@ def main() -> None:
         logger.info("  Backend WebSocket: ws://localhost:%d", args.ws_port)
         logger.info("  MQTT broker: localhost:%d", args.mqtt_port)
         if args.simulation:
-            logger.info("  Simulation mode: %d objects", args.num_objects)
+            logger.info(
+                "  Simulation mode: %d objects (%d simulated subsystem processes)",
+                args.num_objects, len(SIMULATED_SUBSYSTEMS),
+            )
         logger.info("=" * 60)
         logger.info("Press Ctrl+C to stop all services")
         

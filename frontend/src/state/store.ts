@@ -153,6 +153,8 @@ export function reduceState(state: UiState, msg: unknown): UiState {
           name,
           state: newState,
           ready: newState === 'ready',
+          state_description:
+            (d.state_description as string) || existing.state_description || '',
         } as SubsystemStatus,
       };
       logs.push({

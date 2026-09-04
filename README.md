@@ -85,14 +85,48 @@ backend/
 ├── orchestrator/
 │   ├── workflow.py           # Main orchestrator (event routing, command handling)
 │   ├── object_state_machines.py  # Per-object state machine manager
-│   └── simulation.py         # Simulation mode
+│   └── pipeline.py           # Pipeline controller (object flow through the 2-disk platform)
 ├── services/
 │   └── frontend_server.py    # WebSocket server for frontend
+├── simulation/               # Simulated subsystems: one process each, MQTT-only
+│   ├── subsystem_sim.py      # Generic simulated subsystem (same YAML as the real one)
+│   ├── robot_first_sim.py
+│   ├── rotating_platform_sim.py
+│   ├── vision_sim.py
+│   ├── imaging_3di_hsi_sim.py
+│   ├── xrf_sim.py
+│   ├── raman_sim.py
+│   ├── ai_analysis_sim.py
+│   ├── robot_second_sim.py
+│   └── cloud_database_sim.py
 ├── state/
 │   └── state_machine.py      # MQTT-agnostic state machine engine
 └── simulation_test.py        # End-to-end test suite
 frontend/                       # TypeScript/React frontend
 launch_gui.py                   # Unified launcher
+```
+
+## Simulation mode
+
+In simulation mode each subsystem is simulated as an **individual process**
+(`backend/simulation/<name>_sim.py`) that loads the *same* YAML state machine
+the orchestrator uses and communicates with it **exclusively over MQTT** –
+identical to how the real hardware subsystems will behave:
+
+- commands flow `orchestrator → automata/subsystem/<name>/event`
+  (published by the subsystem adapter on every state-machine transition),
+- status reports flow `automata/subsystem/<name>/status → orchestrator`
+  (on every state change + heartbeat),
+- the vision system reports the detected box objects on
+  `automata/subsystem/vision/response`.
+
+The orchestrator treats simulated and real subsystems the same way; the
+`PipelineController` drives the object flow (2 disk slots, 1 end effector,
+coupled platform rotations) purely from the status reports. Work durations
+are declared in each subsystem YAML (`metadata.work_durations`).
+
+```bash
+python launch_gui.py --simulation --num-objects 5   # starts broker + 9 sim processes + backend + frontend
 ```
 
 ## State Machine Layers
@@ -110,13 +144,16 @@ Events:
 ### 2. Object State Machine (`object.yaml`)
 
 Manages per-object analysis workflow:
-- `identified_in_box` → `moving_to_disk` → `HSI_3DI_analysis` → ... → `object_analyzed`
+- `identified_in_box` → `waiting_for_disk` → `moving_to_disk` → `HSI_3DI_analysis` → ... → `object_analyzed`
+
+Objects wait in `waiting_for_disk` (still in the box) until a disk slot is
+free – the platform holds at most 2 objects and robot 1 carries at most 1.
 
 Events are scoped to target specific subsystems:
 - `robot_first/pick` → triggers robot_first subsystem
-- `imaging_3di_hsi/capture` → triggers imaging subsystem
-- `xrf/measure` → triggers XRF subsystem
-- `raman/measure` → triggers Raman subsystem
+- `imaging_3di_hsi/capture` + `robot_first/measure_hsi_3d` → object placed: imaging starts and robot 1 holds the imaging tool
+- `rotating_platform/rotate_to_second` / `rotate_to_first` → triggers the platform
+- `xrf/measure`, `raman/measure` → trigger the analyzers
 - `cloud_database/upload` → triggers cloud upload
 
 ### 3. Subsystem State Machines (per-subsystem YAML files)

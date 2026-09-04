@@ -14,6 +14,7 @@ export interface ObjectStateStyle {
 /** Default object state display order (mirrors object.yaml). */
 export const DEFAULT_STATE_ORDER: string[] = [
   'identified_in_box',
+  'waiting_for_disk',
   'moving_to_disk',
   'HSI_3DI_analysis',
   'object_going_second_position',
@@ -23,16 +24,22 @@ export const DEFAULT_STATE_ORDER: string[] = [
   'object_analyzed',
 ];
 
-/** Default color class mapping for object states. */
+/**
+ * Default color class mapping for object states.
+ *
+ * Color names map to the CSS classes .object-state.state-<color> defined
+ * in index.html.
+ */
 export const DEFAULT_STATE_COLORS: Record<string, string> = {
-  identified_in_box: 'gray',
-  moving_to_disk: 'blue',
-  HSI_3DI_analysis: 'purple',
-  'object_going_second_position': 'cyan',
-  XRF_RAMAN_analysis: 'orange',
-  'object_going_first_position': 'cyan',
-  moving_to_box: 'blue',
-  object_analyzed: 'green',
+  identified_in_box: 'identified',
+  waiting_for_disk: 'waiting',
+  moving_to_disk: 'moving',
+  HSI_3DI_analysis: 'imaging',
+  'object_going_second_position': 'rotating',
+  XRF_RAMAN_analysis: 'measuring',
+  'object_going_first_position': 'rotating',
+  moving_to_box: 'moving',
+  object_analyzed: 'analyzed',
 };
 
 /**

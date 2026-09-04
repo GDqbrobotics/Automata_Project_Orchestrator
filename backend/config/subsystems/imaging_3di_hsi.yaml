@@ -7,6 +7,10 @@ initial_state: initializing
 required: true
 metadata:
   description: "3D imaging and hyperspectral imaging modules"
+  # Simulation timings (seconds) used by backend/simulation/imaging_3di_hsi_sim.py
+  init_duration: 1.5
+  work_durations:
+    capturing: 4.0
 
 states:
   initializing:

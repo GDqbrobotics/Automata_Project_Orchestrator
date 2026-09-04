@@ -8,6 +8,10 @@ required: true
 metadata:
   description: "RGB-D camera for object detection and ID creation"
   hardware: "Intel RealSense D455"
+  # Simulation timings (seconds) used by backend/simulation/vision_sim.py
+  init_duration: 1.5
+  work_durations:
+    capturing: 3.0
 
 states:
   initializing:

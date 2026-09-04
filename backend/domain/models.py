@@ -26,10 +26,12 @@ class SubsystemState(str, enum.Enum):
     BUSY = "busy"
     OFFLINE = "offline"
     ERROR = "error"
+    STOPPED = "stopped"
 
 
 class ObjectState(str, enum.Enum):
     IDENTIFIED = "identified_in_box"
+    WAITING_FOR_DISK = "waiting_for_disk"
     MOVING_TO_DISK = "moving_to_disk"
     HSI_3DI_ANALYSIS = "HSI_3DI_analysis"
     GOING_SECOND_POSITION = "object_going_second_position"
