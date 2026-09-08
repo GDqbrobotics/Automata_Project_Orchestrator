@@ -45,6 +45,12 @@ class FrontendServer:
         self._thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
         self._workflow_display_config: Dict[str, Any] | None = None
+        # State machine graph definitions (subsystem + object) sent with
+        # every status broadcast, so the frontend can render them.
+        self._state_machine_defs: Dict[str, Any] | None = None
+        # Last full-status payload, replayed to newly connected clients so a
+        # (re)connecting UI immediately gets state + SM definitions.
+        self._last_status_payload: Dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Registration
@@ -68,6 +74,15 @@ class FrontendServer:
         async with self._lock:
             self._connected_clients.add(websocket)
         logger.info("Frontend client connected (total: %d)", len(self._connected_clients))
+
+        # Replay the last full status (workflow state, subsystems, objects
+        # and state machine definitions) so a fresh/reconnecting client does
+        # not have to wait for the next state change or press Refresh.
+        if self._last_status_payload is not None:
+            try:
+                await websocket.send(json.dumps(self._last_status_payload))
+            except Exception:
+                pass
 
         try:
             async for raw in websocket:
@@ -125,6 +140,9 @@ class FrontendServer:
             logger.debug("Including subsystem_config in broadcast (%d subsystems)", len(self._subsystem_config))
         else:
             logger.debug("subsystem_config is None, not including in broadcast")
+        # Include state machine graph definitions (subsystem + object SMs)
+        if self._state_machine_defs is not None:
+            status_dict.update(self._state_machine_defs)
         # Include any extra details (e.g. object workflow state order/colors)
         if extra_details:
             status_dict.update(extra_details)
@@ -133,6 +151,7 @@ class FrontendServer:
             event_type=BackendEvent.WORKFLOW_STATE_CHANGED.value,
             details=status_dict,
         ).to_dict()
+        self._last_status_payload = payload
         # Capture clients list while holding thread-safe lock
         with self._broadcast_lock:
             clients = list(self._connected_clients)
@@ -155,6 +174,27 @@ class FrontendServer:
         """Set the subsystem configuration to broadcast with status updates."""
         self._subsystem_config = config_list
         logger.info("Subsystem config set: %d subsystems", len(config_list))
+
+    def set_state_machine_definitions(
+        self,
+        subsystem_defs: Dict[str, Dict[str, Any]],
+        object_def: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Set state machine graph definitions to broadcast with status.
+
+        The definitions come from the same YAML files that drive the
+        engines (subsystem adapters + object blueprint), so the frontend
+        always renders the actual machine, not a hardcoded copy.
+        """
+        self._state_machine_defs = {
+            "subsystem_state_machines": subsystem_defs,
+            "object_state_machine": object_def,
+        }
+        logger.info(
+            "State machine definitions set: %d subsystems, object=%s",
+            len(subsystem_defs),
+            "yes" if object_def else "no",
+        )
 
     def set_workflow_display_config(
         self,

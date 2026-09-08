@@ -1,6 +1,8 @@
 import type { FrontendMessage, WorkflowCommand, WorkflowStateType } from '../contracts.js';
 import { FrontendClient } from '../api/client.js';
 import { createInitialState, reduceState } from '../state/store.js';
+import { StateMachineModal } from './state-machine-modal.js';
+import type { ModalData, ModalKind } from './state-machine-modal.js';
 import {
   buildStateStyles,
   getObjectStateIndex,
@@ -19,10 +21,13 @@ export class App {
   private client: FrontendClient;
   private state = createInitialState();
   private onStateChange?: (state: WorkflowStateType) => void;
+  private detailModal: StateMachineModal;
+  private detailRef: { kind: ModalKind; id: string } | null = null;
 
   constructor(config: AppConfig = {}) {
     this.client = new FrontendClient(config.wsUrl || 'ws://localhost:8080');
     this.onStateChange = config.onStateChange;
+    this.detailModal = new StateMachineModal();
   }
 
   start(): void {
@@ -66,6 +71,57 @@ export class App {
     this.updateConnectionIndicator();
     this.updateEventLog();
     this.updateWorkflowMessage();
+    // Keep the state machine inspector live while it is open
+    if (this.detailRef) {
+      this.detailModal.update(this.buildDetailData(this.detailRef.kind, this.detailRef.id));
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // State machine inspector (subsystem / object detail modal)
+  // ------------------------------------------------------------------
+  openDetail(kind: ModalKind, id: string): void {
+    this.detailRef = { kind, id };
+    this.detailModal.open(this.buildDetailData(kind, id), () => {
+      this.detailRef = null;
+    });
+  }
+
+  private buildDetailData(kind: ModalKind, id: string): ModalData {
+    if (kind === 'subsystem') {
+      const info = this.state.subsystems[id];
+      const cfg = this.state.subsystemsConfig.find((c) => c.name === id);
+      const def = this.state.subsystemStateMachines[id] || null;
+      const rawState = info?.state || null;
+      const currentState = rawState && def && def.states[rawState] ? rawState : null;
+      return {
+        kind,
+        id,
+        title: cfg?.display_name || id,
+        subtitle: `subsystem · ${id}${cfg?.type ? ` · ${cfg.type}` : ''}`,
+        def,
+        currentState,
+        stateDescription:
+          (currentState && def?.states[currentState]?.description) ||
+          (info?.state_description || ''),
+        subsystemMessages: this.state.subsystemMessages[id] || [],
+      };
+    }
+    const obj = this.state.objects.find((o) => o.object_id === id);
+    const def = this.state.objectStateMachine;
+    const rawState = obj?.state || null;
+    const currentState = rawState && def && def.states[rawState] ? rawState : null;
+    return {
+      kind,
+      id,
+      title: id,
+      subtitle: `object · ${rawState || 'unknown state'}`,
+      def,
+      currentState,
+      stateDescription:
+        obj?.state_description || (currentState && def?.states[currentState]?.description) || '',
+      objectMessages: this.state.objectMessages[id] || [],
+    };
   }
 
   /** Cached state styles, built from config or defaults. */
@@ -153,6 +209,9 @@ export class App {
         <div class="subsystem-state ${stateClass}">${stateText}</div>
         ${descriptionHtml}
       `;
+      card.style.cursor = 'pointer';
+      card.title = 'Click to view state machine and MQTT traffic';
+      card.addEventListener('click', () => this.openDetail('subsystem', name));
       grid.appendChild(card);
     }
   }
@@ -234,6 +293,9 @@ export class App {
           <span class="object-transitions">${transitionCount} transitions</span>
         </div>
       `;
+      card.style.cursor = 'pointer';
+      card.title = 'Click to view state machine and internal messages';
+      card.addEventListener('click', () => this.openDetail('object', obj.object_id));
       grid.appendChild(card);
     }
   }

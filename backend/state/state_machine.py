@@ -82,6 +82,28 @@ class StateMachineConfig:
             states=states,
         )
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the state machine definition (for the frontend).
+
+        Returns a plain dict describing the full graph (states, their
+        descriptions and transitions) so the UI can render it without
+        needing access to the YAML files.
+        """
+        return {
+            "name": self.name,
+            "initial_state": self.initial_state,
+            "states": {
+                state_name: {
+                    "description": state.description,
+                    "transitions": [
+                        {"event": t.event, "target": t.target}
+                        for t in state.transitions
+                    ],
+                }
+                for state_name, state in self.states.items()
+            },
+        }
+
 
 def _parse_subsystem_prefix(name: str) -> tuple[str, str]:
     """Parse a scoped name like 'robot_first/measure_request'.

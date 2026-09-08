@@ -164,6 +164,27 @@ Each subsystem has its own state machine with states like:
 
 **Important**: Subsystem SMs only use `log_event` actions. MQTT publishing is handled automatically by the orchestrator's boundary layer callback when events are fired.
 
+## State Machine Inspector (GUI)
+
+Click any **subsystem card** or **object card** to open an inspector window
+with:
+
+- a **graphical view of the state machine** — rendered from the same YAML
+  the backend engines run on, with the **current state enlightened**
+  (hover a state to highlight its transitions),
+- a **live message feed**:
+  - subsystems → MQTT messages **sent** to the subsystem (commands on
+    `automata/subsystem/<name>/event`) and **received** from it (status
+    reports / responses), with repeated heartbeats collapsed into a ×N badge;
+  - objects → **internal messages**: every state transition and the scoped
+    events it fires (targeting a specific subsystem, the internal pipeline,
+    or all subsystems).
+
+The state machine definitions and message traffic are streamed over the
+existing WebSocket (events `subsystem_message`, `object_message` and
+`messages_cleared`); the definitions travel inside every status broadcast,
+so the view always matches the actual machine.
+
 ## Configuration Files
 
 ### workflow.yaml

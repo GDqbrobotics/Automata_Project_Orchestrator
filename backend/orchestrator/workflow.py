@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -140,6 +141,11 @@ class WorkflowOrchestrator:
         )
         self.adapters: Dict[str, SubsystemAdapter] = self.adapter_factory.get_all()
 
+        # Record every MQTT publish on the boundary for the frontend's
+        # message inspector (subsystem detail modal).
+        for _name, _adapter in self.adapters.items():
+            _adapter.on_mqtt_publish = self._make_publish_recorder(_name)
+
         # Note: the subsystem -> MQTT boundary is owned by the adapters
         # (SubsystemAdapter.fire_transition publishes every command to
         # automata/subsystem/<name>/event).
@@ -180,6 +186,12 @@ class WorkflowOrchestrator:
         # ─── MQTT Message Dispatcher ───
         self.mqtt._on_message = self._on_mqtt_message
         self._subsystem_callbacks: Dict[str, Callable] = {}
+
+        # Object internal-event messages fired during the in-progress
+        # transition. They are flushed by fire_object_transition() together
+        # with the transition record, so the frontend shows the transition
+        # first and then the events it fired (not interleaved out of order).
+        self._object_event_buffer: Dict[str, List[Dict[str, Any]]] = {}
 
         # ─── Pipeline Controller ───
         # Orchestrates the object flow (PROJECT_CONTEXT workflow). It is
@@ -323,11 +335,10 @@ class WorkflowOrchestrator:
         handle them locally (e.g. freezing the ongoing work).
         """
         for name in self.adapters:
-            self.mqtt.publish(
-                f"{TOPIC_SUBSYSTEM}/{name}/event",
-                {"event": command, "source": "orchestrator"},
-                qos=1,
-            )
+            topic = f"{TOPIC_SUBSYSTEM}/{name}/event"
+            payload = {"event": command, "source": "orchestrator"}
+            self.mqtt.publish(topic, payload, qos=1)
+            self._fire_subsystem_message(name, "sent", topic, payload)
 
     # ------------------------------------------------------------------
     # Object Event Handler
@@ -350,6 +361,23 @@ class WorkflowOrchestrator:
             object_id, event_name,
         )
         scope, local_event = _parse_subsystem_prefix(event_name)
+
+        # Record the internal message for the frontend inspector. It is
+        # buffered and flushed by fire_object_transition() after the
+        # transition record (see _object_event_buffer).
+        target = (
+            "pipeline (internal)"
+            if scope == "workflow"
+            else (scope if scope else "all subsystems (broadcast)")
+        )
+        self._object_event_buffer.setdefault(object_id, []).append({
+            "object_id": object_id,
+            "kind": "event",
+            "event": event_name,
+            "target": target,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
         if scope == "workflow":
             # Internal pipeline coordination – consumed by the controller.
             # NOTE: this runs while the orchestrator lock is held (object
@@ -478,6 +506,9 @@ class WorkflowOrchestrator:
         self._status.progress = 0
         self._status.current_object = None
         self._status.objects = []
+        self._object_event_buffer.clear()
+        # Clear the frontend message inspector history (subsystem + object)
+        self._fire_frontend_event(BackendEvent.MESSAGES_CLEARED.value, {})
         logger.info("Workflow state reset: cleared objects and progress")
 
     def _start_workflow_immediately(self) -> None:
@@ -524,6 +555,7 @@ class WorkflowOrchestrator:
         """Remove an object state machine instance."""
         with self._lock:
             self.object_manager.remove_object(object_id)
+            self._object_event_buffer.pop(object_id, None)
         logger.info("Removed object state machine: %s", object_id)
 
         self._fire_frontend_event(
@@ -546,6 +578,24 @@ class WorkflowOrchestrator:
                 BackendEvent.OBJECT_STATE_CHANGED.value,
                 {"object_id": object_id, "new_state": new_state},
             )
+            # Object message inspector: the transition first, then the
+            # internal events the transition fired (buffered by
+            # _on_object_event while the engine ran its event actions).
+            record = self.object_manager.get_last_transition(object_id)
+            if record:
+                self._fire_frontend_event(
+                    BackendEvent.OBJECT_MESSAGE.value,
+                    {
+                        "object_id": object_id,
+                        "kind": "transition",
+                        "from": record.get("from"),
+                        "to": record.get("to"),
+                        "event": record.get("event"),
+                        "timestamp": record.get("timestamp"),
+                    },
+                )
+            for msg in self._object_event_buffer.pop(object_id, []):
+                self._fire_frontend_event(BackendEvent.OBJECT_MESSAGE.value, msg)
             self._broadcast_objects()
 
             if new_state == "object_analyzed":
@@ -600,6 +650,13 @@ class WorkflowOrchestrator:
             data = payload.decode()
 
         logger.info("[Orchestrator] MQTT dispatch %s -> %s", topic_str, data)
+
+        # Record incoming subsystem traffic for the frontend message
+        # inspector (status reports, responses, ...).
+        if topic_str.startswith(f"{TOPIC_SUBSYSTEM}/"):
+            parts = topic_str.split("/")
+            if len(parts) >= 4 and parts[2] in self.adapters:
+                self._fire_subsystem_message(parts[2], "received", topic_str, data)
 
         # Match against registered subsystem callbacks
         for pattern, callback in self._subsystem_callbacks.items():
@@ -855,6 +912,43 @@ class WorkflowOrchestrator:
         ).to_dict()
         self.frontend.broadcast(payload)
 
+    def _make_publish_recorder(
+        self, subsystem_name: str
+    ) -> Callable[[str, Any], None]:
+        """Build the on_mqtt_publish observer for a subsystem adapter.
+
+        The adapter calls it for every MQTT publish on its topics
+        (fire_transition commands, send_command), so this is the single
+        choke point that records 'sent' traffic for the frontend.
+        """
+        def _record(topic: str, payload: Any) -> None:
+            self._fire_subsystem_message(subsystem_name, "sent", topic, payload)
+
+        return _record
+
+    def _fire_subsystem_message(
+        self,
+        subsystem_name: str,
+        direction: str,
+        topic: str,
+        payload: Any,
+    ) -> None:
+        """Broadcast one MQTT message of a subsystem to the frontend.
+
+        direction is 'sent' (orchestrator -> subsystem) or 'received'
+        (subsystem -> orchestrator).
+        """
+        self._fire_frontend_event(
+            BackendEvent.SUBSYSTEM_MESSAGE.value,
+            {
+                "subsystem": subsystem_name,
+                "direction": direction,
+                "topic": topic,
+                "payload": payload,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
     def _get_status(self) -> WorkflowStatus:
         with self._lock:
             self._status.objects = [
@@ -1091,6 +1185,16 @@ class WorkflowOrchestrator:
         self.frontend.set_subsystem_config(
             [cfg.to_dict() for cfg in self.subsystems_config]
         )
+        # State machine graph definitions for the frontend inspector modal
+        # (subsystem SMs + object blueprint) — the same YAML the engines run.
+        self.frontend.set_state_machine_definitions(
+            {
+                name: adapter.state_machine.config.to_dict()
+                for name, adapter in self.adapters.items()
+                if adapter.state_machine is not None
+            },
+            self.object_manager.config.to_dict(),
+        )
         # Send object workflow display config (state order, colors and
         # per-workflow-state messages) to the frontend
         self.frontend.set_workflow_display_config(
@@ -1099,10 +1203,9 @@ class WorkflowOrchestrator:
             self._global_config.workflow_state_messages,
         )
 
-        self._fire_frontend_event(
-            BackendEvent.WORKFLOW_STATE_CHANGED.value,
-            {"new_state": "idle", "source": "orchestrator_start"},
-        )
+        # Full status broadcast (includes the SM definitions) so clients
+        # that are connected right away get the complete picture.
+        self.frontend.broadcast_with_display_config(self._status)
         if self._use_simulation:
             logger.info("Simulation mode enabled")
         logger.info("Workflow orchestrator started")

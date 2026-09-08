@@ -67,6 +67,10 @@ class BackendEvent(str, enum.Enum):
     OBJECT_STATE_CHANGED = "object_state_changed"
     OBJECT_ADDED = "object_added"
     OBJECT_REMOVED = "object_removed"
+    # Message traffic for the state-machine inspector modal:
+    SUBSYSTEM_MESSAGE = "subsystem_message"    # MQTT sent to / received from a subsystem
+    OBJECT_MESSAGE = "object_message"          # internal messages of one object's SM
+    MESSAGES_CLEARED = "messages_cleared"      # history reset (workflow reset)
 
 
 @dataclass

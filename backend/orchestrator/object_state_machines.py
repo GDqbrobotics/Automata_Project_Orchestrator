@@ -203,6 +203,16 @@ class ObjectStateMachines:
                     result.append(info)
             return result
 
+    def get_last_transition(self, object_id: str) -> Optional[Dict[str, Any]]:
+        """Get the most recent transition record for an object.
+
+        Returns a dict with keys from/to/event/timestamp, or None if the
+        object has not transitioned yet (or is unknown).
+        """
+        with self._lock:
+            logs = self._transition_logs.get(object_id, [])
+            return dict(logs[-1]) if logs else None
+
     def get_available_transitions(self, object_id: str) -> Dict[str, str]:
         """Get available transitions for an object's state machine."""
         with self._lock:

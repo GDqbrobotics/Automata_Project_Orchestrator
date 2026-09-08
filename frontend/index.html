@@ -364,6 +364,232 @@
       color: var(--text-muted);
       margin-bottom: 6px;
     }
+
+    /* Clickable detail cards */
+    .subsystem-card, .object-card {
+      cursor: pointer;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .subsystem-card:hover, .object-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+
+    /* ─── State machine inspector modal ─── */
+    .sm-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: rgba(5, 7, 12, 0.72);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(2px);
+    }
+    .sm-overlay.open { display: flex; }
+
+    .sm-modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: min(1080px, 94vw);
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+      overflow: hidden;
+    }
+
+    .sm-modal-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sm-modal-title { display: flex; flex-direction: column; min-width: 0; }
+    .sm-modal-name { font-size: 1.05rem; font-weight: 700; }
+    .sm-modal-sub { font-size: 0.75rem; color: var(--text-muted); }
+
+    .sm-modal-state {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .sm-modal-state-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+    }
+    .sm-modal-state-value {
+      font-size: 0.85rem;
+      font-weight: 700;
+      padding: 3px 12px;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #fff;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .sm-modal-state-value.unknown {
+      background: var(--surface2);
+      color: var(--text-muted);
+    }
+    .sm-modal-state-desc {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      max-width: 300px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .sm-modal-close {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      font-size: 1rem;
+      line-height: 1;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .sm-modal-close:hover { color: var(--text); border-color: var(--accent); }
+
+    .sm-modal-graph-wrap {
+      overflow: auto;
+      padding: 14px 18px 6px;
+      background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,0.05) 1px, transparent 0);
+      background-size: 22px 22px;
+    }
+    .sm-modal-graph { min-width: min-content; }
+    .sm-empty { color: var(--text-muted); font-size: 0.85rem; padding: 30px; text-align: center; }
+
+    .sm-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding: 8px 18px 12px;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+    }
+    .sm-legend .lg {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 3px;
+      margin-right: 5px;
+      vertical-align: -1px;
+    }
+    .sm-legend .lg-current { background: var(--accent); }
+    .sm-legend .lg-initial { background: var(--success); border-radius: 50%; }
+    .sm-legend .lg-scoped { background: var(--accent); height: 3px; width: 16px; border-radius: 2px; }
+    .sm-legend .lg-internal { background: #777; height: 3px; width: 16px; border-radius: 2px; }
+
+    .sm-modal-feed-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 18px;
+      border-top: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 0.85rem;
+    }
+    .sm-modal-feed-count { font-size: 0.7rem; color: var(--text-muted); font-weight: 400; }
+
+    .sm-modal-feed {
+      overflow-y: auto;
+      max-height: 220px;
+      padding: 8px 18px 14px;
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 0.75rem;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .sm-feed-empty { color: var(--text-muted); text-align: center; padding: 18px; font-style: italic; }
+
+    .sm-msg { padding: 5px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.06); }
+    .sm-msg-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .sm-msg-dir { font-weight: 700; }
+    .sm-msg.sent .sm-msg-dir { color: var(--success); }
+    .sm-msg.received .sm-msg-dir { color: var(--accent); }
+    .sm-msg-topic { color: var(--text); opacity: 0.85; }
+    .sm-msg-count { color: var(--warning); font-weight: 700; }
+    .sm-msg-time { margin-left: auto; color: var(--text-muted); }
+    .sm-msg-time-first { margin-left: 0; }
+    .sm-msg-payload {
+      margin-top: 2px;
+      padding-left: 14px;
+      color: var(--text-muted);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* object internal messages */
+    .om-states { color: var(--text); font-weight: 600; }
+    .om-arrow { color: var(--accent); }
+    .om-event { color: var(--accent); }
+    .om-event.evt-internal { color: #999; }
+    .om-event.evt-plain { color: var(--text-muted); }
+    .sm-msg.om-transition .om-event { color: var(--warning); }
+    .om-target { color: var(--text-muted); }
+
+    /* graph SVG */
+    .sm-graph { display: block; }
+    .sm-node-rect { fill: var(--surface2); stroke: var(--border); stroke-width: 1.2; }
+    .sm-node { cursor: pointer; }
+    .sm-node:hover .sm-node-rect { stroke: var(--accent); }
+    .sm-node-current .sm-node-rect {
+      fill: var(--accent);
+      stroke: var(--accent-hover);
+      stroke-width: 2;
+    }
+    .sm-halo { fill: var(--accent); opacity: 0; pointer-events: none; }
+    .sm-node-current .sm-halo {
+      opacity: 0.3;
+      animation: sm-pulse 2s ease-in-out infinite;
+    }
+    @keyframes sm-pulse {
+      0%, 100% { opacity: 0.15; }
+      50% { opacity: 0.42; }
+    }
+    .sm-node-text {
+      fill: var(--text);
+      font-size: 11px;
+      font-weight: 600;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      pointer-events: none;
+    }
+    .sm-node-current .sm-node-text { fill: #fff; }
+    .sm-initial-dot { fill: var(--success); }
+    .sm-initial-line { stroke: var(--success); stroke-width: 1.5; }
+
+    .sm-edge path { fill: none; stroke-width: 1.4; }
+    .sm-edge-plain path { stroke: var(--text-muted); }
+    .sm-edge-scoped path { stroke: var(--accent); }
+    .sm-edge-internal path { stroke: #777; stroke-dasharray: 5 4; }
+    #sm-arrow-plain path { fill: var(--text-muted); }
+    #sm-arrow-scoped path { fill: var(--accent); }
+    #sm-arrow-internal path { fill: #777; }
+    .sm-edge text {
+      font-size: 9.5px;
+      font-family: 'Consolas', 'Monaco', monospace;
+      paint-order: stroke;
+      stroke: var(--surface);
+      stroke-width: 3px;
+    }
+    .sm-edge-plain text { fill: var(--text-muted); }
+    .sm-edge-scoped text { fill: var(--accent-hover); }
+    .sm-edge-internal text { fill: #999; }
+    .sm-edge-dim { opacity: 0.22; }
+    .sm-edge-hl path { stroke-width: 2.4; }
   </style>
 </head>
 <body>

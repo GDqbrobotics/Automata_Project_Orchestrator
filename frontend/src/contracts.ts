@@ -16,7 +16,10 @@ export type WorkflowEvent =
   | 'progress_updated'
   | 'object_state_changed'
   | 'object_added'
-  | 'object_removed';
+  | 'object_removed'
+  | 'subsystem_message'
+  | 'object_message'
+  | 'messages_cleared';
 
 export type WorkflowStateType =
   | 'idle'
@@ -66,6 +69,49 @@ export interface ObjectInfo {
   created: string;
   last_state_change: string;
   transitions: Array<{ from: string; to: string; event: string; timestamp: string }>;
+}
+
+/** One transition edge in a state machine definition (from YAML). */
+export interface SmTransition {
+  event: string;
+  target: string;
+}
+
+/** One state in a state machine definition (from YAML). */
+export interface SmStateDef {
+  description: string;
+  transitions: SmTransition[];
+}
+
+/** Full state machine graph definition, as serialized by the backend. */
+export interface StateMachineDef {
+  name: string;
+  initial_state: string;
+  states: Record<string, SmStateDef>;
+}
+
+/** One MQTT message seen on a subsystem's topics. */
+export interface SubsystemMessage {
+  direction: 'sent' | 'received';
+  topic: string;
+  payload: unknown;
+  timestamp: string;
+  /** Consecutive-duplicate count (e.g. repeated heartbeats). */
+  count?: number;
+}
+
+/** One internal message of an object's state machine. */
+export interface ObjectMessage {
+  kind: 'transition' | 'event';
+  /** kind=transition: source state */
+  from?: string;
+  /** kind=transition: target state */
+  to?: string;
+  /** The event name (transition event, or fired scoped event). */
+  event: string;
+  /** kind=event: where the fired event went (subsystem / pipeline / broadcast). */
+  target?: string;
+  timestamp: string;
 }
 
 export interface FrontendMessage {

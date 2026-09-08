@@ -4,8 +4,14 @@ import type {
   SubsystemStatus,
   SubsystemConfig,
   ObjectInfo,
+  StateMachineDef,
+  SubsystemMessage,
+  ObjectMessage,
 } from '../contracts.js';
 import { getStateMessage } from '../config/state-messages.js';
+
+/** Max messages kept per subsystem / object in the inspector history. */
+const MESSAGE_HISTORY_LIMIT = 100;
 
 export interface UiState {
   workflowState: WorkflowStateType;
@@ -24,6 +30,14 @@ export interface UiState {
   objectStateColors: Record<string, string>;
   /** Workflow state display messages, sent by backend from global.yaml */
   workflowStateMessages: Record<string, string>;
+  /** Subsystem state machine graph definitions (for the inspector modal). */
+  subsystemStateMachines: Record<string, StateMachineDef>;
+  /** Object state machine graph definition (shared blueprint). */
+  objectStateMachine: StateMachineDef | null;
+  /** Recent MQTT messages per subsystem (sent/received). */
+  subsystemMessages: Record<string, SubsystemMessage[]>;
+  /** Recent internal messages per object (transitions + fired events). */
+  objectMessages: Record<string, ObjectMessage[]>;
   logs: Array<{ time: string; source: string; message: string; level: 'info' | 'error' | 'success' | 'warning' }>;
 }
 
@@ -47,6 +61,10 @@ export function createInitialState(): UiState {
     objectStateOrder: [],
     objectStateColors: {},
     workflowStateMessages: {},
+    subsystemStateMachines: {},
+    objectStateMachine: null,
+    subsystemMessages: {},
+    objectMessages: {},
     logs: [],
   };
 }
@@ -86,13 +104,18 @@ export function reduceState(state: UiState, msg: unknown): UiState {
 
   if (m.event === 'workflow_state_changed' && m.details) {
     const d = m.details as Record<string, unknown>;
-    if (d.new_state) {
-      const newState = d.new_state as WorkflowStateType;
+    // Incremental events carry new_state; full status broadcasts (and the
+    // replay sent to a (re)connecting client) carry state.
+    const wsState = d.new_state || d.state;
+    if (wsState) {
+      const newState = wsState as WorkflowStateType;
+      if (newState !== state.workflowState) {
+        logs.push({ time: now(), source: 'workflow', message: `State → ${newState}`, level: 'info' });
+      }
       updated.workflowState = newState;
       // The backend does not send a display message; derive it so the
       // stored message never degrades to an empty string.
       updated.message = getStateMessage(newState, state.error || undefined);
-      logs.push({ time: now(), source: 'workflow', message: `State → ${newState}`, level: 'info' });
     }
     // Subsystem config may be included in the details
     if (d.subsystems_config && Array.isArray(d.subsystems_config)) {
@@ -209,11 +232,25 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (d.state_messages && typeof d.state_messages === 'object') {
       updated.workflowStateMessages = d.state_messages as Record<string, string>;
     }
+    // State machine graph definitions (inspector modal)
+    if (d.subsystem_state_machines && typeof d.subsystem_state_machines === 'object') {
+      updated.subsystemStateMachines = d.subsystem_state_machines as Record<string, StateMachineDef>;
+    }
+    if (d.object_state_machine && typeof d.object_state_machine === 'object') {
+      updated.objectStateMachine = d.object_state_machine as StateMachineDef;
+    }
   }
 
   // Handle top-level status updates (broadcast_status payload)
   if (m.state) {
-    const s = m as unknown as WorkflowStatus & { subsystems_config?: SubsystemConfig[]; objects?: ObjectInfo[]; state_order?: string[]; state_colors?: Record<string, string> };
+    const s = m as unknown as WorkflowStatus & {
+      subsystems_config?: SubsystemConfig[];
+      objects?: ObjectInfo[];
+      state_order?: string[];
+      state_colors?: Record<string, string>;
+      subsystem_state_machines?: Record<string, StateMachineDef>;
+      object_state_machine?: StateMachineDef;
+    };
     updated.workflowState = s.state;
     updated.progress = s.progress;
     updated.totalObjects = s.total_objects;
@@ -248,6 +285,13 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     }
     if (s.state_colors && typeof s.state_colors === 'object') {
       updated.objectStateColors = s.state_colors as Record<string, string>;
+    }
+    // State machine graph definitions from top-level payload
+    if (s.subsystem_state_machines && typeof s.subsystem_state_machines === 'object') {
+      updated.subsystemStateMachines = s.subsystem_state_machines as Record<string, StateMachineDef>;
+    }
+    if (s.object_state_machine && typeof s.object_state_machine === 'object') {
+      updated.objectStateMachine = s.object_state_machine as StateMachineDef;
     }
   }
 
@@ -312,6 +356,11 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     const objectId = d.object_id as string;
     if (objectId) {
       updated.objects = updated.objects.filter(o => o.object_id !== objectId);
+      if (objectId in updated.objectMessages) {
+        const rest = { ...updated.objectMessages };
+        delete rest[objectId];
+        updated.objectMessages = rest;
+      }
       logs.push({
         time: now(),
         source: 'object',
@@ -319,6 +368,66 @@ export function reduceState(state: UiState, msg: unknown): UiState {
         level: 'warning',
       });
     }
+  }
+
+  // Handle subsystem MQTT message traffic (inspector modal feed)
+  if (m.event === 'subsystem_message' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const name = d.subsystem as string;
+    if (name) {
+      const list = [...(updated.subsystemMessages[name] || [])];
+      const msg: SubsystemMessage = {
+        direction: (d.direction as 'sent' | 'received') || 'received',
+        topic: (d.topic as string) || '',
+        payload: d.payload,
+        timestamp: (d.timestamp as string) || now(),
+      };
+      // Collapse consecutive duplicates (e.g. status heartbeats with an
+      // unchanged payload): bump the counter instead of flooding the feed.
+      const last = list[list.length - 1];
+      if (
+        last &&
+        last.direction === msg.direction &&
+        last.topic === msg.topic &&
+        JSON.stringify(last.payload) === JSON.stringify(msg.payload)
+      ) {
+        last.count = (last.count || 1) + 1;
+        last.timestamp = msg.timestamp;
+      } else {
+        list.push(msg);
+      }
+      if (list.length > MESSAGE_HISTORY_LIMIT) {
+        list.splice(0, list.length - MESSAGE_HISTORY_LIMIT);
+      }
+      updated.subsystemMessages = { ...updated.subsystemMessages, [name]: list };
+    }
+  }
+
+  // Handle object internal messages (inspector modal feed)
+  if (m.event === 'object_message' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const objectId = d.object_id as string;
+    if (objectId) {
+      const list = [...(updated.objectMessages[objectId] || [])];
+      list.push({
+        kind: (d.kind as 'transition' | 'event') || 'transition',
+        from: d.from as string | undefined,
+        to: d.to as string | undefined,
+        event: (d.event as string) || '',
+        target: d.target as string | undefined,
+        timestamp: (d.timestamp as string) || now(),
+      });
+      if (list.length > MESSAGE_HISTORY_LIMIT) {
+        list.splice(0, list.length - MESSAGE_HISTORY_LIMIT);
+      }
+      updated.objectMessages = { ...updated.objectMessages, [objectId]: list };
+    }
+  }
+
+  // Handle message-history clear (workflow reset)
+  if (m.event === 'messages_cleared') {
+    updated.subsystemMessages = {};
+    updated.objectMessages = {};
   }
 
   // Trim logs

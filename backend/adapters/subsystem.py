@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.domain.models import SubsystemConfig, SubsystemInfo, SubsystemState
 
@@ -57,6 +57,10 @@ class SubsystemAdapter:
     error: Optional[str] = None
     state_machine: Any = None  # StateMachineEngine instance
     state_machine_path: Optional[str] = None
+    # Optional observer for every MQTT publish the adapter performs on this
+    # subsystem's topics (used by the orchestrator to feed the frontend's
+    # message inspector). Called with (topic, payload).
+    on_mqtt_publish: Optional[Callable[[str, Any], None]] = None
 
     @property
     def info(self) -> SubsystemInfo:
@@ -115,24 +119,25 @@ class SubsystemAdapter:
         new_state = self.state_machine.fire(event, None)
         if event not in REPORT_EVENTS:
             topic = f"automata/subsystem/{self.name}/event"
-            self.mqtt_client.publish(
-                topic,
-                {
-                    "event": event,
-                    "source": "orchestrator",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                qos=1,
-            )
+            payload = {
+                "event": event,
+                "source": "orchestrator",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self.mqtt_client.publish(topic, payload, qos=1)
             logger.info(
                 "[Boundary] Subsystem '%s' command '%s' -> %s (MQTT '%s')",
                 self.name, event, new_state, topic,
             )
+            if self.on_mqtt_publish:
+                self.on_mqtt_publish(topic, payload)
         return new_state
 
     def send_command(self, command: str, payload: Optional[Dict[str, Any]] = None) -> None:
         topic = f"automata/subsystem/{self.name}/command"
         self.mqtt_client.publish(topic, payload or {})
+        if self.on_mqtt_publish:
+            self.on_mqtt_publish(topic, payload or {})
 
     def is_ready(self) -> bool:
         return self.state == SubsystemState.READY
