@@ -6,7 +6,7 @@ The AUTOMATA GUI Orchestrator is the operator-facing control system for the AUTO
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Frontend (TypeScript/React)                                     │
+│  Frontend (TypeScript/Vite)                                      │
 │  - Operator-facing UI                                            │
 │  - WebSocket communication                                       │
 └──────────────────────────────┬──────────────────────────────────┘
@@ -102,7 +102,16 @@ backend/
 ├── state/
 │   └── state_machine.py      # MQTT-agnostic state machine engine
 └── simulation_test.py        # End-to-end test suite
-frontend/                       # TypeScript/React frontend
+frontend/                       # TypeScript frontend (Vite, no framework)
+├── index.html                  # App shell (structure only, no CSS/JS)
+└── src/
+    ├── index.ts                # Entry: wires App to DOM buttons
+    ├── contracts.ts            # Typed message contracts (mirror backend)
+    ├── api/client.ts           # WebSocket client
+    ├── state/store.ts          # Reducer: WS events → UI state
+    ├── config/                 # Button rules, object styles, state messages
+    ├── styles/app.css          # All UI styles (design tokens + layout)
+    └── ui/                     # App shell, SM graph, inspector modal
 launch_gui.py                   # Unified launcher
 ```
 

@@ -65,37 +65,6 @@ export function buildStateStyles(
 }
 
 /**
- * Get the color class for a given object state.
- *
- * @param state - The object state name
- * @param stateOrder - Optional state order (defaults to DEFAULT_STATE_ORDER)
- * @param stateColors - Optional color map (defaults to DEFAULT_STATE_COLORS)
- * @returns The CSS color class name
- */
-export function getStateColor(
-  state: string,
-  stateOrder?: string[],
-  stateColors?: Record<string, string>,
-): string {
-  const styles = buildStateStyles(stateOrder, stateColors);
-  return styles[state]?.colorClass || 'gray';
-}
-
-/**
- * Get the step index (0-based) for a given object state.
- *
- * @param state - The object state name
- * @param stateOrder - Optional state order (defaults to DEFAULT_STATE_ORDER)
- * @returns The step index, or -1 if the state is not in the order
- */
-export function getObjectStateIndex(
-  state: string,
-  stateOrder: string[] = DEFAULT_STATE_ORDER,
-): number {
-  return stateOrder.indexOf(state);
-}
-
-/**
  * Get the total number of steps in the object workflow.
  *
  * @param stateOrder - Optional state order (defaults to DEFAULT_STATE_ORDER)

@@ -44,6 +44,11 @@ class FrontendServer:
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
+        # Startup handshake between start() and the server thread: the
+        # thread signals that the bind attempt finished (success or error)
+        # so a failed bind is surfaced loudly instead of dying silently.
+        self._startup_done: Optional[threading.Event] = None
+        self._start_error: Optional[Exception] = None
         self._workflow_display_config: Dict[str, Any] | None = None
         # State machine graph definitions (subsystem + object) sent with
         # every status broadcast, so the frontend can render them.
@@ -239,23 +244,41 @@ class FrontendServer:
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """Start the WebSocket server in a background thread."""
+        """Start the WebSocket server in a background thread.
+
+        Raises RuntimeError if the server cannot bind (e.g. the port is
+        already in use). Deliberately NO reuse_port: a second listener on
+        the same port would make the kernel load-balance operator
+        connections across two orchestrator instances with divergent
+        state (a silent "process swamp").
+        """
         self._shutdown_event.clear()
+        self._start_error = None
+        self._startup_done = threading.Event()
         loop = asyncio.new_event_loop()
         self._event_loop = loop
 
         async def _run() -> None:
             # websockets 14.x API:
             # websockets.serve() returns a 'serve' object that needs to be awaited
-            # to get the actual Server instance.
-            serve_obj = websockets.serve(
-                self._ws_handler,
-                self.host,
-                self.port,
-                reuse_port=True,
-            )
-            self._server = await serve_obj
+            # to get the actual Server instance. The bind happens here.
+            try:
+                serve_obj = websockets.serve(
+                    self._ws_handler,
+                    self.host,
+                    self.port,
+                )
+                self._server = await serve_obj
+            except Exception as exc:
+                self._start_error = exc
+                self._startup_done.set()
+                logger.error(
+                    "Frontend server failed to bind ws://%s:%d: %s",
+                    self.host, self.port, exc,
+                )
+                return
             logger.info("Frontend server listening on ws://%s:%d", self.host, self.port)
+            self._startup_done.set()
             # Wait until the server is closed (by stop())
             await self._server.wait_closed()
 
@@ -264,6 +287,19 @@ class FrontendServer:
             daemon=False,
         )
         self._thread.start()
+
+        # Wait for the bind attempt to finish and fail loudly on error.
+        if not self._startup_done.wait(timeout=10):
+            raise RuntimeError(
+                f"Frontend server did not start within 10s on "
+                f"{self.host}:{self.port}"
+            )
+        if self._start_error is not None:
+            raise RuntimeError(
+                f"Frontend server could not start on {self.host}:{self.port} "
+                f"({self._start_error}). Is another orchestrator already "
+                "running? Stop it first or use a different port."
+            ) from self._start_error
 
     async def _shutdown_server(self) -> None:
         """Close the server and wait for all connections to drain.

@@ -4,677 +4,109 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AUTOMATA – GUI Orchestrator</title>
-  <style>
-    :root {
-      --bg: #0f1117;
-      --surface: #1a1d27;
-      --surface2: #252836;
-      --border: #333648;
-      --text: #e0e3eb;
-      --text-muted: #8a8fa8;
-      --accent: #5b8def;
-      --accent-hover: #7ba4ff;
-      --success: #4caf50;
-      --warning: #ff9800;
-      --error: #f44336;
-      --idle-color: #666;
-      --starting-color: #2196f3;
-      --running-color: #4caf50;
-      --paused-color: #ff9800;
-      --stopped-color: #666;
-      --completing-color: #9c27b0;
-      --error-color: #f44336;
-    }
-
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-
-    body {
-      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-    }
-
-    .app {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 20px;
-    }
-
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 16px 0;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 24px;
-    }
-
-    header h1 {
-      font-size: 1.5rem;
-      font-weight: 600;
-      letter-spacing: 0.5px;
-    }
-
-    header h1 span { color: var(--accent); }
-
-    .connection-indicator {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-size: 0.85rem;
-      background: var(--surface);
-      border: 1px solid var(--border);
-    }
-
-    .connection-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--error);
-    }
-
-    .connection-dot.connected { background: var(--success); }
-
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-    }
-
-    @media (max-width: 768px) {
-      .grid { grid-template-columns: 1fr; }
-    }
-
-    .panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      overflow: hidden;
-    }
-
-    .panel-header {
-      padding: 14px 18px;
-      border-bottom: 1px solid var(--border);
-      font-weight: 600;
-      font-size: 0.95rem;
-    }
-
-    .panel-body { padding: 18px; }
-
-    /* State display */
-    .state-display {
-      text-align: center;
-      padding: 30px 20px;
-    }
-
-    .state-badge {
-      display: inline-block;
-      padding: 10px 28px;
-      border-radius: 24px;
-      font-size: 1.2rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      background: var(--surface2);
-      color: var(--text-muted);
-    }
-
-    .state-badge.idle { background: var(--idle-color); color: #fff; }
-    .state-badge.starting { background: var(--starting-color); }
-    .state-badge.running { background: var(--running-color); }
-    .state-badge.paused { background: var(--paused-color); }
-    .state-badge.stopping { background: var(--warning); color: #000; }
-    .state-badge.stopped { background: var(--stopped-color); color: #fff; }
-    .state-badge.completing { background: var(--completing-color); }
-    .state-badge.error { background: var(--error-color); color: #fff; }
-
-    .workflow-message {
-      margin-top: 16px;
-      font-size: 0.9rem;
-      color: var(--text-muted);
-      min-height: 24px;
-    }
-
-    /* Progress bar */
-    .progress-section { margin-top: 20px; }
-
-    .progress-bar {
-      height: 8px;
-      background: var(--surface2);
-      border-radius: 4px;
-      overflow: hidden;
-      margin: 8px 0;
-    }
-
-    .progress-fill {
-      height: 100%;
-      background: var(--accent);
-      border-radius: 4px;
-      transition: width 0.5s ease;
-    }
-
-    .progress-label {
-      font-size: 0.85rem;
-      color: var(--text-muted);
-    }
-
-    /* Action buttons */
-    .actions {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-
-    .btn {
-      padding: 10px 20px;
-      border: none;
-      border-radius: 6px;
-      font-size: 0.9rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .btn:hover { opacity: 0.9; transform: translateY(-1px); }
-    .btn:active { transform: translateY(0); }
-    .btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-      transform: none;
-    }
-
-    .btn-primary { background: var(--accent); color: #fff; }
-    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
-    .btn-warning { background: var(--warning); color: #000; }
-    .btn-danger { background: var(--error); color: #fff; }
-    .btn-success { background: var(--success); color: #fff; }
-    .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
-
-    /* Subsystem list */
-    .subsystem-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-      gap: 10px;
-    }
-
-    .subsystem-card {
-      background: var(--surface2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 12px;
-      text-align: center;
-    }
-
-    .subsystem-name {
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      margin-bottom: 4px;
-    }
-
-    .subsystem-state {
-      font-size: 0.85rem;
-      font-weight: 600;
-      padding: 3px 10px;
-      border-radius: 12px;
-      display: inline-block;
-      margin-bottom: 4px;
-    }
-
-    .subsystem-state.ready { background: var(--success); color: #fff; }
-    .subsystem-state.busy { background: var(--accent); color: #fff; }
-    .subsystem-state.error { background: var(--error); color: #fff; }
-    .subsystem-state.offline { background: var(--surface); color: var(--text-muted); }
-    .subsystem-state.running { background: var(--accent); color: #fff; }
-    .subsystem-state.measuring { background: var(--accent); color: #fff; }
-    .subsystem-state.capturing { background: var(--accent); color: #fff; }
-    .subsystem-state.analyzing { background: var(--accent); color: #fff; }
-    .subsystem-state.uploading { background: var(--accent); color: #fff; }
-    .subsystem-state.picking { background: var(--accent); color: #fff; }
-    .subsystem-state.placing { background: var(--accent); color: #fff; }
-    .subsystem-state.returning { background: var(--accent); color: #fff; }
-    .subsystem-state.measuring_hsi_3d { background: #7c4dff; color: #fff; }
-    .subsystem-state.rotating { background: #00bcd4; color: #fff; }
-    .subsystem-state.using_xrf { background: #ff5722; color: #fff; }
-    .subsystem-state.using_raman { background: #ff5722; color: #fff; }
-    .subsystem-state.paused { background: var(--warning); color: #000; }
-    .subsystem-state.stopped { background: var(--surface); color: var(--text-muted); }
-    .subsystem-state.tool_changing { background: var(--warning); color: #000; }
-    .subsystem-state.initializing { background: var(--text-muted); color: #fff; }
-
-    .subsystem-state-desc {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      margin-top: 4px;
-      font-style: italic;
-    }
-
-    .required-badge {
-      color: var(--error);
-      font-weight: bold;
-      margin-left: 2px;
-    }
-
-    /* Object cards */
-    .object-card {
-      background: var(--surface2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 12px;
-      text-align: center;
-    }
-
-    .object-name {
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: var(--text);
-      margin-bottom: 4px;
-    }
-
-    .object-state {
-      font-size: 0.75rem;
-      font-weight: 600;
-      padding: 3px 10px;
-      border-radius: 12px;
-      display: inline-block;
-      margin-bottom: 4px;
-      text-transform: lowercase;
-    }
-
-    .object-state.state-identified { background: var(--text-muted); color: #fff; }
-    .object-state.state-waiting { background: var(--warning); color: #000; }
-    .object-state.state-moving { background: var(--accent); color: #fff; }
-    .object-state.state-imaging { background: #7c4dff; color: #fff; }
-    .object-state.state-rotating { background: #00bcd4; color: #fff; }
-    .object-state.state-measuring { background: #ff5722; color: #fff; }
-    .object-state.state-analyzed { background: var(--success); color: #fff; }
-
-    .object-state-desc {
-      font-size: 0.7rem;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-      font-style: italic;
-      min-height: 28px;
-    }
-
-    .object-progress {
-      display: flex;
-      justify-content: space-between;
-      font-size: 0.7rem;
-      color: var(--text-muted);
-      padding-top: 6px;
-      border-top: 1px solid var(--border);
-    }
-
-    .object-step { color: var(--accent); font-weight: 600; }
-    .object-transitions { opacity: 0.7; }
-
-    /* Event log */
-    .event-log {
-      max-height: 260px;
-      overflow-y: auto;
-      font-family: 'Consolas', 'Monaco', monospace;
-      font-size: 0.8rem;
-      line-height: 1.6;
-    }
-
-    .log-entry {
-      padding: 3px 0;
-      border-bottom: 1px solid rgba(255,255,255,0.05);
-    }
-
-    .log-time { color: var(--text-muted); margin-right: 8px; }
-    .log-source { color: var(--accent); margin-right: 8px; }
-    .log-msg { color: var(--text); }
-    .log-msg.error { color: var(--error); }
-    .log-msg.success { color: var(--success); }
-    .log-msg.warning { color: var(--warning); }
-
-    /* Object alias input */
-    .alias-section {
-      margin-top: 16px;
-      padding-top: 16px;
-      border-top: 1px solid var(--border);
-    }
-
-    .alias-input-group {
-      display: flex;
-      gap: 8px;
-    }
-
-    .alias-input {
-      flex: 1;
-      padding: 8px 12px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--surface2);
-      color: var(--text);
-      font-size: 0.9rem;
-    }
-
-    .alias-input:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-
-    .alias-label {
-      font-size: 0.85rem;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-    }
-
-    /* Clickable detail cards */
-    .subsystem-card, .object-card {
-      cursor: pointer;
-      transition: border-color 0.15s ease, transform 0.15s ease;
-    }
-    .subsystem-card:hover, .object-card:hover {
-      border-color: var(--accent);
-      transform: translateY(-1px);
-    }
-
-    /* ─── State machine inspector modal ─── */
-    .sm-overlay {
-      position: fixed;
-      inset: 0;
-      z-index: 100;
-      background: rgba(5, 7, 12, 0.72);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      backdrop-filter: blur(2px);
-    }
-    .sm-overlay.open { display: flex; }
-
-    .sm-modal {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      width: min(1080px, 94vw);
-      max-height: 90vh;
-      display: flex;
-      flex-direction: column;
-      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
-      overflow: hidden;
-    }
-
-    .sm-modal-header {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      padding: 14px 18px;
-      border-bottom: 1px solid var(--border);
-    }
-    .sm-modal-title { display: flex; flex-direction: column; min-width: 0; }
-    .sm-modal-name { font-size: 1.05rem; font-weight: 700; }
-    .sm-modal-sub { font-size: 0.75rem; color: var(--text-muted); }
-
-    .sm-modal-state {
-      margin-left: auto;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .sm-modal-state-label {
-      font-size: 0.68rem;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: var(--text-muted);
-    }
-    .sm-modal-state-value {
-      font-size: 0.85rem;
-      font-weight: 700;
-      padding: 3px 12px;
-      border-radius: 12px;
-      background: var(--accent);
-      color: #fff;
-      max-width: 220px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .sm-modal-state-value.unknown {
-      background: var(--surface2);
-      color: var(--text-muted);
-    }
-    .sm-modal-state-desc {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      max-width: 300px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .sm-modal-close {
-      background: none;
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-      width: 28px;
-      height: 28px;
-      border-radius: 6px;
-      font-size: 1rem;
-      line-height: 1;
-      cursor: pointer;
-      flex-shrink: 0;
-    }
-    .sm-modal-close:hover { color: var(--text); border-color: var(--accent); }
-
-    .sm-modal-graph-wrap {
-      overflow: auto;
-      padding: 14px 18px 6px;
-      background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,0.05) 1px, transparent 0);
-      background-size: 22px 22px;
-    }
-    .sm-modal-graph { min-width: min-content; }
-    .sm-empty { color: var(--text-muted); font-size: 0.85rem; padding: 30px; text-align: center; }
-
-    .sm-legend {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 16px;
-      padding: 8px 18px 12px;
-      font-size: 0.72rem;
-      color: var(--text-muted);
-    }
-    .sm-legend .lg {
-      display: inline-block;
-      width: 10px;
-      height: 10px;
-      border-radius: 3px;
-      margin-right: 5px;
-      vertical-align: -1px;
-    }
-    .sm-legend .lg-current { background: var(--accent); }
-    .sm-legend .lg-initial { background: var(--success); border-radius: 50%; }
-    .sm-legend .lg-scoped { background: var(--accent); height: 3px; width: 16px; border-radius: 2px; }
-    .sm-legend .lg-internal { background: #777; height: 3px; width: 16px; border-radius: 2px; }
-
-    .sm-modal-feed-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 10px 18px;
-      border-top: 1px solid var(--border);
-      font-weight: 600;
-      font-size: 0.85rem;
-    }
-    .sm-modal-feed-count { font-size: 0.7rem; color: var(--text-muted); font-weight: 400; }
-
-    .sm-modal-feed {
-      overflow-y: auto;
-      max-height: 220px;
-      padding: 8px 18px 14px;
-      font-family: 'Consolas', 'Monaco', monospace;
-      font-size: 0.75rem;
-      border-top: 1px solid var(--border);
-      background: var(--bg);
-    }
-    .sm-feed-empty { color: var(--text-muted); text-align: center; padding: 18px; font-style: italic; }
-
-    .sm-msg { padding: 5px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.06); }
-    .sm-msg-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-    .sm-msg-dir { font-weight: 700; }
-    .sm-msg.sent .sm-msg-dir { color: var(--success); }
-    .sm-msg.received .sm-msg-dir { color: var(--accent); }
-    .sm-msg-topic { color: var(--text); opacity: 0.85; }
-    .sm-msg-count { color: var(--warning); font-weight: 700; }
-    .sm-msg-time { margin-left: auto; color: var(--text-muted); }
-    .sm-msg-time-first { margin-left: 0; }
-    .sm-msg-payload {
-      margin-top: 2px;
-      padding-left: 14px;
-      color: var(--text-muted);
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-
-    /* object internal messages */
-    .om-states { color: var(--text); font-weight: 600; }
-    .om-arrow { color: var(--accent); }
-    .om-event { color: var(--accent); }
-    .om-event.evt-internal { color: #999; }
-    .om-event.evt-plain { color: var(--text-muted); }
-    .sm-msg.om-transition .om-event { color: var(--warning); }
-    .om-target { color: var(--text-muted); }
-
-    /* graph SVG */
-    .sm-graph { display: block; }
-    .sm-node-rect { fill: var(--surface2); stroke: var(--border); stroke-width: 1.2; }
-    .sm-node { cursor: pointer; }
-    .sm-node:hover .sm-node-rect { stroke: var(--accent); }
-    .sm-node-current .sm-node-rect {
-      fill: var(--accent);
-      stroke: var(--accent-hover);
-      stroke-width: 2;
-    }
-    .sm-halo { fill: var(--accent); opacity: 0; pointer-events: none; }
-    .sm-node-current .sm-halo {
-      opacity: 0.3;
-      animation: sm-pulse 2s ease-in-out infinite;
-    }
-    @keyframes sm-pulse {
-      0%, 100% { opacity: 0.15; }
-      50% { opacity: 0.42; }
-    }
-    .sm-node-text {
-      fill: var(--text);
-      font-size: 11px;
-      font-weight: 600;
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      pointer-events: none;
-    }
-    .sm-node-current .sm-node-text { fill: #fff; }
-    .sm-initial-dot { fill: var(--success); }
-    .sm-initial-line { stroke: var(--success); stroke-width: 1.5; }
-
-    .sm-edge path { fill: none; stroke-width: 1.4; }
-    .sm-edge-plain path { stroke: var(--text-muted); }
-    .sm-edge-scoped path { stroke: var(--accent); }
-    .sm-edge-internal path { stroke: #777; stroke-dasharray: 5 4; }
-    #sm-arrow-plain path { fill: var(--text-muted); }
-    #sm-arrow-scoped path { fill: var(--accent); }
-    #sm-arrow-internal path { fill: #777; }
-    .sm-edge text {
-      font-size: 9.5px;
-      font-family: 'Consolas', 'Monaco', monospace;
-      paint-order: stroke;
-      stroke: var(--surface);
-      stroke-width: 3px;
-    }
-    .sm-edge-plain text { fill: var(--text-muted); }
-    .sm-edge-scoped text { fill: var(--accent-hover); }
-    .sm-edge-internal text { fill: #999; }
-    .sm-edge-dim { opacity: 0.22; }
-    .sm-edge-hl path { stroke-width: 2.4; }
-  </style>
-  <script type="module" crossorigin src="/assets/index-BsoqRjtD.js"></script>
+  <script type="module" crossorigin src="/assets/index-DFQUlTwn.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-IqP-3Chi.css">
 </head>
 <body>
   <div class="app">
-    <header>
-      <h1><span>AUTOMATA</span> — GUI Orchestrator</h1>
-      <div class="connection-indicator">
-        <div class="connection-dot" id="connectionDot"></div>
-        <span id="connectionText">Disconnected</span>
+
+    <!-- ── Top bar ─────────────────────────────────────────────────── -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22">
+            <path d="M12 2 22 12 12 22 2 12Z" fill="none" stroke="currentColor" stroke-width="2" />
+            <circle cx="12" cy="12" r="3.2" fill="currentColor" />
+          </svg>
+        </span>
+        <h1>AUTOMATA <span>GUI Orchestrator</span></h1>
+      </div>
+      <div class="connection-indicator" role="status">
+        <span class="connection-dot" id="connectionDot"></span>
+        <span class="connection-text" id="connectionText">Disconnected</span>
       </div>
     </header>
 
-    <div class="grid">
-      <!-- Left column -->
-      <div class="left-column">
-        <!-- State panel -->
-        <div class="panel">
-          <div class="panel-header">Workflow State</div>
-          <div class="panel-body">
-            <div class="state-display">
-              <div class="state-badge idle" id="stateBadge">Idle</div>
-              <div class="workflow-message" id="workflowMessage">Waiting for operator input</div>
-            </div>
+    <!-- ── Control deck ────────────────────────────────────────────── -->
+    <section class="panel control-panel" aria-label="Workflow control">
+      <div class="control-state">
+        <div class="state-badge idle" id="stateBadge">idle</div>
+        <p class="workflow-message" id="workflowMessage">Waiting for operator input</p>
+      </div>
 
-            <div class="progress-section">
-              <div class="progress-label" id="progressLabel">Progress: 0 / 0</div>
-              <div class="progress-bar">
-                <div class="progress-fill" id="progressFill" style="width: 0%"></div>
-              </div>
-            </div>
-
-            <div class="alias-section">
-              <div class="alias-label">Assign alias ID (during workflow):</div>
-              <div class="alias-input-group">
-                <input type="text" class="alias-input" id="aliasInput" placeholder="Object ID → Alias" />
-                <button class="btn btn-secondary" id="aliasBtn">Assign</button>
-              </div>
-            </div>
-          </div>
+      <div class="control-progress">
+        <div class="progress-head">
+          <span class="progress-label" id="progressLabel">Progress: 0 / 0</span>
+          <span class="progress-pct" id="progressPct">0%</span>
         </div>
-
-        <!-- Actions panel -->
-        <div class="panel" style="margin-top: 20px;">
-          <div class="panel-header">Operator Actions</div>
-          <div class="panel-body">
-            <div class="actions">
-              <button class="btn btn-primary" id="btnStart">▶ Start Workflow</button>
-              <button class="btn btn-warning" id="btnPause" disabled>⏸ Pause</button>
-              <button class="btn btn-success" id="btnResume" disabled>▶ Resume</button>
-              <button class="btn btn-danger" id="btnStop">⏹ Stop</button>
-              <button class="btn btn-secondary" id="btnStatus">⟳ Refresh Status</button>
-              <button class="btn btn-secondary" id="btnReset">↺ Reset</button>
-            </div>
-          </div>
+        <div class="progress-bar" role="progressbar" aria-label="Workflow progress">
+          <div class="progress-fill" id="progressFill"></div>
         </div>
       </div>
 
-      <!-- Right column -->
-      <div class="right-column">
-        <!-- Subsystems panel -->
-        <div class="panel">
-          <div class="panel-header">Subsystems Status</div>
-          <div class="panel-body">
-            <div class="subsystem-grid" id="subsystemGrid"></div>
-          </div>
+      <div class="control-actions">
+        <div class="actions">
+          <button class="btn btn-primary" id="btnStart">▶ Start</button>
+          <button class="btn btn-warning" id="btnPause" disabled>⏸ Pause</button>
+          <button class="btn btn-success" id="btnResume" disabled>⏵ Resume</button>
+          <button class="btn btn-danger" id="btnStop">⏹ Stop</button>
         </div>
-
-        <!-- Objects panel -->
-        <div class="panel" style="margin-top: 20px;">
-          <div class="panel-header">Object Analysis Progress</div>
-          <div class="panel-body">
-            <div class="subsystem-grid" id="objectsGrid"></div>
-          </div>
-        </div>
-
-        <!-- Event log panel -->
-        <div class="panel" style="margin-top: 20px;">
-          <div class="panel-header">Event Log</div>
-          <div class="panel-body">
-            <div class="event-log" id="eventLog"></div>
-          </div>
+        <div class="actions actions-aux">
+          <button class="btn btn-ghost" id="btnReset" disabled>↺ Reset</button>
+          <button class="btn btn-ghost" id="btnStatus">⟳ Refresh status</button>
         </div>
       </div>
+
+      <div class="alias-row">
+        <label class="alias-label" for="aliasInput">Assign alias ID</label>
+        <div class="alias-input-group">
+          <input
+            type="text"
+            class="alias-input"
+            id="aliasInput"
+            placeholder="Object ID → Alias (e.g. OBJ_003 → AMPHORA_7)"
+            autocomplete="off"
+          />
+          <button class="btn btn-ghost" id="aliasBtn">Assign</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Objects + Subsystems ────────────────────────────────────── -->
+    <div class="mid">
+
+      <section class="panel objects-panel" aria-label="Object analysis progress">
+        <div class="panel-header">
+          <h2>Object analysis</h2>
+          <span class="panel-count" id="objectsCount">0 objects</span>
+        </div>
+        <div class="panel-body scroll-body">
+          <div class="object-grid" id="objectsGrid"></div>
+        </div>
+      </section>
+
+      <section class="panel subsystems-panel" aria-label="Subsystems status">
+        <div class="panel-header">
+          <h2>Subsystems</h2>
+          <span class="panel-count" id="subsystemsCount">0</span>
+        </div>
+        <div class="panel-body scroll-body">
+          <div class="subsystem-grid" id="subsystemGrid"></div>
+        </div>
+      </section>
+
     </div>
+
+    <!-- ── Event log ───────────────────────────────────────────────── -->
+    <section class="panel log-panel" aria-label="Event log">
+      <div class="panel-header">
+        <h2>Event log</h2>
+      </div>
+      <div class="panel-body log-body">
+        <div class="event-log" id="eventLog"></div>
+      </div>
+    </section>
+
   </div>
 
 </body>

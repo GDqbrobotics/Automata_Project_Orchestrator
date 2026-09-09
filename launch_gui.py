@@ -211,6 +211,30 @@ def start_frontend(ws_port: int = 8080) -> subprocess.Popen:
     return proc
 
 
+def check_ports_free(port_whats: dict) -> None:
+    """Refuse to start over an already running instance.
+
+    Without this guard, a second launch silently joins the first one's
+    environment (duplicate simulated subsystems publish to the same MQTT
+    topics, and the second backend would fail to bind the WS port),
+    leaving a confusing "process swamp".
+    """
+    import socket
+
+    for port, what in port_whats.items():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                logger.error(
+                    "%s is already running: port %d is in use.", what, port
+                )
+                logger.error(
+                    "Stop the existing instance first, or launch on "
+                    "different ports (--ws-port / --mqtt-port)."
+                )
+                raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Launch AUTOMATA GUI Orchestrator")
     parser.add_argument(
@@ -248,7 +272,15 @@ def main() -> None:
         help="Enable debug logging",
     )
     args = parser.parse_args()
-    
+
+    # Refuse to stack a second instance on top of a running one.
+    check_ports_free(
+        {
+            args.ws_port: "Another orchestrator",
+            3000: "Another frontend dev server",
+        }
+    )
+
     processes: list[subprocess.Popen] = []
     
     try:
