@@ -7,25 +7,24 @@ The operator will load the machine with a gridded box, where the samples are pla
 
 ## Design of the AUTOMATA machine
 
-Going a little bit further in the physical structure of the machine, it is composed  by an area where the box will be placed (with a camera); then a first robotic arm of Universal Robot with a costumized end effector for pick-and-place 3DI and HSI; then a rotating platform with 2 transparent disks; then a second robotic arm with a costumized end effector for integrating the XRF and Raman analyzers.
+Going a little bit further in the physical structure of the machine, it is composed  by an area where the box will be placed (with a camera); then a first robotic arm of with a costumized end effector for pick-and-place, XRF and Raman analysis; then a rotating platform with 2 transparent disks; then a second robotic arm with a costumized end effector for integrating the HSI and 3DI.
 
 ## The workflow is the following:
 
 1. Human operator loads the gridded box with samples into the machine.
 2. Vision system identify the objects, create IDs, create analyzing order.
 3. Box loop starts. 
-4. First Robot performs tool change to mount the gripper (if is not on mounted) and picks up the target object.
+4. First Robot and picks up the target object.
 5. The object is placed on the transparent disk in first position.
-6. The First Robot change end effector and performs 3DI and HSI on the object.
-7. An AI system uses that data in order to extrapolate interest points on the object for next puntual measurements.
-8. The platform rotated and the disk with the object arrives in the second position.
-9. Second Robot performs XRF measurements on the choosen points.
-10. Second Robot performs Raman measurements on the choosen points.
-11. Platform rotates again taking the disk with the object back in first position.
-12. First Robot after mounting the gripper, picks the object from disk and put it back in its original place inside box.
-13. Repeat untill all object in the box have been analyzed.
+6. The platform rotated and the disk with the object arrives in the second position.
+7. The Second Robot and performs 3DI and HSI on the object. {First Robot picks up the next object and put on the other transparent disk}
+8. An AI system uses that data in order to extrapolate interest points on the object for next puntual measurements.
+9. The platform rotated and the disk with the object goes back in the first position. {The next object on the other disk goes in second position}
+10. First Robot performs XRF and Raman measurements on the AI's choosen points. {The Second Robot performs 3DI and HSI on the other object}
+11. First Robot, picks the object from disk and put it back in its original place inside box and picks the next target object from the box.
+12. Repeat untill all object in the box have been analyzed.
 
-This workflow allows to cut time because first robot performs steps *12-4-5-6* in parallel with second robot performing steps *9-10*.
+This workflow allows to cut time because the 2 robots are working in parallel. This workflow has been organized in order that HSI and £DI are performed before XRF and Raman becouse this last two analysis are puntual and the points are decided after analyzing HSI and 3DI data. Also this split of duty between the 2 robots follows a timing logic: {XRF + Raman + 'Put back object in box' + 'Pick a new object from box'} has a similar execution time of {HSI + 3DI + 'AI point extrapolation'} 
 
 During the workflow the human operator can insert alias IDs from the GUI to the objects in the box, this IDs will be used for on the database in cloud (the machine is already working in the meanwhile with the automatically assigned IDs).
 After storage database IDs are confirmed, the data will be sent to the cloud for each object completed.
@@ -40,9 +39,9 @@ The sub-systems are:
 |---|---|---|---|
 | GUI orchestrator | Ubuntu PC, Touch screen | central GUI application, workflow orchestration, MQTT messaging | NodeJs |
 | Vision system | RGB-D camera, gridded box, lighting | object detection, ID creation, analysis order generation | Docker, Python application | 
-| First robotic arm | Universal Robot arm, custom end effector, gripper | pick-and-place, 3DI/HSI object handling, tool-change control | Docker, ROS2 nodes |
+| First robotic arm | Robot arm, custom end effector (gripper+XRF+Raman) | pick-and-place, XRF/Raman measurement positioning and execution | Docker, ROS2 nodes |
 | Rotating platform | motorized rotary stage, transparent disks | object indexing between measurement positions | Digital I/Os interface |
-| Second robotic arm | Universal Robot arm, custom end effector | XRF/Raman measurement positioning and execution | Docker, ROS2 nodes |
+| Second robotic arm | Robot arm, custom end effector (HSI + 3DI)| HSI and 3DI trajectory of scanning execution | Docker, ROS2 nodes |
 | XRF interface | XRF analyzer hardware | manage communication, trigger acquisition, and transfer data from XRF device | ? |
 | Raman interface | Raman analyzer hardware | manage communication, trigger acquisition, and transfer data from Raman device | ? |
 | 3DI/HSI interface | 3DI and HSI imaging modules | manage communication, synchronization, and data acquisition from 3DI/HSI devices | ? |

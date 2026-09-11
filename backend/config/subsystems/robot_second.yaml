@@ -1,17 +1,17 @@
-# Robot Arm 2 Subsystem Configuration (placeholder)
+# Robot Arm 2 Subsystem Configuration
 name: robot_second
 display_name: Robot Arm 2
 type: robot
 mqtt_topic: "automata/subsystem/{name}"
 initial_state: initializing
-required: false
+required: true
 metadata:
-  description: "Second Universal Robot arm (optional)"
+  description: "Second robot arm – 3DI/HSI scanning"
+  hardware: "Custom end effector (HSI + 3DI)"
   # Simulation timings (seconds) used by backend/simulation/robot_second_sim.py
   init_duration: 1.5
   work_durations:
-    using_xrf: 6.0
-    using_raman: 6.0
+    scanning_hsi_3d: 4.0
 
 states:
   initializing:
@@ -30,13 +30,8 @@ states:
   ready:
     description: "Robot is ready and idle"
     transitions:
-      - event: use_xrf
-        target: using_xrf
-        actions:
-          - log_event
-
-      - event: use_raman
-        target: using_raman
+      - event: scan_hsi_3d
+        target: scanning_hsi_3d
         actions:
           - log_event
 
@@ -50,26 +45,8 @@ states:
         actions:
           - log_event
 
-  using_xrf:
-    description: "Robot is using XRF"
-    transitions:
-      - event: complete
-        target: ready
-        actions:
-          - log_event
-
-      - event: stop
-        target: stopped
-        actions:
-          - log_event
-
-      - event: error
-        target: error
-        actions:
-          - log_event
-
-  using_raman:
-    description: "Robot is using Raman"
+  scanning_hsi_3d:
+    description: "Robot is executing the 3DI/HSI scan trajectory"
     transitions:
       - event: complete
         target: ready
@@ -91,6 +68,11 @@ states:
     transitions:
       - event: ready
         target: ready
+        actions:
+          - log_event
+
+      - event: scan_hsi_3d
+        target: scanning_hsi_3d
         actions:
           - log_event
 

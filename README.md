@@ -152,17 +152,20 @@ Events:
 
 ### 2. Object State Machine (`object.yaml`)
 
-Manages per-object analysis workflow:
-- `identified_in_box` → `waiting_for_disk` → `moving_to_disk` → `HSI_3DI_analysis` → ... → `object_analyzed`
+Manages per-object analysis workflow (imaging on the second disk position,
+XRF/Raman on the first one – robot 2 scans, robot 1 measures):
+- `identified_in_box` → `waiting_for_disk` → `moving_to_disk` → `object_going_second_position` → `HSI_3DI_analysis` → `object_going_first_position` → `XRF_RAMAN_analysis` → ... → `object_analyzed`
 
 Objects wait in `waiting_for_disk` (still in the box) until a disk slot is
 free – the platform holds at most 2 objects and robot 1 carries at most 1.
 
 Events are scoped to target specific subsystems:
 - `robot_first/pick` → triggers robot_first subsystem
-- `imaging_3di_hsi/capture` + `robot_first/measure_hsi_3d` → object placed: imaging starts and robot 1 holds the imaging tool
-- `rotating_platform/rotate_to_second` / `rotate_to_first` → triggers the platform
-- `xrf/measure`, `raman/measure` → trigger the analyzers
+- `workflow/rotation_requested_second` → object placed on the first disk: the pipeline requests the rotation to the imaging position
+- `imaging_3di_hsi/capture` + `robot_second/scan_hsi_3d` → object on the second disk: imaging starts
+- `ai_analysis/plan` + `workflow/rotation_requested_first` → imaging done: the AI plans the points and the rotation back is requested
+- `robot_first/measure_xrf_raman` + `xrf/measure` + `raman/measure` → object on the first disk: XRF/Raman start
+- `robot_first/return` → measurements done: robot 1 returns the object to the box
 - `cloud_database/upload` → triggers cloud upload
 
 ### 3. Subsystem State Machines (per-subsystem YAML files)
@@ -226,13 +229,14 @@ states:
 ### object.yaml
 ```yaml
 states:
-  HSI_3DI_analysis:
+  object_going_second_position:
     transitions:
-      - event: imaging_capture_complete
-        target: object_going_second_position
+      - event: platform_rotated_to_second
+        target: HSI_3DI_analysis
         actions:
           - log_event
-          - event: rotating_platform/rotate_to_second  # Scoped event
+          - event: imaging_3di_hsi/capture          # Scoped event
+          - event: robot_second/scan_hsi_3d         # Scoped event
 ```
 
 ### subsystem/robot_first.yaml

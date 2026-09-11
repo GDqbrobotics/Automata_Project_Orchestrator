@@ -6,14 +6,14 @@ mqtt_topic: "automata/subsystem/{name}"
 initial_state: initializing
 required: true
 metadata:
-  description: "First Universal Robot arm – pick-and-place and 3DI/HSI handling"
-  hardware: "UR5e with custom end effector"
+  description: "First robot arm – pick-and-place and XRF/Raman measurement"
+  hardware: "Custom end effector (gripper + XRF + Raman)"
   # Simulation timings (seconds) used by backend/simulation/robot_first_sim.py
   init_duration: 1.5
   work_durations:
     picking: 2.0
     placing: 2.0
-    measuring_hsi_3d: 4.0
+    measuring_xrf_raman: 6.0
     returning: 2.5
 
 states:
@@ -48,8 +48,8 @@ states:
         actions:
           - log_event
 
-      - event: measure_hsi_3d
-        target: measuring_hsi_3d
+      - event: measure_xrf_raman
+        target: measuring_xrf_raman
         actions:
           - log_event
 
@@ -117,14 +117,14 @@ states:
         actions:
           - log_event
 
-  measuring_hsi_3d:
-    description: "Robot is holding the imaging tool while 3DI/HSI is captured on the object"
+  measuring_xrf_raman:
+    description: "Robot is performing XRF and Raman measurements on the object"
     transitions:
       - event: complete
         target: ready
         actions:
           - log_event
-          
+
       - event: stop
         target: stopped
         actions:
@@ -153,8 +153,8 @@ states:
         actions:
           - log_event
 
-      - event: measure_hsi_3d
-        target: measuring_hsi_3d
+      - event: measure_xrf_raman
+        target: measuring_xrf_raman
         actions:
           - log_event
 

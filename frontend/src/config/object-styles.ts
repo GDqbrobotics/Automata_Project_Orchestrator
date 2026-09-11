@@ -16,10 +16,10 @@ export const DEFAULT_STATE_ORDER: string[] = [
   'identified_in_box',
   'waiting_for_disk',
   'moving_to_disk',
-  'HSI_3DI_analysis',
   'object_going_second_position',
-  'XRF_RAMAN_analysis',
+  'HSI_3DI_analysis',
   'object_going_first_position',
+  'XRF_RAMAN_analysis',
   'moving_to_box',
   'object_analyzed',
 ];

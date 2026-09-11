@@ -24,6 +24,13 @@ many objects outside the box at the same time):
 * a platform rotation moves BOTH disks at once, so it is only commanded
   when every occupied disk holds an object that finished its stage.
 
+Stage mapping (docs/PROJECT_CONTEXT.md workflow):
+
+* first disk position:  robot 1 – pick / place / XRF+Raman / return to box
+* second disk position: robot 2 – 3DI+HSI scan (imaging interface)
+* the AI plans the XRF/Raman points between imaging and measurement,
+  in parallel with the rotation back to the first position
+
 Threading: methods may be called from the MQTT callback thread, the
 WebSocket command thread, or re-entrantly from object-transition events.
 The controller lock is an RLock; ``on_object_workflow_event`` (called
@@ -42,18 +49,22 @@ logger = logging.getLogger(__name__)
 # Subsystem names
 VISION = "vision"
 ROBOT_FIRST = "robot_first"
+ROBOT_SECOND = "robot_second"
 ROTATING_PLATFORM = "rotating_platform"
 IMAGING_3DI_HSI = "imaging_3di_hsi"
 CLOUD_DB = "cloud_database"
-# Subsystems that work in parallel during the measurement stage
-MEASUREMENT_SUBSYSTEMS: Tuple[str, ...] = ("ai_analysis", "xrf", "raman", "robot_second")
+# Subsystems that work in parallel during the measurement stage on the
+# FIRST disk position (robot 1 + XRF/Raman analyzers). The AI joins the set
+# only while it is still planning the points (it starts in parallel with
+# the rotation back to the first position).
+MEASUREMENT_SUBSYSTEMS: Tuple[str, ...] = ("xrf", "raman", "robot_first", "ai_analysis")
 
 # Object states used for pipeline coordination (see object.yaml)
 OBJ_WAITING = "waiting_for_disk"            # in the box, queued
-OBJ_HSI = "HSI_3DI_analysis"                # on the first disk, being imaged
-OBJ_GOING_SECOND = "object_going_second_position"   # on the first disk, waiting for rotation
-OBJ_XRF_RAMAN = "XRF_RAMAN_analysis"        # on the second disk, being measured
-OBJ_GOING_FIRST = "object_going_first_position"     # on the second disk, waiting for rotation
+OBJ_GOING_SECOND = "object_going_second_position"   # on the first disk, waiting for rotation to imaging
+OBJ_HSI = "HSI_3DI_analysis"                # on the second disk, being imaged
+OBJ_GOING_FIRST = "object_going_first_position"     # on the second disk, waiting for rotation back to measurement
+OBJ_XRF_RAMAN = "XRF_RAMAN_analysis"        # on the first disk, being measured
 OBJ_MOVING_TO_BOX = "moving_to_box"         # on the first disk, waiting for return
 
 # Non-working subsystem states (a report into any other state is a work stage)
@@ -209,56 +220,81 @@ class PipelineController:
                 self._command(ROBOT_FIRST, "place")
                 self._robot_task = ("place", object_id)
             elif op == "place" and was_state == "placing":
-                # The object is on the first disk: start 3DI/HSI. The object
-                # transition also commands robot 1 to hold the imaging tool
-                # (measuring_hsi_3d) for the whole capture.
+                # The object is on the first disk: it waits there for the
+                # rotation to the second (imaging) position.
                 self._robot_task = None
-                if self._fire_object(object_id, "object_placed_on_disk"):
-                    self._imaging_object = object_id
-                    if self._sm_state(IMAGING_3DI_HSI) != "capturing":
-                        # Imaging subsystem unavailable: skip the stage so
-                        # the pipeline does not stall.
-                        logger.warning(
-                            "Pipeline: imaging not capturing – completing stage immediately"
-                        )
-                        self._imaging_object = None
-                        self._fire_object(object_id, "imaging_capture_complete")
+                self._fire_object(object_id, "object_placed_on_disk")
             elif op == "return" and was_state == "returning":
                 # The object is back in the box.
                 self._robot_task = None
                 if self._disk_first == object_id:
                     self._disk_first = None
                 self._fire_object(object_id, "object_returned_to_box")
-            # was_state == "measuring_hsi_3d": the robot simply released the
-            # imaging tool (runs in parallel with the imaging stage).
+            # (robot 1's XRF/Raman completion has no pick/place/return task
+            #  in flight and is counted as a measurement completion below)
+            return
 
-        elif name == IMAGING_3DI_HSI and was_state == "capturing" and self._imaging_object:
+        if name == IMAGING_3DI_HSI and was_state == "capturing" and self._imaging_object:
             object_id = self._imaging_object
             self._imaging_object = None
-            # -> object_going_second_position + rotation request
+            # -> object_going_first_position; the object transition plans
+            #    the measurement points (AI) and requests the rotation back.
+            #    Robot 2's scan completion is not tracked: the imaging
+            #    interface owns the data the AI needs.
             self._fire_object(object_id, "imaging_capture_complete")
+            return
 
-        elif name in MEASUREMENT_SUBSYSTEMS and self._measuring_object:
+        if name in MEASUREMENT_SUBSYSTEMS and self._measuring_object:
             self._measuring_pending.discard(name)
             if not self._measuring_pending:
-                object_id = self._measuring_object
-                self._measuring_object = None
-                # -> object_going_first_position + rotation request
-                self._fire_object(object_id, "measurements_complete")
+                self._complete_measurements(self._measuring_object)
+            return
 
-        elif name == ROTATING_PLATFORM and was_state == "rotating" and self._rotating:
+        if name == ROTATING_PLATFORM and was_state == "rotating" and self._rotating:
             self._finish_rotation()
 
+    def _complete_measurements(self, object_id: str) -> None:
+        """All measurement subsystems are done: send robot 1 back to the box.
+
+        The measurements_complete transition moves the object to
+        moving_to_box and commands robot 1 (robot_first/return); the task
+        is tracked here so the robot's completion releases the first disk
+        slot (robot 1 has no task in flight while measuring).
+        """
+        self._measuring_object = None
+        self._robot_task = ("return", object_id)
+        self._fire_object(object_id, "measurements_complete")
+
     def _finish_rotation(self) -> None:
-        """Apply the coupled disk swap and start the stages on both sides."""
+        """Apply the coupled disk swap and start the stages on both sides.
+
+        After the swap, the object that was on the first disk is on the
+        second (imaging) position, and the object that was on the second
+        disk is back on the first (XRF/Raman measurement) position.
+        """
         first, second = self._disk_first, self._disk_second
 
         if first is not None and self._obj_state(first) == OBJ_GOING_SECOND:
-            # -> XRF_RAMAN_analysis; the object transition commanded the
-            #    measurement subsystems. Wait for the ones that actually
-            #    entered their working state.
+            # -> HSI_3DI_analysis; the object transition commands the
+            #    imaging subsystem and robot 2's scan (second position).
             if self._fire_object(first, "platform_rotated_to_second"):
-                self._measuring_object = first
+                self._imaging_object = first
+                if self._sm_state(IMAGING_3DI_HSI) != "capturing":
+                    # Imaging subsystem unavailable: skip the stage so the
+                    # pipeline does not stall.
+                    logger.warning(
+                        "Pipeline: imaging not capturing – completing stage immediately"
+                    )
+                    self._imaging_object = None
+                    self._fire_object(first, "imaging_capture_complete")
+
+        if second is not None and self._obj_state(second) == OBJ_GOING_FIRST:
+            # -> XRF_RAMAN_analysis; the object transition commands robot 1
+            #    and the XRF/Raman analyzers (first position). Wait for the
+            #    ones that actually entered their working state (the AI is
+            #    included only if it is still planning the points).
+            if self._fire_object(second, "platform_rotated_to_first"):
+                self._measuring_object = second
                 self._measuring_pending = {
                     m for m in MEASUREMENT_SUBSYSTEMS
                     if (s := self._sm_state(m)) not in (None, *NON_WORK_STATES)
@@ -268,14 +304,7 @@ class PipelineController:
                         "Pipeline: no measurement subsystem active – "
                         "completing measurements immediately"
                     )
-                    self._measuring_object = None
-                    self._fire_object(first, "measurements_complete")
-
-        if second is not None and self._obj_state(second) == OBJ_GOING_FIRST:
-            # -> moving_to_box; the object transition commanded robot 1 to
-            #    pick the object back and return it to the box.
-            if self._fire_object(second, "platform_rotated_to_first"):
-                self._robot_task = ("return", second)
+                    self._complete_measurements(second)
 
         self._disk_first, self._disk_second = second, first
         self._rotating = False
@@ -310,12 +339,29 @@ class PipelineController:
         if self._phase != "pipeline":
             return
 
+        # Robot 1 performs the XRF/Raman stage: an object waiting on the
+        # second disk to come back (OBJ_GOING_FIRST) needs robot 1 the
+        # moment the rotation lands it on the first position, so robot 1
+        # must be free then (gate 1) and no new pick may be started in the
+        # meantime (gate 2).
+        second_waiting_for_measurement = (
+            self._disk_second is not None
+            and self._obj_state(self._disk_second) == OBJ_GOING_FIRST
+        )
+
         # 1. Pending platform rotation (both disks must be stable)
         if (
             self._rotation_requested
             and not self._rotating
             and self._sm_state(ROTATING_PLATFORM) == "ready"
             and self._disks_stable()
+            and not (
+                second_waiting_for_measurement
+                and (
+                    self._sm_state(ROBOT_FIRST) != "ready"
+                    or self._robot_task is not None
+                )
+            )
         ):
             target = (
                 "second"
@@ -329,11 +375,14 @@ class PipelineController:
             self._rotating = True
 
         # 2. Robot 1 dispatch: the next object leaves the box only when the
-        #    imaging position is free (2 disk slots, 1 end effector).
+        #    first disk position is free (2 disk slots, 1 end effector),
+        #    and never while the second-disk object is coming back for
+        #    XRF/Raman (robot 1 is needed there as soon as it lands).
         if (
             self._robot_task is None
             and self._sm_state(ROBOT_FIRST) == "ready"
             and self._disk_first is None
+            and not second_waiting_for_measurement
             and self._queue_pos < len(self._order)
         ):
             object_id = self._order[self._queue_pos]

@@ -23,50 +23,56 @@ states:
     description: Object is being moved from the box to the rotating platform disk
     transitions:
       - event: object_placed_on_disk
-        target: HSI_3DI_analysis
-        actions:
-          - log_event
-          - event: imaging_3di_hsi/capture
-          - event: robot_first/measure_hsi_3d
-
-  HSI_3DI_analysis:
-    description: 3D imaging and hyperspectral imaging capture is being performed
-    transitions:
-      - event: imaging_capture_complete
         target: object_going_second_position
         actions:
           - log_event
           # Rotation request to the pipeline controller (workflow/ scope is
-          # internal): the platform only rotates when BOTH disk positions
-          # are stable, so the actual rotating_platform command is issued by
-          # the orchestrator, not by this transition.
+          # internal): the platform rotates BOTH disks at once, so the
+          # actual rotating_platform command is issued by the orchestrator,
+          # not by this transition.
           - event: workflow/rotation_requested_second
 
   object_going_second_position:
-    description: Object waits on the first disk for a platform rotation to the second measurement position
+    description: Object waits on the first disk for a platform rotation to the second imaging position (3DI/HSI is performed by robot 2)
     transitions:
       - event: platform_rotated_to_second
-        target: XRF_RAMAN_analysis
+        target: HSI_3DI_analysis
         actions:
           - log_event
-          - event: ai_analysis/plan
-          - event: xrf/measure
-          - event: raman/measure
-          - event: robot_second/use_xrf
+          - event: imaging_3di_hsi/capture
+          - event: robot_second/scan_hsi_3d
 
-  XRF_RAMAN_analysis:
-    description: XRF and Raman puntual measurements are being performed at AI-extracted points
+  HSI_3DI_analysis:
+    description: 3D imaging and hyperspectral imaging capture is being performed on the object (second position)
     transitions:
-      - event: measurements_complete
+      - event: imaging_capture_complete
         target: object_going_first_position
         actions:
           - log_event
+          # The AI plans the XRF/Raman points from the imaging data; it
+          # runs in parallel with the rotation back to the first position.
+          - event: ai_analysis/plan
+          # Rotation request to the pipeline controller (workflow/ scope is
+          # internal): the platform only rotates when BOTH disk positions
+          # are stable, so the actual rotating_platform command is issued
+          # by the orchestrator, not by this transition.
           - event: workflow/rotation_requested_first
 
   object_going_first_position:
-    description: Rotating platform is moving the object back to the first position
+    description: Object waits on the second disk for a platform rotation back to the first measurement position (XRF/Raman is performed by robot 1)
     transitions:
       - event: platform_rotated_to_first
+        target: XRF_RAMAN_analysis
+        actions:
+          - log_event
+          - event: robot_first/measure_xrf_raman
+          - event: xrf/measure
+          - event: raman/measure
+
+  XRF_RAMAN_analysis:
+    description: XRF and Raman puntual measurements are being performed at AI-extracted points (first position)
+    transitions:
+      - event: measurements_complete
         target: moving_to_box
         actions:
           - log_event
