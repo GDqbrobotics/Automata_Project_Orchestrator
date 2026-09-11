@@ -80,14 +80,24 @@ class FrontendServer:
             self._connected_clients.add(websocket)
         logger.info("Frontend client connected (total: %d)", len(self._connected_clients))
 
-        # Replay the last full status (workflow state, subsystems, objects
-        # and state machine definitions) so a fresh/reconnecting client does
-        # not have to wait for the next state change or press Refresh.
-        if self._last_status_payload is not None:
+        # Replay the current full status (workflow state, subsystems,
+        # objects and state machine definitions) so a fresh/reconnecting
+        # client does not have to wait for the next state change or press
+        # Refresh. Prefer a fresh broadcast over the cached payload: the
+        # cache only updates on full-status broadcasts, so a client joining
+        # in between would otherwise see stale subsystem states (e.g. the
+        # 'initializing' state from startup).
+        if self._status_callback is not None:
             try:
-                await websocket.send(json.dumps(self._last_status_payload))
+                # Sends to all clients, including the one just connected.
+                self.broadcast_with_display_config(self._status_callback())
             except Exception:
-                pass
+                logger.exception(
+                    "Fresh status replay failed, falling back to cache"
+                )
+                await self._replay_cached_status(websocket)
+        else:
+            await self._replay_cached_status(websocket)
 
         try:
             async for raw in websocket:
@@ -128,6 +138,14 @@ class FrontendServer:
         finally:
             async with self._lock:
                 self._connected_clients.discard(websocket)
+
+    async def _replay_cached_status(self, websocket: ServerConnection) -> None:
+        """Send the last cached full-status payload to one client."""
+        if self._last_status_payload is not None:
+            try:
+                await websocket.send(json.dumps(self._last_status_payload))
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Broadcasting state

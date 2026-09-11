@@ -302,6 +302,7 @@ class WorkflowOrchestrator:
                 "Subsystem '%s' transitioned: %s (event: %s)",
                 subsystem_name, new_state, event_name,
             )
+            self._refresh_subsystem_info(subsystem_name)
             # Update frontend with subsystem state change
             self._fire_frontend_event(
                 BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
@@ -328,6 +329,7 @@ class WorkflowOrchestrator:
             if adapter and adapter.state_machine:
                 try:
                     adapter.fire_transition(event_name)
+                    self._refresh_subsystem_info(cfg.name)
                 except StateMachineError:
                     # Some subsystems may not have a transition for this event
                     logger.debug(
@@ -425,6 +427,7 @@ class WorkflowOrchestrator:
             sm = adapter.state_machine
             if sm and sm.current_state == "stopped" and "ready" in sm.get_available_transitions():
                 adapter.fire_transition("ready")
+                self._refresh_subsystem_info(name)
 
         # If all required subsystems already report ready, enter running now;
         # otherwise the next status report over MQTT will trigger it.
@@ -774,6 +777,19 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     # Subsystem Status Updates
     # ------------------------------------------------------------------
+    def _refresh_subsystem_info(self, subsystem_name: str) -> None:
+        """Keep the full-status snapshot of a subsystem up to date.
+
+        _status.active_subsystems stores SubsystemInfo snapshots; every
+        full status broadcast re-sends them to the frontend. They must be
+        refreshed whenever the adapter's local state machine moves, or the
+        UI would flash stale states (e.g. 'initializing' – a state the SM
+        can never return to) on every broadcast.
+        """
+        adapter = self.adapters.get(subsystem_name)
+        if adapter is not None:
+            self._status.active_subsystems[subsystem_name] = adapter.info
+
     def _update_subsystem_status(
         self,
         subsystem_name: str,
@@ -798,6 +814,9 @@ class WorkflowOrchestrator:
         # so command gating works (e.g. the robot is 'complete' once it
         # reports ready).
         self._sync_subsystem_sm(subsystem_name, state_str, was_state)
+        # Keep the full-status snapshot in sync with the local SM (it is
+        # re-sent to the frontend on every status broadcast).
+        self._refresh_subsystem_info(subsystem_name)
 
         self._fire_frontend_event(
             BackendEvent.SUBSYSTEM_STATUS_UPDATED.value,
@@ -933,11 +952,7 @@ class WorkflowOrchestrator:
                 },
             )
 
-            if subsystem_name in self._status.active_subsystems:
-                info = self._status.active_subsystems[subsystem_name]
-                info.current_state = new_state
-                info.state_description = adapter._get_state_description()
-
+            self._refresh_subsystem_info(subsystem_name)
             self._check_workflow_state_on_subsystem_change(subsystem_name, new_state)
             return True
 
@@ -1127,10 +1142,7 @@ class WorkflowOrchestrator:
             },
         )
         # Keep the status dict in sync so broadcast_with_display_config is correct
-        if subsystem_name in self._status.active_subsystems:
-            info = self._status.active_subsystems[subsystem_name]
-            info.current_state = new_state
-            info.state_description = adapter._get_state_description()
+        self._refresh_subsystem_info(subsystem_name)
         logger.info("Subsystem '%s' notified as ready for frontend", subsystem_name)
 
     def update_all_subsystems_ready(self) -> None:
@@ -1268,6 +1280,9 @@ class WorkflowOrchestrator:
         self.frontend.set_subsystem_config(
             [cfg.to_dict() for cfg in self.subsystems_config]
         )
+        # (Re)connecting clients get a FRESH full status (built from the
+        # live subsystem snapshots) instead of the cached last broadcast.
+        self.frontend.set_status_callback(lambda: self._status)
         # State machine graph definitions for the frontend inspector modal
         # (subsystem SMs + object blueprint) — the same YAML the engines run.
         self.frontend.set_state_machine_definitions(
