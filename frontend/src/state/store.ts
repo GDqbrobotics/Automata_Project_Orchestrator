@@ -327,6 +327,26 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     }
   }
 
+  // Handle object alias assignment (operator action)
+  if (m.event === 'object_alias_assigned' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const objectId = d.object_id as string;
+    const alias = (d.alias as string) || '';
+    if (objectId) {
+      const idx = updated.objects.findIndex((o) => o.object_id === objectId);
+      if (idx >= 0) {
+        updated.objects = [...updated.objects];
+        updated.objects[idx] = { ...updated.objects[idx], alias };
+      }
+      logs.push({
+        time: now(),
+        source: 'object',
+        message: `Alias for ${objectId}: ${alias || '(cleared)'}`,
+        level: 'success',
+      });
+    }
+  }
+
   // Handle object added
   if (m.event === 'object_added' && m.details) {
     const d = m.details as Record<string, unknown>;
@@ -339,6 +359,7 @@ export function reduceState(state: UiState, msg: unknown): UiState {
         created: now(),
         last_state_change: now(),
         transitions: [],
+        alias: (d.alias as string) || '',
       } as ObjectInfo;
       updated.objects = [...updated.objects, objInfo];
       logs.push({

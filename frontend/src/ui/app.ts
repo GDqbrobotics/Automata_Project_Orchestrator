@@ -95,12 +95,18 @@ export class App {
     this.client.send(cmd);
   }
 
+  /** Assign (or replace) the operator alias ID of an object. */
+  assignAlias(objectId: string, alias: string): void {
+    this.client.send('assign_alias', { object_id: objectId, alias });
+  }
+
   // UI rendering
   private render(): void {
     this.updateStateBadge();
     this.updateWorkflowMessage();
     this.updateProgress();
     this.updateObjectsGrid();
+    this.updateAliasSelect();
     this.updateSubsystemGrid();
     this.updateActionButtons();
     this.updateConnectionIndicator();
@@ -250,6 +256,11 @@ export class App {
       );
 
       card.appendChild(top);
+      if (obj.alias) {
+        const aliasEl = el('div', 'object-alias', obj.alias);
+        aliasEl.title = 'Alias ID (cloud database)';
+        card.appendChild(aliasEl);
+      }
       card.appendChild(el('div', 'object-state-desc', obj.state_description || ''));
       card.appendChild(foot);
 
@@ -308,6 +319,33 @@ export class App {
 
       card.addEventListener('click', () => this.openDetail('subsystem', name));
       grid.appendChild(card);
+    }
+  }
+
+  /** Keep the alias-assignment object selector in sync with tracked objects. */
+  private updateAliasSelect(): void {
+    const select = document.getElementById('aliasObjectSelect') as HTMLSelectElement | null;
+    if (!select) return;
+    const objects = this.state.objects;
+    const current = select.value;
+
+    select.innerHTML = '';
+    if (objects.length === 0) {
+      const opt = el('option', undefined, '— no objects —');
+      opt.value = '';
+      opt.disabled = true;
+      select.appendChild(opt);
+      select.disabled = true;
+      return;
+    }
+    select.disabled = false;
+    for (const obj of objects) {
+      const opt = el('option', undefined, obj.object_id);
+      opt.value = obj.object_id;
+      select.appendChild(opt);
+    }
+    if (objects.some((o) => o.object_id === current)) {
+      select.value = current;
     }
   }
 

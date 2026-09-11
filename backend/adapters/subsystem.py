@@ -101,7 +101,9 @@ class SubsystemAdapter:
         if error:
             self.error = error
 
-    def fire_transition(self, event: str) -> str:
+    def fire_transition(
+        self, event: str, data: Optional[Dict[str, Any]] = None
+    ) -> str:
         """Fire a transition on the subsystem's state machine (BOUNDARY).
 
         The subsystem SM is the boundary layer between internal events and
@@ -110,6 +112,11 @@ class SubsystemAdapter:
         real) subsystem receives it and acts on it. Completion reports
         (complete / init_complete) are excluded: they flow the other way,
         over the /status topic.
+
+        Args:
+            event: The transition event.
+            data: Optional context merged into the MQTT command payload
+                (e.g. the cloud upload command carries object_id/alias).
 
         Returns the new state name.
         Raises SubsystemStateMachineError if the transition is invalid.
@@ -124,6 +131,8 @@ class SubsystemAdapter:
                 "source": "orchestrator",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            if data:
+                payload.update(data)
             self.mqtt_client.publish(topic, payload, qos=1)
             logger.info(
                 "[Boundary] Subsystem '%s' command '%s' -> %s (MQTT '%s')",

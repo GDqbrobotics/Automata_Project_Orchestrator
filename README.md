@@ -194,6 +194,16 @@ existing WebSocket (events `subsystem_message`, `object_message` and
 `messages_cleared`); the definitions travel inside every status broadcast,
 so the view always matches the actual machine.
 
+## Alias IDs (cloud database)
+
+From the **control deck** the operator assigns an alias ID to any tracked
+object (object selector + alias + Assign). The machine keeps working with
+the auto-assigned ID in the meantime; the alias is the ID the cloud database
+uses for the object's record and is attached to the `cloud_database/upload`
+command when the object's analysis completes (`{object_id, alias}`).
+Assigned aliases are shown on the object cards. The backend validates the
+alias (format + uniqueness) and reports errors in the event log.
+
 ## Configuration Files
 
 ### workflow.yaml

@@ -49,6 +49,8 @@ class ObjectStateMachines:
 
         # Per-object state machines keyed by object_id
         self._machines: Dict[str, StateMachineEngine] = {}
+        # Per-object operator-assigned alias IDs (cloud database)
+        self._aliases: Dict[str, str] = {}
         # Per-object state descriptions keyed by object_id
         self._state_descriptions: Dict[str, str] = {}
         # Per-object timestamps
@@ -118,6 +120,7 @@ class ObjectStateMachines:
                 lambda event_name, oid=object_id: self._fire_event(oid, event_name),
             )
             self._machines[object_id] = engine
+            self._aliases[object_id] = ""
             self._state_descriptions[object_id] = engine.config.states.get(
                 engine.current_state, type('obj', (), {'description': ''})()
             ).description if engine.current_state in engine.config.states else ""
@@ -140,6 +143,7 @@ class ObjectStateMachines:
         with self._lock:
             if object_id in self._machines:
                 del self._machines[object_id]
+                self._aliases.pop(object_id, None)
                 self._state_descriptions.pop(object_id, None)
                 self._timestamps.pop(object_id, None)
                 self._transition_logs.pop(object_id, None)
@@ -191,7 +195,36 @@ class ObjectStateMachines:
                 "created": timestamps.get("created", ""),
                 "last_state_change": timestamps.get("current_state", ""),
                 "transitions": transitions,
+                "alias": self._aliases.get(object_id, ""),
             }
+
+    # ------------------------------------------------------------------
+    # Alias IDs (operator-assigned, used by the cloud database)
+    # ------------------------------------------------------------------
+    def set_alias(self, object_id: str, alias: str) -> bool:
+        """Set (or replace) the operator-assigned alias ID of an object.
+
+        The machine keeps working with the auto-assigned object_id; the
+        alias is what the cloud database uses for the object's record.
+
+        Args:
+            object_id: The object to tag.
+            alias: The operator-chosen alias (validated by the caller).
+
+        Returns:
+            True if the alias was stored, False if the object is unknown.
+        """
+        with self._lock:
+            if object_id not in self._machines:
+                return False
+            self._aliases[object_id] = alias
+            self._save_object_to_disk(object_id)
+            return True
+
+    def get_alias(self, object_id: str) -> str:
+        """Return the alias ID of an object ("" if none assigned)."""
+        with self._lock:
+            return self._aliases.get(object_id, "")
 
     def get_all_objects_info(self) -> List[Dict[str, Any]]:
         """Get info about all tracked objects."""
@@ -307,6 +340,7 @@ class ObjectStateMachines:
             "state_description": self._state_descriptions.get(object_id, ""),
             "timestamps": self._timestamps.get(object_id, {}),
             "transitions": self._transition_logs.get(object_id, []),
+            "alias": self._aliases.get(object_id, ""),
         }
 
         state_file = self._object_state_file(object_id)
@@ -338,6 +372,7 @@ class ObjectStateMachines:
             machine.current_state = data.get("state", machine.config.initial_state)
 
             self._machines[object_id] = machine
+            self._aliases[object_id] = data.get("alias", "")
             self._state_descriptions[object_id] = data.get("state_description", "")
             self._timestamps[object_id] = data.get("timestamps", {})
             self._transition_logs[object_id] = data.get("transitions", [])
@@ -386,6 +421,7 @@ class ObjectStateMachines:
         """Remove all object state machines and their persisted state files."""
         with self._lock:
             self._machines.clear()
+            self._aliases.clear()
             self._state_descriptions.clear()
             self._timestamps.clear()
             self._transition_logs.clear()

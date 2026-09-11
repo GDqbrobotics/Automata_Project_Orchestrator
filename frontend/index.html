@@ -58,12 +58,14 @@
       <div class="alias-row">
         <label class="alias-label" for="aliasInput">Assign alias ID</label>
         <div class="alias-input-group">
+          <select class="alias-select" id="aliasObjectSelect" aria-label="Object"></select>
           <input
             type="text"
             class="alias-input"
             id="aliasInput"
-            placeholder="Object ID → Alias (e.g. OBJ_003 → AMPHORA_7)"
+            placeholder="Alias for the cloud database (e.g. AMPHORA_7)"
             autocomplete="off"
+            maxlength="64"
           />
           <button class="btn btn-ghost" id="aliasBtn">Assign</button>
         </div>

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -213,12 +214,17 @@ class WorkflowOrchestrator:
         self.frontend.set_command_handler(WorkflowCommand.STOP_WORKFLOW, self._handle_stop)
         self.frontend.set_command_handler(WorkflowCommand.REQUEST_STATUS, self._handle_status)
         self.frontend.set_command_handler(WorkflowCommand.RESET_WORKFLOW, self._handle_reset)
+        self.frontend.set_command_handler(WorkflowCommand.ASSIGN_ALIAS, self._handle_assign_alias)
 
     # ------------------------------------------------------------------
     # Internal Event Routing (Workflow ↔ Object ↔ Subsystems)
     # ------------------------------------------------------------------
-    def _on_event(self, event_name: str) -> None:
+    def _on_event(self, event_name: str, data: Optional[Dict[str, Any]] = None) -> None:
         """Route internal events fired by state machines.
+
+        `data` (optional) is merged into the MQTT command payload when the
+        event is routed to a subsystem (e.g. the cloud upload command
+        carries the object_id and its operator-assigned alias).
 
         Events can be:
           - Unscoped: "error" → broadcast to all subsystems
@@ -258,7 +264,7 @@ class WorkflowOrchestrator:
                 "Routing scoped event '%s' → subsystem '%s'",
                 event_name, scope,
             )
-            self._route_event_to_subsystem(scope, local_event)
+            self._route_event_to_subsystem(scope, local_event, data=data)
         else:
             # Unscoped event: broadcast to all subsystems
             logger.info("Broadcasting unscoped event '%s' to all subsystems", event_name)
@@ -268,6 +274,7 @@ class WorkflowOrchestrator:
         self,
         subsystem_name: str,
         event_name: str,
+        data: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Fire an event on a specific subsystem's state machine.
 
@@ -278,6 +285,7 @@ class WorkflowOrchestrator:
         Args:
             subsystem_name: The target subsystem.
             event_name: The event to fire on that subsystem.
+            data: Optional context merged into the MQTT command payload.
         """
         adapter = self.adapters.get(subsystem_name)
         if adapter is None:
@@ -289,7 +297,7 @@ class WorkflowOrchestrator:
             return
 
         try:
-            new_state = adapter.fire_transition(event_name)
+            new_state = adapter.fire_transition(event_name, data)
             logger.info(
                 "Subsystem '%s' transitioned: %s (event: %s)",
                 subsystem_name, new_state, event_name,
@@ -384,8 +392,17 @@ class WorkflowOrchestrator:
             # transition path); the controller only sets flags here.
             self._pipeline.on_object_workflow_event(object_id, local_event)
             return
+        # The cloud upload command (object.yaml: 'cloud_database/upload'
+        # fired when an object is analyzed) carries the object reference so
+        # the cloud database can store the record under its alias ID.
+        data = None
+        if scope == "cloud_database" and local_event == "upload":
+            data = {
+                "object_id": object_id,
+                "alias": self.object_manager.get_alias(object_id),
+            }
         # Reuse the same routing logic as workflow events
-        self._on_event(event_name)
+        self._on_event(event_name, data=data)
 
     # ------------------------------------------------------------------
     # Operator Command Handlers
@@ -488,6 +505,70 @@ class WorkflowOrchestrator:
     def _handle_status(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: request_status")
         self.frontend.broadcast_status(self._status)
+
+    # Alias IDs: the operator tags objects during the workflow; the alias
+    # is the ID the cloud database uses for the object's record while the
+    # machine keeps working with the auto-assigned object_id
+    # (docs/PROJECT_CONTEXT.md).
+    ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_\-\. ]{1,64}$")
+
+    def _handle_assign_alias(self, data: Dict[str, Any]) -> None:
+        """Handle operator alias-ID assignment for an object.
+
+        Command payload: {command: assign_alias, object_id: str, alias: str}
+        """
+        object_id = str(data.get("object_id") or "").strip()
+        alias = str(data.get("alias") or "").strip()
+
+        if not object_id:
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": "Alias assignment: missing object_id"},
+            )
+            return
+        if not alias:
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": f"Alias assignment: empty alias for '{object_id}'"},
+            )
+            return
+        if not self.ALIAS_PATTERN.match(alias):
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {
+                    "message": (
+                        f"Alias '{alias}' invalid: use letters, digits, "
+                        "'_' '-' '.' or spaces (max 64 characters)"
+                    )
+                },
+            )
+            return
+
+        with self._lock:
+            if self.object_manager.get_object_state(object_id) is None:
+                self._fire_frontend_event(
+                    BackendEvent.ERROR_REPORTED.value,
+                    {"message": f"Alias assignment: unknown object '{object_id}'"},
+                )
+                return
+            # Aliases become cloud database IDs: keep them unique (the
+            # machine's own object_ids are unique by construction).
+            alias_lc = alias.lower()
+            for oid in self.object_manager.get_object_ids():
+                if oid != object_id and self.object_manager.get_alias(oid).lower() == alias_lc:
+                    self._fire_frontend_event(
+                        BackendEvent.ERROR_REPORTED.value,
+                        {"message": f"Alias '{alias}' is already assigned to {oid}"},
+                    )
+                    return
+            self.object_manager.set_alias(object_id, alias)
+
+        logger.info("Operator: assigned alias '%s' to %s", alias, object_id)
+        self._fire_frontend_event(
+            BackendEvent.OBJECT_ALIAS_ASSIGNED.value,
+            {"object_id": object_id, "alias": alias, "source": "operator"},
+        )
+        self._broadcast_objects()
 
     # ------------------------------------------------------------------
     # Workflow Helpers
@@ -959,6 +1040,7 @@ class WorkflowOrchestrator:
                     created=obj.get("created", ""),
                     last_state_change=obj.get("last_state_change", ""),
                     transitions=obj.get("transitions", []),
+                    alias=obj.get("alias", ""),
                 )
                 for obj in self.object_manager.get_all_objects_info()
             ]
@@ -979,6 +1061,7 @@ class WorkflowOrchestrator:
                     created=obj.get("created", ""),
                     last_state_change=obj.get("last_state_change", ""),
                     transitions=obj.get("transitions", []),
+                    alias=obj.get("alias", ""),
                 )
                 for obj in objects_info
             ]

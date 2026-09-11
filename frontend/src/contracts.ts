@@ -6,7 +6,8 @@ export type WorkflowCommand =
   | 'resume_workflow'
   | 'stop_workflow'
   | 'request_status'
-  | 'reset_workflow';
+  | 'reset_workflow'
+  | 'assign_alias';
 
 export type WorkflowEvent =
   | 'workflow_state_changed'
@@ -17,6 +18,7 @@ export type WorkflowEvent =
   | 'object_state_changed'
   | 'object_added'
   | 'object_removed'
+  | 'object_alias_assigned'
   | 'subsystem_message'
   | 'object_message'
   | 'messages_cleared';
@@ -69,6 +71,8 @@ export interface ObjectInfo {
   created: string;
   last_state_change: string;
   transitions: Array<{ from: string; to: string; event: string; timestamp: string }>;
+  /** Operator-assigned alias ID used by the cloud database ('' = none). */
+  alias?: string;
 }
 
 /** One transition edge in a state machine definition (from YAML). */

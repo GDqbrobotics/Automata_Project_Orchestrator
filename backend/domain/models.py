@@ -48,6 +48,7 @@ class WorkflowCommand(str, enum.Enum):
     STOP_WORKFLOW = "stop_workflow"
     REQUEST_STATUS = "request_status"
     RESET_WORKFLOW = "reset_workflow"
+    ASSIGN_ALIAS = "assign_alias"
 
 
 class Command(str, enum.Enum):
@@ -67,6 +68,7 @@ class BackendEvent(str, enum.Enum):
     OBJECT_STATE_CHANGED = "object_state_changed"
     OBJECT_ADDED = "object_added"
     OBJECT_REMOVED = "object_removed"
+    OBJECT_ALIAS_ASSIGNED = "object_alias_assigned"  # operator set an alias ID
     # Message traffic for the state-machine inspector modal:
     SUBSYSTEM_MESSAGE = "subsystem_message"    # MQTT sent to / received from a subsystem
     OBJECT_MESSAGE = "object_message"          # internal messages of one object's SM
@@ -213,6 +215,10 @@ class ObjectInfo:
     created: str = ""
     last_state_change: str = ""
     transitions: List[Dict[str, Any]] = field(default_factory=list)
+    # Operator-assigned alias ID for the cloud database ("" = none yet).
+    # The machine keeps working with object_id; the alias rides along in
+    # the cloud_database/upload command payload.
+    alias: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -222,6 +228,7 @@ class ObjectInfo:
             "created": self.created,
             "last_state_change": self.last_state_change,
             "transitions": self.transitions,
+            "alias": self.alias,
         }
 
 

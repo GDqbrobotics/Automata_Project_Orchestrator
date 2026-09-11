@@ -354,7 +354,26 @@ body {
   white-space: nowrap;
 }
 
-.alias-input-group { display: flex; gap: 8px; flex: 1; max-width: 560px; }
+.alias-input-group { display: flex; gap: 8px; flex: 1; max-width: 660px; }
+
+.alias-select {
+  flex: 0 0 auto;
+  width: 140px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+.alias-select:disabled { opacity: 0.5; cursor: not-allowed; }
+.alias-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
 
 .alias-input {
   flex: 1;
@@ -497,6 +516,17 @@ body {
 .object-state.state-measuring  { background: rgba(255, 157, 118, 0.14); color: var(--orange); }
 .object-state.state-analyzed   { background: rgba(62, 207, 111, 0.14);  color: var(--success); }
 .object-state.state-gray       { background: rgba(152, 160, 184, 0.1);  color: var(--text-faint); }
+
+.object-alias {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent-hover);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .object-state-desc {
   font-size: 0.7rem;

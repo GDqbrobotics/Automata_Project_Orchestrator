@@ -17,13 +17,21 @@ app.onBindCommands({
   btnReset: 'reset_workflow',
 });
 
-// Alias assignment (backend endpoint pending — see development journal)
-document.getElementById('aliasBtn')?.addEventListener('click', () => {
-  const input = document.getElementById('aliasInput') as HTMLInputElement;
-  if (input?.value) {
-    console.log('Alias assignment:', input.value);
-    input.value = '';
-  }
+// Alias ID assignment: the operator picks an object and gives it the ID
+// the cloud database will use (the machine keeps working with the
+// auto-assigned object_id in the meantime).
+const submitAlias = (): void => {
+  const select = document.getElementById('aliasObjectSelect') as HTMLSelectElement | null;
+  const input = document.getElementById('aliasInput') as HTMLInputElement | null;
+  const objectId = select?.value || '';
+  const alias = (input?.value || '').trim();
+  if (!objectId || !alias) return;
+  app.assignAlias(objectId, alias);
+  if (input) input.value = '';
+};
+document.getElementById('aliasBtn')?.addEventListener('click', submitAlias);
+document.getElementById('aliasInput')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitAlias();
 });
 
 console.log('AUTOMATA GUI Orchestrator frontend started');
