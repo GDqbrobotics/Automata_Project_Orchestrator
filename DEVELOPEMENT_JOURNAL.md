@@ -11,6 +11,41 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - Validate: `timeout 500 python backend/simulation_test.py` — **always wrap in a timeout** (a bug can make it hang forever)
 - All state machines are YAML-driven: `backend/config/workflow.yaml`, `object.yaml`, `subsystems/*.yaml`, `global.yaml`. Simulated subsystems load the *same* YAML as the orchestrator. Work durations live in the subsystem YAML metadata (`work_durations`).
 - The object flow is driven by `backend/orchestrator/pipeline.py` (PipelineController) from MQTT status reports — identical code path for simulated and real subsystems.
+- Object workflow has an explicit `ai_processing` state between `object_going_first_position` and `XRF_RAMAN_analysis`: the object waits on the first position until the AI finishes extracting the XRF/Raman interest points (see Latest changes 2026-09-14 / ai_processing).
+
+## Latest changes (2026-09-14 — object SM: ai_processing state before XRF_RAMAN_analysis)
+
+New intermediate object state `ai_processing` between
+`object_going_first_position` and `XRF_RAMAN_analysis`: the AI must finish
+analyzing the object's imaging data (interest points) before the puntual
+XRF/Raman measurements can start, and that wait is now an explicit object
+state instead of an implicit bookkeeping detail of the pipeline.
+
+- `object.yaml`: `object_going_first_position --platform_rotated_to_first-->
+  ai_processing` (no actions); new `ai_processing --ai_complete-->
+  XRF_RAMAN_analysis` fires `robot_first/measure_xrf_raman` + `xrf/measure`
+  + `raman/measure` (moved here from the old `platform_rotated_to_first`
+  transition). `ai_analysis/plan` still fires on `imaging_capture_complete`
+  (the AI keeps running in parallel with the rotation back).
+- `pipeline.py`: `MEASUREMENT_SUBSYSTEMS` no longer includes `ai_analysis`
+  (it gates the stage start instead of joining the parallel set); new
+  `_ai_object` bookkeeping — on rotation landing the object enters
+  `ai_processing` and `_ai_object` tracks it; when the AI reports ready
+  from `analyzing`, `_on_subsystem_completed` fires `ai_complete` on the
+  object and starts measurement tracking (new helper
+  `_start_measurement_tracking`, extracted from `_finish_rotation`). Skip
+  guard: if the AI already finished during the rotation (or its plan
+  command never landed), `ai_complete` fires immediately on landing so the
+  pipeline never stalls. Run-finish condition + `reset()` include
+  `_ai_object`.
+- `global.yaml` state_order/state_colors + frontend `object-styles.ts`
+  defaults: `ai_processing` inserted (new `planning` color class, green
+  teal, in app.css). `ObjectState.AI_PROCESSING` added to the enum.
+- simulation_test.py: expected state/transition sequences updated (121
+  checks); the full-workflow run exercises BOTH paths — "AI planning done
+  for X – starting measurements" (AI finishes after the rotation lands)
+  and "AI already done for X – starting measurements immediately" (skip
+  guard).
 
 ## Latest changes (2026-09-14 — debug mode: user-driven MQTT injection from subsystem windows)
 

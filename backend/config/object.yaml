@@ -49,8 +49,9 @@ states:
         target: object_going_first_position
         actions:
           - log_event
-          # The AI plans the XRF/Raman points from the imaging data; it
-          # runs in parallel with the rotation back to the first position.
+          # The AI starts planning the XRF/Raman points from the imaging
+          # data in parallel with the rotation back to the first position;
+          # the object waits in ai_processing until the AI reports done.
           - event: ai_analysis/plan
           # Rotation request to the pipeline controller (workflow/ scope is
           # internal): the platform only rotates when BOTH disk positions
@@ -62,9 +63,19 @@ states:
     description: Object waits on the second disk for a platform rotation back to the first measurement position (XRF/Raman is performed by robot 1)
     transitions:
       - event: platform_rotated_to_first
+        target: ai_processing
+        actions:
+          - log_event
+
+  ai_processing:
+    description: Object is on the first position while the AI processes its imaging data to extract the interest points for the XRF/Raman measurements
+    transitions:
+      - event: ai_complete
         target: XRF_RAMAN_analysis
         actions:
           - log_event
+          # The AI finished its analysis: the target points are known, so
+          # the puntual measurements start (robot 1 + the two analyzers).
           - event: robot_first/measure_xrf_raman
           - event: xrf/measure
           - event: raman/measure

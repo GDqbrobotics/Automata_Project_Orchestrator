@@ -37,6 +37,7 @@ class ObjectState(str, enum.Enum):
     GOING_SECOND_POSITION = "object_going_second_position"
     XRF_RAMAN_ANALYSIS = "XRF_RAMAN_analysis"
     GOING_FIRST_POSITION = "object_going_first_position"
+    AI_PROCESSING = "ai_processing"
     MOVING_TO_BOX = "moving_to_box"
     ANALYZED = "object_analyzed"
 

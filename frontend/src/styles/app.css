@@ -513,6 +513,7 @@ body {
 .object-state.state-moving     { background: var(--accent-soft);         color: var(--accent-hover); }
 .object-state.state-imaging    { background: rgba(167, 139, 250, 0.16); color: var(--purple); }
 .object-state.state-rotating   { background: rgba(95, 217, 230, 0.13);  color: var(--cyan); }
+.object-state.state-planning   { background: rgba(122, 214, 170, 0.14); color: #7ad6aa; }
 .object-state.state-measuring  { background: rgba(255, 157, 118, 0.14); color: var(--orange); }
 .object-state.state-analyzed   { background: rgba(62, 207, 111, 0.14);  color: var(--success); }
 .object-state.state-gray       { background: rgba(152, 160, 184, 0.1);  color: var(--text-faint); }

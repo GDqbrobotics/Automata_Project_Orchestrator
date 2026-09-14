@@ -28,8 +28,10 @@ Stage mapping (docs/PROJECT_CONTEXT.md workflow):
 
 * first disk position:  robot 1 – pick / place / XRF+Raman / return to box
 * second disk position: robot 2 – 3DI+HSI scan (imaging interface)
-* the AI plans the XRF/Raman points between imaging and measurement,
-  in parallel with the rotation back to the first position
+* the AI plans the XRF/Raman points between imaging and measurement:
+  it starts in parallel with the rotation back to the first position, and
+  the object waits in the ai_processing state until the AI reports done
+  (only then do the XRF/Raman measurements start)
 
 Threading: methods may be called from the MQTT callback thread, the
 WebSocket command thread, or re-entrantly from object-transition events.
@@ -52,18 +54,20 @@ ROBOT_FIRST = "robot_first"
 ROBOT_SECOND = "robot_second"
 ROTATING_PLATFORM = "rotating_platform"
 IMAGING_3DI_HSI = "imaging_3di_hsi"
+AI_ANALYSIS = "ai_analysis"
 CLOUD_DB = "cloud_database"
 # Subsystems that work in parallel during the measurement stage on the
-# FIRST disk position (robot 1 + XRF/Raman analyzers). The AI joins the set
-# only while it is still planning the points (it starts in parallel with
-# the rotation back to the first position).
-MEASUREMENT_SUBSYSTEMS: Tuple[str, ...] = ("xrf", "raman", "robot_first", "ai_analysis")
+# FIRST disk position (robot 1 + XRF/Raman analyzers). The AI is NOT in the
+# set: it must finish planning the points BEFORE the stage starts (the
+# object waits in ai_processing until the AI reports done).
+MEASUREMENT_SUBSYSTEMS: Tuple[str, ...] = ("xrf", "raman", "robot_first")
 
 # Object states used for pipeline coordination (see object.yaml)
 OBJ_WAITING = "waiting_for_disk"            # in the box, queued
 OBJ_GOING_SECOND = "object_going_second_position"   # on the first disk, waiting for rotation to imaging
 OBJ_HSI = "HSI_3DI_analysis"                # on the second disk, being imaged
 OBJ_GOING_FIRST = "object_going_first_position"     # on the second disk, waiting for rotation back to measurement
+OBJ_AI_PROCESSING = "ai_processing"         # on the first disk, AI planning the XRF/Raman points
 OBJ_XRF_RAMAN = "XRF_RAMAN_analysis"        # on the first disk, being measured
 OBJ_MOVING_TO_BOX = "moving_to_box"         # on the first disk, waiting for return
 
@@ -91,6 +95,8 @@ class PipelineController:
         self._disk_second: Optional[str] = None    # object on the measurement position
         self._robot_task: Optional[Tuple[str, str]] = None  # (op, object_id)
         self._imaging_object: Optional[str] = None
+        # Object waiting in ai_processing for the AI's point planning
+        self._ai_object: Optional[str] = None
         self._measuring_object: Optional[str] = None
         self._measuring_pending: Set[str] = set()
         self._rotation_requested = False
@@ -204,6 +210,7 @@ class PipelineController:
             self._disk_second = None
             self._robot_task = None
             self._imaging_object = None
+            self._ai_object = None
             self._measuring_object = None
             self._measuring_pending = set()
             self._rotation_requested = False
@@ -237,11 +244,25 @@ class PipelineController:
         if name == IMAGING_3DI_HSI and was_state == "capturing" and self._imaging_object:
             object_id = self._imaging_object
             self._imaging_object = None
-            # -> object_going_first_position; the object transition plans
-            #    the measurement points (AI) and requests the rotation back.
+            # -> object_going_first_position; the object transition starts
+            #    the AI (point planning) and requests the rotation back.
             #    Robot 2's scan completion is not tracked: the imaging
             #    interface owns the data the AI needs.
             self._fire_object(object_id, "imaging_capture_complete")
+            return
+
+        if name == AI_ANALYSIS and was_state == "analyzing" and self._ai_object:
+            # The AI finished extracting the interest points for the object
+            # waiting in ai_processing: the XRF/Raman stage starts now
+            # (the object transition commands robot 1 + the analyzers).
+            object_id = self._ai_object
+            self._ai_object = None
+            logger.info(
+                "Pipeline: AI planning done for %s – starting measurements",
+                object_id,
+            )
+            if self._fire_object(object_id, "ai_complete"):
+                self._start_measurement_tracking(object_id)
             return
 
         if name in MEASUREMENT_SUBSYSTEMS and self._measuring_object:
@@ -264,6 +285,26 @@ class PipelineController:
         self._measuring_object = None
         self._robot_task = ("return", object_id)
         self._fire_object(object_id, "measurements_complete")
+
+    def _start_measurement_tracking(self, object_id: str) -> None:
+        """Start tracking the parallel measurement subsystems for an object
+        that just entered the XRF/Raman stage (first position).
+
+        The stage ends when every subsystem that actually entered its
+        working state reports ready (guards against a command that did not
+        land because a subsystem was not in the expected state).
+        """
+        self._measuring_object = object_id
+        self._measuring_pending = {
+            m for m in MEASUREMENT_SUBSYSTEMS
+            if (s := self._sm_state(m)) not in (None, *NON_WORK_STATES)
+        }
+        if not self._measuring_pending:
+            logger.warning(
+                "Pipeline: no measurement subsystem active – "
+                "completing measurements immediately"
+            )
+            self._complete_measurements(object_id)
 
     def _finish_rotation(self) -> None:
         """Apply the coupled disk swap and start the stages on both sides.
@@ -289,22 +330,24 @@ class PipelineController:
                     self._fire_object(first, "imaging_capture_complete")
 
         if second is not None and self._obj_state(second) == OBJ_GOING_FIRST:
-            # -> XRF_RAMAN_analysis; the object transition commands robot 1
-            #    and the XRF/Raman analyzers (first position). Wait for the
-            #    ones that actually entered their working state (the AI is
-            #    included only if it is still planning the points).
+            # -> ai_processing: the object waits on the first position for
+            #    the AI to finish planning the XRF/Raman points (the AI was
+            #    started when the imaging completed, in parallel with this
+            #    rotation). When the AI reports done, the object transition
+            #    commands robot 1 + the analyzers.
             if self._fire_object(second, "platform_rotated_to_first"):
-                self._measuring_object = second
-                self._measuring_pending = {
-                    m for m in MEASUREMENT_SUBSYSTEMS
-                    if (s := self._sm_state(m)) not in (None, *NON_WORK_STATES)
-                }
-                if not self._measuring_pending:
-                    logger.warning(
-                        "Pipeline: no measurement subsystem active – "
-                        "completing measurements immediately"
+                self._ai_object = second
+                if self._sm_state(AI_ANALYSIS) in (None, *NON_WORK_STATES):
+                    # AI not working (already finished during the rotation,
+                    # or its plan command never landed): skip the wait so
+                    # the pipeline does not stall.
+                    logger.info(
+                        "Pipeline: AI already done for %s – starting measurements immediately",
+                        second,
                     )
-                    self._complete_measurements(second)
+                    self._ai_object = None
+                    if self._fire_object(second, "ai_complete"):
+                        self._start_measurement_tracking(second)
 
         self._disk_first, self._disk_second = second, first
         self._rotating = False
@@ -404,6 +447,7 @@ class PipelineController:
             and self._robot_task is None
             and not self._rotating
             and self._imaging_object is None
+            and self._ai_object is None
             and self._measuring_object is None
         ):
             self._phase = "suspended"

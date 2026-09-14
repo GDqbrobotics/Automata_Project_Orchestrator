@@ -178,17 +178,24 @@ Events:
 
 Manages per-object analysis workflow (imaging on the second disk position,
 XRF/Raman on the first one – robot 2 scans, robot 1 measures):
-- `identified_in_box` → `waiting_for_disk` → `moving_to_disk` → `object_going_second_position` → `HSI_3DI_analysis` → `object_going_first_position` → `XRF_RAMAN_analysis` → ... → `object_analyzed`
+- `identified_in_box` → `waiting_for_disk` → `moving_to_disk` → `object_going_second_position` → `HSI_3DI_analysis` → `object_going_first_position` → `ai_processing` → `XRF_RAMAN_analysis` → ... → `object_analyzed`
 
 Objects wait in `waiting_for_disk` (still in the box) until a disk slot is
 free – the platform holds at most 2 objects and robot 1 carries at most 1.
+
+`ai_processing` is the intermediate state on the first position: the AI must
+finish analyzing the object's imaging data (extracting the interest points)
+before the XRF/Raman puntual measurements can start. The AI is started when
+the imaging completes (in parallel with the rotation back); when the AI
+reports done, the pipeline fires `ai_complete` on the object (immediately,
+if the AI already finished during the rotation).
 
 Events are scoped to target specific subsystems:
 - `robot_first/pick` → triggers robot_first subsystem
 - `workflow/rotation_requested_second` → object placed on the first disk: the pipeline requests the rotation to the imaging position
 - `imaging_3di_hsi/capture` + `robot_second/scan_hsi_3d` → object on the second disk: imaging starts
-- `ai_analysis/plan` + `workflow/rotation_requested_first` → imaging done: the AI plans the points and the rotation back is requested
-- `robot_first/measure_xrf_raman` + `xrf/measure` + `raman/measure` → object on the first disk: XRF/Raman start
+- `ai_analysis/plan` + `workflow/rotation_requested_first` → imaging done: the AI starts planning the points and the rotation back is requested
+- `ai_complete` → the AI finished its analysis: `robot_first/measure_xrf_raman` + `xrf/measure` + `raman/measure` fire and the XRF/Raman stage starts
 - `robot_first/return` → measurements done: robot 1 returns the object to the box
 - `cloud_database/upload` → triggers cloud upload
 

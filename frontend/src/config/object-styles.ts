@@ -19,6 +19,7 @@ export const DEFAULT_STATE_ORDER: string[] = [
   'object_going_second_position',
   'HSI_3DI_analysis',
   'object_going_first_position',
+  'ai_processing',
   'XRF_RAMAN_analysis',
   'moving_to_box',
   'object_analyzed',
@@ -38,6 +39,7 @@ export const DEFAULT_STATE_COLORS: Record<string, string> = {
   'object_going_second_position': 'rotating',
   XRF_RAMAN_analysis: 'measuring',
   'object_going_first_position': 'rotating',
+  ai_processing: 'planning',
   moving_to_box: 'moving',
   object_analyzed: 'analyzed',
 };

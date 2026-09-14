@@ -539,7 +539,9 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
     #  - every other object must stay in the box.
     # Object states occupying each physical position (imaging happens on
     # the second disk, XRF/Raman measurement on the first one):
-    DISK_FIRST_STATES = {"object_going_second_position", "XRF_RAMAN_analysis", "moving_to_box"}
+    DISK_FIRST_STATES = {
+        "object_going_second_position", "ai_processing", "XRF_RAMAN_analysis", "moving_to_box",
+    }
     DISK_SECOND_STATES = {"HSI_3DI_analysis", "object_going_first_position"}
     IN_BOX_STATES = {"identified_in_box", "waiting_for_disk", "object_analyzed"}
     invariant_violations: List[tuple] = []
@@ -980,6 +982,7 @@ def test_object_state_machine_config() -> None:
         "object_going_second_position",
         "XRF_RAMAN_analysis",
         "object_going_first_position",
+        "ai_processing",
         "moving_to_box",
         "object_analyzed",
     ]
@@ -1006,8 +1009,12 @@ def test_object_state_machine_config() -> None:
         # BOTH disks at once, so the orchestrator (pipeline controller)
         # decides when a rotation is physically safe and issues the actual
         # rotating_platform command.
+        # The object lands on the first position in 'ai_processing' and
+        # waits there until the AI finishes extracting the interest points;
+        # only then does the XRF/Raman stage start (ai_complete fires the
+        # measurement commands).
         "HSI_3DI_analysis": ["ai_analysis/plan", "workflow/rotation_requested_first"],
-        "object_going_first_position": ["robot_first/measure_xrf_raman", "xrf/measure", "raman/measure"],
+        "ai_processing": ["robot_first/measure_xrf_raman", "xrf/measure", "raman/measure"],
         "XRF_RAMAN_analysis": ["robot_first/return"],
         "moving_to_box": ["cloud_database/upload"],
     }
@@ -1055,7 +1062,8 @@ def test_object_state_machine_transitions() -> None:
         ("object_placed_on_disk", "object_going_second_position"),
         ("platform_rotated_to_second", "HSI_3DI_analysis"),
         ("imaging_capture_complete", "object_going_first_position"),
-        ("platform_rotated_to_first", "XRF_RAMAN_analysis"),
+        ("platform_rotated_to_first", "ai_processing"),
+        ("ai_complete", "XRF_RAMAN_analysis"),
         ("measurements_complete", "moving_to_box"),
         ("object_returned_to_box", "object_analyzed"),
     ]
@@ -1149,7 +1157,8 @@ async def test_object_in_orchestrator() -> None:
         ("object_placed_on_disk", "object_going_second_position"),
         ("platform_rotated_to_second", "HSI_3DI_analysis"),
         ("imaging_capture_complete", "object_going_first_position"),
-        ("platform_rotated_to_first", "XRF_RAMAN_analysis"),
+        ("platform_rotated_to_first", "ai_processing"),
+        ("ai_complete", "XRF_RAMAN_analysis"),
         ("measurements_complete", "moving_to_box"),
         ("object_returned_to_box", "object_analyzed"),
     ]
