@@ -12,7 +12,12 @@
  * rebuilds the ModalData on every render so the open modal stays live.
  */
 
-import type { ObjectMessage, StateMachineDef, SubsystemMessage } from '../contracts.js';
+import type {
+  DebugTopicDescriptor,
+  ObjectMessage,
+  StateMachineDef,
+  SubsystemMessage,
+} from '../contracts.js';
 import { hasScopedEvents, renderStateMachineGraph } from './sm-graph.js';
 
 export type ModalKind = 'subsystem' | 'object';
@@ -31,6 +36,10 @@ export interface ModalData {
   stateDescription: string;
   subsystemMessages?: SubsystemMessage[];
   objectMessages?: ObjectMessage[];
+  /** Debug mode (--debug): topics the real subsystem is expected to publish.
+   *  When set (subsystem modals only), the modal shows the manual MQTT
+   *  injection panel (user-driven simulation). */
+  debugTopics?: DebugTopicDescriptor[];
 }
 
 function formatTime(ts: string): string {
@@ -68,6 +77,21 @@ export class StateMachineModal {
   private feedEl: HTMLDivElement;
   private data: ModalData | null = null;
   private onClose: (() => void) | null = null;
+  // ── Debug panel (manual MQTT injection, --debug mode) ──
+  // Built once and never re-rendered by update()/render(), so the operator's
+  // edits survive the live backend broadcasts that refresh the modal.
+  private debugPanelEl: HTMLElement;
+  private debugTopicSel: HTMLSelectElement;
+  private debugStateFieldEl: HTMLElement;
+  private debugStateSel: HTMLSelectElement;
+  private debugPayloadEl: HTMLTextAreaElement;
+  private debugSendBtn: HTMLButtonElement;
+  private debugStatusEl: HTMLElement;
+  private onDebugSend: ((topic: string, payload: Record<string, unknown>) => void) | null = null;
+  /** Topic descriptors for the currently open subsystem (debug mode). */
+  private debugTopics: DebugTopicDescriptor[] = [];
+  /** States of the currently open subsystem (state quick-pick for /status). */
+  private debugStates: string[] = [];
 
   constructor(parent: ParentNode = document.body) {
     this.overlay = document.createElement('div');
@@ -90,6 +114,28 @@ export class StateMachineModal {
           <div class="sm-modal-graph"></div>
         </div>
         <div class="sm-legend"></div>
+        <div class="sm-debug" hidden>
+          <div class="sm-debug-header">
+            <span class="sm-debug-title">debug — send subsystem message</span>
+            <span class="sm-debug-hint">publishes the selected MQTT topic as if the real subsystem sent it</span>
+          </div>
+          <div class="sm-debug-controls">
+            <div class="sm-debug-field">
+              <span class="sm-debug-label">topic</span>
+              <select class="sm-debug-topic" aria-label="MQTT topic"></select>
+            </div>
+            <div class="sm-debug-field" data-state-field hidden>
+              <span class="sm-debug-label">reported state</span>
+              <select class="sm-debug-state" aria-label="Reported state"></select>
+            </div>
+          </div>
+          <span class="sm-debug-label sm-debug-payload-label">payload (json)</span>
+          <textarea class="sm-debug-payload" spellcheck="false" rows="3"></textarea>
+          <div class="sm-debug-footer">
+            <button class="btn btn-primary sm-debug-send">Send</button>
+            <span class="sm-debug-status"></span>
+          </div>
+        </div>
         <div class="sm-modal-feed-header">
           <span class="sm-modal-feed-title"></span>
           <span class="sm-modal-feed-count"></span>
@@ -106,6 +152,17 @@ export class StateMachineModal {
     this.feedTitleEl = this.overlay.querySelector('.sm-modal-feed-title')!;
     this.feedCountEl = this.overlay.querySelector('.sm-modal-feed-count')!;
     this.feedEl = this.overlay.querySelector('.sm-modal-feed')!;
+
+    this.debugPanelEl = this.overlay.querySelector('.sm-debug')!;
+    this.debugTopicSel = this.overlay.querySelector('.sm-debug-topic')!;
+    this.debugStateFieldEl = this.overlay.querySelector('[data-state-field]')!;
+    this.debugStateSel = this.overlay.querySelector('.sm-debug-state')!;
+    this.debugPayloadEl = this.overlay.querySelector('.sm-debug-payload')!;
+    this.debugSendBtn = this.overlay.querySelector('.sm-debug-send')!;
+    this.debugStatusEl = this.overlay.querySelector('.sm-debug-status')!;
+    this.debugTopicSel.addEventListener('change', () => this._onDebugTopicChange());
+    this.debugStateSel.addEventListener('change', () => this._onDebugStateChange());
+    this.debugSendBtn.addEventListener('click', () => this._sendDebug());
 
     this.overlay.querySelector('.sm-modal-close')!.addEventListener('click', () => this.close());
     this.overlay.addEventListener('click', (e) => {
@@ -124,16 +181,25 @@ export class StateMachineModal {
     return this.data !== null;
   }
 
-  open(data: ModalData, onClose: () => void): void {
+  open(
+    data: ModalData,
+    onClose: () => void,
+    onDebugSend?: (topic: string, payload: Record<string, unknown>) => void,
+  ): void {
     this.data = data;
     this.onClose = onClose;
+    this.onDebugSend = onDebugSend ?? null;
     this.overlay.classList.add('open');
+    this._setupDebugPanel(data);
     this.render();
   }
 
   update(data: ModalData): void {
     if (!this.data) return;
     this.data = data;
+    // Note: the debug panel is deliberately not touched here — it is set up
+    // once in open() so the operator's topic/payload edits survive the live
+    // broadcasts that keep this modal updated.
     this.render();
   }
 
@@ -143,8 +209,10 @@ export class StateMachineModal {
     this.overlay.classList.remove('open');
     this.graphWrapEl.innerHTML = '';
     this.feedEl.innerHTML = '';
+    this.debugPanelEl.hidden = true;
     const cb = this.onClose;
     this.onClose = null;
+    this.onDebugSend = null;
     cb?.();
   }
 
@@ -203,6 +271,110 @@ export class StateMachineModal {
       }
     }
     this.feedEl.scrollTop = this.feedEl.scrollHeight;
+  }
+
+  // ------------------------------------------------------------------
+  // Debug panel (manual MQTT injection, --debug mode)
+  // ------------------------------------------------------------------
+  private _setupDebugPanel(d: ModalData): void {
+    if (d.kind === 'subsystem' && d.debugTopics && d.debugTopics.length > 0) {
+      this.debugTopics = d.debugTopics;
+      this.debugStates = d.def ? Object.keys(d.def.states) : [];
+
+      this.debugTopicSel.innerHTML = '';
+      for (const t of this.debugTopics) {
+        const opt = document.createElement('option');
+        opt.value = t.topic;
+        opt.textContent = t.topic;
+        opt.title = t.description;
+        this.debugTopicSel.appendChild(opt);
+      }
+
+      this.debugStateSel.innerHTML = '';
+      for (const s of this.debugStates) {
+        const opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s;
+        this.debugStateSel.appendChild(opt);
+      }
+
+      this._updateDebugStateVisibility();
+      const topic = this._currentDebugTopic();
+      this.debugPayloadEl.value = JSON.stringify(topic.default_payload, null, 2);
+      // Keep the state quick-pick in sync with the default payload.
+      const defPayload = topic.default_payload as Record<string, unknown>;
+      if (typeof defPayload.state === 'string' && this.debugStates.includes(defPayload.state)) {
+        this.debugStateSel.value = defPayload.state;
+      }
+      this.debugStatusEl.textContent = '';
+      this.debugStatusEl.className = 'sm-debug-status';
+      this.debugPanelEl.hidden = false;
+    } else {
+      this.debugPanelEl.hidden = true;
+    }
+  }
+
+  private _currentDebugTopic(): DebugTopicDescriptor {
+    const sel = this.debugTopics.find((t) => t.topic === this.debugTopicSel.value);
+    return sel ?? this.debugTopics[0];
+  }
+
+  private _updateDebugStateVisibility(): void {
+    // The state quick-pick only makes sense for the /status topic (its
+    // payload carries the reported state) and a known state machine.
+    const isStatus = this.debugTopicSel.value.endsWith('/status');
+    this.debugStateFieldEl.hidden = !isStatus || this.debugStates.length === 0;
+  }
+
+  private _onDebugTopicChange(): void {
+    this._updateDebugStateVisibility();
+    this.debugPayloadEl.value = JSON.stringify(this._currentDebugTopic().default_payload, null, 2);
+    const defPayload = this._currentDebugTopic().default_payload as Record<string, unknown>;
+    if (typeof defPayload.state === 'string' && this.debugStates.includes(defPayload.state)) {
+      this.debugStateSel.value = defPayload.state;
+    }
+    this.debugStatusEl.textContent = '';
+  }
+
+  private _onDebugStateChange(): void {
+    const payload = this._readDebugPayload(this._currentDebugTopic().default_payload);
+    payload.state = this.debugStateSel.value;
+    payload.ready = this.debugStateSel.value === 'ready';
+    this.debugPayloadEl.value = JSON.stringify(payload, null, 2);
+  }
+
+  private _readDebugPayload(fallback: Record<string, unknown>): Record<string, unknown> {
+    try {
+      const parsed: unknown = JSON.parse(this.debugPayloadEl.value || '{}');
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // fall through to the default payload
+    }
+    return { ...fallback };
+  }
+
+  private _sendDebug(): void {
+    if (!this.onDebugSend) return;
+    const topic = this.debugTopicSel.value;
+    if (!topic) return;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(this.debugPayloadEl.value || '{}');
+    } catch {
+      this.debugStatusEl.textContent = 'Invalid JSON payload';
+      this.debugStatusEl.className = 'sm-debug-status error';
+      return;
+    }
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+      this.debugStatusEl.textContent = 'Payload must be a JSON object';
+      this.debugStatusEl.className = 'sm-debug-status error';
+      return;
+    }
+    this.onDebugSend(topic, payload as Record<string, unknown>);
+    this.debugStatusEl.textContent = `sent → ${topic}`;
+    this.debugStatusEl.className = 'sm-debug-status ok';
   }
 
   private renderLegend(def: StateMachineDef): void {

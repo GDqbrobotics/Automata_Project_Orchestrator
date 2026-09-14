@@ -7,7 +7,8 @@ export type WorkflowCommand =
   | 'stop_workflow'
   | 'request_status'
   | 'reset_workflow'
-  | 'assign_alias';
+  | 'assign_alias'
+  | 'debug_send_subsystem_message';
 
 export type WorkflowEvent =
   | 'workflow_state_changed'
@@ -102,6 +103,22 @@ export interface SubsystemMessage {
   timestamp: string;
   /** Consecutive-duplicate count (e.g. repeated heartbeats). */
   count?: number;
+}
+
+/** One MQTT topic a real subsystem is expected to publish (debug mode). */
+export interface DebugTopicDescriptor {
+  /** Full topic, e.g. 'automata/subsystem/xrf/status'. */
+  topic: string;
+  description: string;
+  /** Sensible starting payload, editable in the inspector. */
+  default_payload: Record<string, unknown>;
+}
+
+/** Debug config sent with status broadcasts when the backend runs --debug. */
+export interface DebugConfig {
+  enabled: boolean;
+  /** Subsystem name -> its outgoing MQTT topics. */
+  topics: Record<string, DebugTopicDescriptor[]>;
 }
 
 /** One internal message of an object's state machine. */

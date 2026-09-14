@@ -100,6 +100,23 @@ export class App {
     this.client.send('assign_alias', { object_id: objectId, alias });
   }
 
+  /**
+   * Debug mode (--debug): inject an MQTT message on one of the topics a
+   * real subsystem is expected to publish, as if the subsystem sent it.
+   * The backend rejects it when it is not running with --debug.
+   */
+  sendDebugSubsystemMessage(
+    subsystemId: string,
+    topic: string,
+    payload: Record<string, unknown>,
+  ): void {
+    this.client.send('debug_send_subsystem_message', {
+      subsystem: subsystemId,
+      topic,
+      payload,
+    });
+  }
+
   // UI rendering
   private render(): void {
     this.updateStateBadge();
@@ -122,9 +139,19 @@ export class App {
   // ------------------------------------------------------------------
   openDetail(kind: ModalKind, id: string): void {
     this.detailRef = { kind, id };
-    this.detailModal.open(this.buildDetailData(kind, id), () => {
-      this.detailRef = null;
-    });
+    this.detailModal.open(
+      this.buildDetailData(kind, id),
+      () => {
+        this.detailRef = null;
+      },
+      (topic, payload) => {
+        // Only reachable from subsystem modals (the debug panel is hidden
+        // for object modals and when debug mode is off).
+        if (this.detailRef && this.detailRef.kind === 'subsystem') {
+          this.sendDebugSubsystemMessage(this.detailRef.id, topic, payload);
+        }
+      },
+    );
   }
 
   private buildDetailData(kind: ModalKind, id: string): ModalData {
@@ -145,6 +172,11 @@ export class App {
           (currentState && def?.states[currentState]?.description) ||
           (info?.state_description || ''),
         subsystemMessages: this.state.subsystemMessages[id] || [],
+        // Debug mode (--debug): offer the manual MQTT injection panel with
+        // the topics the real subsystem is expected to publish.
+        debugTopics: this.state.debug?.enabled
+          ? this.state.debug.topics[id] || undefined
+          : undefined,
       };
     }
     const obj = this.state.objects.find((o) => o.object_id === id);

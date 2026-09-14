@@ -831,6 +831,70 @@ body {
   word-break: break-all;
 }
 
+/* debug panel — manual MQTT injection (backend launched with --debug) */
+.sm-debug {
+  margin: 4px 18px 0;
+  padding: 10px 12px 12px;
+  border: 1px dashed var(--warning);
+  border-radius: 10px;
+  background: rgba(245, 166, 35, 0.05);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sm-debug[hidden] { display: none; }
+.sm-debug-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.sm-debug-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--warning);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.sm-debug-hint { font-size: 0.7rem; color: var(--text-dim); }
+.sm-debug-controls { display: flex; gap: 14px; flex-wrap: wrap; }
+.sm-debug-field { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 260px; }
+.sm-debug-field select {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 6px 8px;
+}
+.sm-debug-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.sm-debug-payload-label { width: 100%; }
+.sm-debug-payload {
+  width: 100%;
+  min-height: 74px;
+  resize: vertical;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 8px;
+}
+.sm-debug-payload:focus, .sm-debug-field select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.sm-debug-footer { display: flex; align-items: center; gap: 12px; }
+.sm-debug-footer .btn { padding: 5px 14px; font-size: 0.8rem; }
+.sm-debug-status { font-size: 0.75rem; color: var(--text-dim); }
+.sm-debug-status.ok { color: var(--success); }
+.sm-debug-status.error { color: var(--error); }
+
 /* object internal messages */
 .om-states { color: var(--text); font-weight: 600; }
 .om-arrow { color: var(--accent); }

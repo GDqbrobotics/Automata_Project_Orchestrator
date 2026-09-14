@@ -21,6 +21,9 @@ Usage:
     # With custom broker
     python launch_gui.py --broker 192.168.1.100 --simulation
     
+    # Debug mode (manual MQTT injection from the subsystem windows)
+    python launch_gui.py --debug
+    
     # Verbose logging
     python launch_gui.py --simulation --verbose
 """
@@ -85,6 +88,9 @@ def start_mosquitto_broker(port: int = 1883) -> subprocess.Popen:
         ["mosquitto", "-c", conf_file.name],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        # Own process group: shutdown can kill the whole tree (npm would
+        # otherwise leave its vite child behind, holding the frontend port).
+        start_new_session=True,
     )
     start_pipe_drainers(proc)
 
@@ -147,6 +153,7 @@ def start_subsystem_simulators(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=str(project_root),
+            start_new_session=True,
         )
         start_pipe_drainers(proc)
         procs.append(proc)
@@ -160,6 +167,7 @@ def start_backend(
     use_simulation: bool = False,
     num_objects: int = 3,
     verbose: bool = False,
+    debug: bool = False,
 ) -> subprocess.Popen:
     """Start the backend orchestrator."""
     cmd = [
@@ -173,6 +181,9 @@ def start_backend(
         cmd.append("--simulation")
         cmd.extend(["--num-objects", str(num_objects)])
     
+    if debug:
+        cmd.append("--debug")
+    
     if verbose:
         cmd.append("--verbose")
     
@@ -183,6 +194,7 @@ def start_backend(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(project_root),
+        start_new_session=True,
     )
     start_pipe_drainers(proc)
     return proc
@@ -206,9 +218,28 @@ def start_frontend(ws_port: int = 8080) -> subprocess.Popen:
         stderr=subprocess.PIPE,
         cwd=str(project_root / "frontend"),
         env=env,
+        start_new_session=True,
     )
     start_pipe_drainers(proc)
     return proc
+
+
+def terminate_process_tree(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the child's whole process group (falls back to the child alone).
+
+    Needed for `npm run dev`: terminating only the npm process would leave
+    its vite child running, still bound to the frontend port.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            if sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            pass
 
 
 def check_ports_free(port_whats: dict) -> None:
@@ -267,6 +298,15 @@ def main() -> None:
         help="Number of objects to simulate",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Debug mode: each subsystem inspector window shows a selector "
+            "of the MQTT topics the real subsystem is expected to publish, "
+            "and the user can send one of them (user-driven simulation)"
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging",
@@ -305,6 +345,7 @@ def main() -> None:
             use_simulation=args.simulation,
             num_objects=args.num_objects,
             verbose=args.verbose,
+            debug=args.debug,
         )
         processes.append(backend_proc)
         
@@ -326,6 +367,10 @@ def main() -> None:
                 "  Simulation mode: %d objects (%d simulated subsystem processes)",
                 args.num_objects, len(SIMULATED_SUBSYSTEMS),
             )
+        if args.debug:
+            logger.info(
+                "  Debug mode: subsystem windows offer manual MQTT message injection"
+            )
         logger.info("=" * 60)
         logger.info("Press Ctrl+C to stop all services")
         
@@ -339,7 +384,7 @@ def main() -> None:
         logger.info("Shutting down...")
         for proc in processes:
             try:
-                proc.terminate()
+                terminate_process_tree(proc, signal.SIGTERM)
             except Exception:
                 pass
         
@@ -348,8 +393,11 @@ def main() -> None:
             try:
                 proc.wait(timeout=5)
             except Exception:
-                proc.kill()
-                proc.wait()
+                terminate_process_tree(proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
         
         logger.info("All services stopped")
 

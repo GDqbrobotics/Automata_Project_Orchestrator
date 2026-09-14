@@ -113,6 +113,7 @@ class WorkflowOrchestrator:
         global_config: GlobalConfig | None = None,
         use_simulation: bool = False,
         num_objects: int | None = None,
+        debug_mode: bool = False,
     ) -> None:
         # Apply global config (CLI args may have overridden defaults)
         self._global_config = global_config or GlobalConfig()
@@ -215,10 +216,17 @@ class WorkflowOrchestrator:
         self.frontend.set_command_handler(WorkflowCommand.REQUEST_STATUS, self._handle_status)
         self.frontend.set_command_handler(WorkflowCommand.RESET_WORKFLOW, self._handle_reset)
         self.frontend.set_command_handler(WorkflowCommand.ASSIGN_ALIAS, self._handle_assign_alias)
+        self.frontend.set_command_handler(
+            WorkflowCommand.DEBUG_SEND_SUBSYSTEM_MESSAGE,
+            self._handle_debug_send_subsystem_message,
+        )
 
-    # ------------------------------------------------------------------
-    # Internal Event Routing (Workflow ↔ Object ↔ Subsystems)
-    # ------------------------------------------------------------------
+        # ─── Debug Mode ───
+        # When enabled (launch_gui.py --debug) the subsystem inspector
+        # shows a selector of the MQTT topics a real subsystem is expected
+        # to publish, and the operator can send one of them manually
+        # (user-driven simulation; see _handle_debug_send_subsystem_message).
+        self._debug_mode = debug_mode
     def _on_event(self, event_name: str, data: Optional[Dict[str, Any]] = None) -> None:
         """Route internal events fired by state machines.
 
@@ -572,6 +580,119 @@ class WorkflowOrchestrator:
             {"object_id": object_id, "alias": alias, "source": "operator"},
         )
         self._broadcast_objects()
+
+    # ------------------------------------------------------------------
+    # Debug mode (--debug): user-driven MQTT injection
+    # ------------------------------------------------------------------
+    def _build_debug_topics(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Describe the MQTT topics each real subsystem is expected to publish.
+
+        Sent to the frontend (debug mode only) so the subsystem inspector can
+        offer a selector of the outgoing topics with sensible default
+        payloads. The orchestrator's receive path consumes /status (state
+        reports, incl. heartbeats) and /response (e.g. the vision system's
+        object list), so those are the topics a real subsystem sends.
+        """
+        topics: Dict[str, List[Dict[str, Any]]] = {}
+        for name, adapter in self.adapters.items():
+            current = (
+                adapter.state_machine.current_state
+                if adapter.state_machine
+                else adapter.initial_state
+            )
+            entries: List[Dict[str, Any]] = [
+                {
+                    "topic": f"{TOPIC_SUBSYSTEM}/{name}/status",
+                    "description": (
+                        "State report (published by the subsystem on every "
+                        "state change + heartbeat)"
+                    ),
+                    "default_payload": {
+                        "state": current,
+                        "name": name,
+                        "ready": current == "ready",
+                        "paused": False,
+                    },
+                },
+                {
+                    "topic": f"{TOPIC_SUBSYSTEM}/{name}/response",
+                    "description": "Response message",
+                    # The only response the orchestrator acts on is the
+                    # vision object list; every other response is logged.
+                    "default_payload": (
+                        {
+                            "type": "objects_detected",
+                            "objects": [
+                                f"object_{i:03d}"
+                                for i in range(1, self._total_objects + 1)
+                            ],
+                            "count": self._total_objects,
+                        }
+                        if name == "vision"
+                        else {"type": "ok"}
+                    ),
+                },
+            ]
+            topics[name] = entries
+        return topics
+
+    def _handle_debug_send_subsystem_message(self, data: Dict[str, Any]) -> None:
+        """Debug mode: inject an MQTT message on a subsystem's outgoing topic.
+
+        The operator picks one of the topics a real subsystem is expected to
+        publish (see _build_debug_topics) and a payload; the orchestrator
+        publishes it to the broker and feeds its own MQTT receive path with
+        the same bytes, so it is processed exactly like a message coming
+        from the real subsystem (status sync, pipeline, inspector feed).
+
+        Command payload: {command, subsystem, topic, payload}
+        """
+        if not self._debug_mode:
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": "Debug mode is not enabled (start with --debug)"},
+            )
+            return
+
+        name = str(data.get("subsystem") or "").strip()
+        topic = str(data.get("topic") or "").strip()
+        payload = data.get("payload")
+
+        if name not in self.adapters:
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": f"Debug: unknown subsystem '{name}'"},
+            )
+            return
+        allowed = (
+            f"{TOPIC_SUBSYSTEM}/{name}/status",
+            f"{TOPIC_SUBSYSTEM}/{name}/response",
+        )
+        if topic not in allowed:
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {
+                    "message": (
+                        f"Debug: topic '{topic}' not allowed for '{name}' "
+                        f"(expected one of: {', '.join(allowed)})"
+                    )
+                },
+            )
+            return
+        if not isinstance(payload, dict):
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": "Debug: payload must be a JSON object"},
+            )
+            return
+
+        logger.info("[debug] operator injects MQTT message on %s: %s", topic, payload)
+        # Publish to the broker (visible to any other subscriber), then feed
+        # the orchestrator's own receive path: the broker does not loop a
+        # client's own publishes back to that client, so without this the
+        # orchestrator would never process its injected message.
+        self.mqtt.publish(topic, payload, qos=1)
+        self._on_mqtt_message(topic, json.dumps(payload).encode())
 
     # ------------------------------------------------------------------
     # Workflow Helpers
@@ -1280,6 +1401,11 @@ class WorkflowOrchestrator:
         self.frontend.set_subsystem_config(
             [cfg.to_dict() for cfg in self.subsystems_config]
         )
+        # Debug mode: let the subsystem inspector offer the outgoing-topic
+        # selector (user-driven MQTT injection).
+        if self._debug_mode:
+            self.frontend.set_debug_topics(self._build_debug_topics())
+            logger.info("Debug mode enabled: subsystem inspector offers manual MQTT injection")
         # (Re)connecting clients get a FRESH full status (built from the
         # live subsystem snapshots) instead of the cached last broadcast.
         self.frontend.set_status_callback(lambda: self._status)

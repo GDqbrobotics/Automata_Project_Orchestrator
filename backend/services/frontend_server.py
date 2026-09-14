@@ -53,6 +53,10 @@ class FrontendServer:
         # State machine graph definitions (subsystem + object) sent with
         # every status broadcast, so the frontend can render them.
         self._state_machine_defs: Dict[str, Any] | None = None
+        # Debug topic descriptors (subsystem -> outgoing MQTT topics with
+        # default payloads), broadcast with status when the orchestrator
+        # runs with --debug (user-driven MQTT injection in the inspector).
+        self._debug_topics: Optional[Dict[str, List[Dict[str, Any]]]] = None
         # Last full-status payload, replayed to newly connected clients so a
         # (re)connecting UI immediately gets state + SM definitions.
         self._last_status_payload: Dict[str, Any] | None = None
@@ -166,6 +170,12 @@ class FrontendServer:
         # Include state machine graph definitions (subsystem + object SMs)
         if self._state_machine_defs is not None:
             status_dict.update(self._state_machine_defs)
+        # Include debug topic descriptors (only when launched with --debug)
+        if self._debug_topics is not None:
+            status_dict["debug"] = {
+                "enabled": True,
+                "topics": self._debug_topics,
+            }
         # Include any extra details (e.g. object workflow state order/colors)
         if extra_details:
             status_dict.update(extra_details)
@@ -197,6 +207,17 @@ class FrontendServer:
         """Set the subsystem configuration to broadcast with status updates."""
         self._subsystem_config = config_list
         logger.info("Subsystem config set: %d subsystems", len(config_list))
+
+    def set_debug_topics(self, topics: Dict[str, List[Dict[str, Any]]]) -> None:
+        """Set the debug topic descriptors (subsystem -> topics the real
+        subsystem is expected to publish, with default payloads).
+
+        Only called when the orchestrator runs with --debug; the descriptor
+        travels with every status broadcast so the frontend's subsystem
+        inspector can render the user-driven MQTT injection selector.
+        """
+        self._debug_topics = topics
+        logger.info("Debug topics set: %d subsystems", len(topics))
 
     def set_state_machine_definitions(
         self,

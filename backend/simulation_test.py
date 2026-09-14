@@ -256,12 +256,14 @@ class OrchestratorRunner:
         subsystems_config_dir: str,
         use_simulation: bool = False,
         num_objects: int = 3,
+        debug_mode: bool = False,
     ) -> None:
         self.orchestrator = WorkflowOrchestrator(
             config_path=Path(config_path),
             subsystems_config_path=Path(subsystems_config_dir),
             use_simulation=use_simulation,
             num_objects=num_objects,
+            debug_mode=debug_mode,
         )
         self.orchestrator.mqtt.broker = MQTT_BROKER_HOST
         self.orchestrator.mqtt.port = MQTT_BROKER_PORT
@@ -1244,6 +1246,184 @@ def test_scoped_event_routing() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 12: Debug mode (manual MQTT injection from the subsystem windows)
+# ---------------------------------------------------------------------------
+async def test_debug_mode() -> None:
+    """Test: the --debug manual MQTT injection feature.
+
+    Covers what the subsystem inspector's debug panel does end-to-end:
+    - the status broadcast carries the per-subsystem outgoing topic list,
+    - sending a message on one of those topics is processed exactly like a
+      message from the real subsystem (local SM sync + inspector feed),
+    - only the subsystem's outgoing topics are allowed,
+    - the command is rejected when the backend is not running --debug.
+    """
+    logger.info("--- TEST 12: Debug mode (manual MQTT injection) ---")
+
+    status_topic = f"{TOPIC_SUBSYSTEM}/{ROTATING_PLATFORM}/status"
+
+    # ── Debug mode ON ──
+    runner = OrchestratorRunner(CONFIG_PATH, SUBSYSTEMS_CONFIG_DIR, debug_mode=True)
+    runner.start()
+    orch = runner.orchestrator
+
+    ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+    await ws_client.connect()
+    time.sleep(0.2)
+
+    # 1. The status broadcast carries the debug topic descriptors
+    debug_topics: Optional[Dict[str, Any]] = None
+    for _ in range(30):
+        for m in await ws_client.drain_messages():
+            d = m.get("details") or {}
+            if m.get("event") == "workflow_state_changed" and isinstance(d.get("debug"), dict):
+                debug_topics = d["debug"].get("topics")
+        if debug_topics:
+            break
+        time.sleep(0.2)
+    results.check(
+        debug_topics is not None,
+        "Status broadcast includes the debug topic list (debug mode on)",
+    )
+    if debug_topics:
+        entries = [e["topic"] for e in debug_topics.get(ROTATING_PLATFORM, [])]
+        results.check(
+            status_topic in entries,
+            "Debug topics include rotating_platform /status",
+        )
+        results.check(
+            f"{TOPIC_SUBSYSTEM}/{ROTATING_PLATFORM}/response" in entries,
+            "Debug topics include rotating_platform /response",
+        )
+
+    # 2. A sent status report is processed like a real subsystem message:
+    #    the local subsystem SM syncs to the reported state
+    adapter = orch.adapters.get(ROTATING_PLATFORM)
+    results.check(
+        adapter is not None and adapter.state_machine is not None,
+        "rotating_platform adapter has a state machine",
+    )
+    if adapter and adapter.state_machine:
+        await ws_client.send_command(
+            "debug_send_subsystem_message",
+            {
+                "subsystem": ROTATING_PLATFORM,
+                "topic": status_topic,
+                "payload": {
+                    "state": "ready",
+                    "name": ROTATING_PLATFORM,
+                    "ready": True,
+                    "paused": False,
+                },
+            },
+        )
+        await ws_client.receive()
+        time.sleep(0.5)
+        results.check(
+            adapter.state_machine.current_state == "ready",
+            f"Injected status report synced the local SM to 'ready' "
+            f"(current: {adapter.state_machine.current_state})",
+        )
+
+        # The inspector feed records the injected message as 'received'
+        feed_seen = False
+        for _ in range(30):
+            for m in await ws_client.drain_messages():
+                d = m.get("details") or {}
+                if (
+                    m.get("event") == "subsystem_message"
+                    and d.get("subsystem") == ROTATING_PLATFORM
+                    and d.get("direction") == "received"
+                    and d.get("topic") == status_topic
+                ):
+                    feed_seen = True
+            if feed_seen:
+                break
+            time.sleep(0.2)
+        results.check(
+            feed_seen,
+            "Injected message appears in the subsystem message feed (direction=received)",
+        )
+
+    # 3. A topic the subsystem does not publish (/event) is rejected
+    await ws_client.send_command(
+        "debug_send_subsystem_message",
+        {
+            "subsystem": ROTATING_PLATFORM,
+            "topic": f"{TOPIC_SUBSYSTEM}/{ROTATING_PLATFORM}/event",
+            "payload": {"state": "ready"},
+        },
+    )
+    topic_rejected = False
+    for _ in range(30):
+        for m in await ws_client.drain_messages():
+            if m.get("event") == "error_reported" and "not allowed" in str(
+                (m.get("details") or {}).get("message", "")
+            ):
+                topic_rejected = True
+        if topic_rejected:
+            break
+        time.sleep(0.2)
+    results.check(
+        topic_rejected,
+        "Non-outgoing topic (/event) is rejected with an error",
+    )
+
+    await ws_client.close()
+    runner.stop()
+
+    # ── Debug mode OFF ──
+    runner2 = OrchestratorRunner(CONFIG_PATH, SUBSYSTEMS_CONFIG_DIR, debug_mode=False)
+    runner2.start()
+    ws_client2 = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+    await ws_client2.connect()
+    time.sleep(0.2)
+
+    await ws_client2.send_command(
+        "debug_send_subsystem_message",
+        {
+            "subsystem": ROTATING_PLATFORM,
+            "topic": status_topic,
+            "payload": {"state": "ready"},
+        },
+    )
+    disabled_rejected = False
+    for _ in range(30):
+        for m in await ws_client2.drain_messages():
+            if m.get("event") == "error_reported" and "not enabled" in str(
+                (m.get("details") or {}).get("message", "")
+            ):
+                disabled_rejected = True
+        if disabled_rejected:
+            break
+        time.sleep(0.2)
+    results.check(
+        disabled_rejected,
+        "Debug command is rejected when the backend is not running --debug",
+    )
+
+    # No debug config in the status broadcast when debug mode is off
+    has_debug_key = False
+    for _ in range(30):
+        for m in await ws_client2.drain_messages():
+            d = m.get("details") or {}
+            if m.get("event") == "workflow_state_changed" and "debug" in d:
+                has_debug_key = True
+        if has_debug_key:
+            break
+        time.sleep(0.2)
+    results.check(
+        not has_debug_key,
+        "Status broadcast has no debug config when debug mode is off",
+    )
+
+    await ws_client2.close()
+    runner2.stop()
+
+    logger.info("Debug mode test complete.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def run_all_tests(num_objects: int = 3) -> bool:
@@ -1280,6 +1460,8 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         await test_object_in_orchestrator()
         time.sleep(1)
         test_scoped_event_routing()
+        time.sleep(1)
+        await test_debug_mode()
 
     except Exception as exc:
         logger.error("Test suite error: %s", exc, exc_info=True)

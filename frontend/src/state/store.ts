@@ -7,6 +7,7 @@ import type {
   StateMachineDef,
   SubsystemMessage,
   ObjectMessage,
+  DebugConfig,
 } from '../contracts.js';
 import { getStateMessage } from '../config/state-messages.js';
 
@@ -34,6 +35,8 @@ export interface UiState {
   subsystemStateMachines: Record<string, StateMachineDef>;
   /** Object state machine graph definition (shared blueprint). */
   objectStateMachine: StateMachineDef | null;
+  /** Debug config (null when the backend is not running with --debug). */
+  debug: DebugConfig | null;
   /** Recent MQTT messages per subsystem (sent/received). */
   subsystemMessages: Record<string, SubsystemMessage[]>;
   /** Recent internal messages per object (transitions + fired events). */
@@ -63,6 +66,7 @@ export function createInitialState(): UiState {
     workflowStateMessages: {},
     subsystemStateMachines: {},
     objectStateMachine: null,
+    debug: null,
     subsystemMessages: {},
     objectMessages: {},
     logs: [],
@@ -239,6 +243,10 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (d.object_state_machine && typeof d.object_state_machine === 'object') {
       updated.objectStateMachine = d.object_state_machine as StateMachineDef;
     }
+    // Debug config (backend started with --debug)
+    if (d.debug && typeof d.debug === 'object') {
+      updated.debug = d.debug as DebugConfig;
+    }
   }
 
   // Handle top-level status updates (broadcast_status payload)
@@ -250,6 +258,7 @@ export function reduceState(state: UiState, msg: unknown): UiState {
       state_colors?: Record<string, string>;
       subsystem_state_machines?: Record<string, StateMachineDef>;
       object_state_machine?: StateMachineDef;
+      debug?: DebugConfig;
     };
     updated.workflowState = s.state;
     updated.progress = s.progress;
@@ -292,6 +301,10 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     }
     if (s.object_state_machine && typeof s.object_state_machine === 'object') {
       updated.objectStateMachine = s.object_state_machine as StateMachineDef;
+    }
+    // Debug config from top-level payload (backend started with --debug)
+    if (s.debug && typeof s.debug === 'object') {
+      updated.debug = s.debug;
     }
   }
 

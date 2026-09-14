@@ -138,6 +138,30 @@ are declared in each subsystem YAML (`metadata.work_durations`).
 python launch_gui.py --simulation --num-objects 5   # starts broker + 9 sim processes + backend + frontend
 ```
 
+## Debug mode (manual MQTT injection)
+
+```bash
+python launch_gui.py --debug
+```
+
+With `--debug`, every **subsystem inspector window** (click a subsystem card)
+shows an extra **debug panel**: a selector with the list of MQTT topics the
+real subsystem is expected to publish — `automata/subsystem/<name>/status`
+(state reports) and `automata/subsystem/<name>/response` (e.g. the vision
+object list) — plus an editable JSON payload pre-filled with a sensible
+default. For the `/status` topic a state quick-pick (from the subsystem's
+YAML states) fills the payload's `state`/`ready` fields. Pressing **Send**
+publishes the message on that topic **as if the real subsystem sent it**:
+the orchestrator processes it through the exact same receive path as live
+MQTT traffic (subsystem state sync, pipeline reactions, and the window's
+message feed shows it as `← received`).
+
+It is a simulation you drive by hand: useful to test the orchestrator
+against the expected subsystem behaviour without the real hardware (or to
+replay a specific message, e.g. a different `objects_detected` list).
+The backend rejects the command unless it was started with `--debug` and
+only accepts the subsystem's outgoing topics.
+
 ## State Machine Layers
 
 ### 1. Workflow State Machine (`workflow.yaml`)
@@ -271,6 +295,11 @@ python launch_gui.py --simulation --num-objects 5
 ### With Custom Broker
 ```bash
 python launch_gui.py --broker 192.168.1.100 --simulation
+```
+
+### Debug Mode (manual MQTT injection from the subsystem windows)
+```bash
+python launch_gui.py --debug
 ```
 
 ### Verbose Logging

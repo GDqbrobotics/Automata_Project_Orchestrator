@@ -126,6 +126,11 @@ def main() -> None:
         help="Number of objects to simulate (overrides global config)",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode (subsystem inspector offers manual MQTT injection)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging",
@@ -150,6 +155,7 @@ def main() -> None:
         global_config=global_config,
         use_simulation=args.simulation,
         num_objects=args.num_objects,
+        debug_mode=args.debug,
     )
 
     def _shutdown(signum: int, frame: object) -> None:

@@ -49,6 +49,9 @@ class WorkflowCommand(str, enum.Enum):
     REQUEST_STATUS = "request_status"
     RESET_WORKFLOW = "reset_workflow"
     ASSIGN_ALIAS = "assign_alias"
+    # Debug mode only (--debug): inject an MQTT message on one of the
+    # topics a real subsystem publishes, as if the subsystem sent it.
+    DEBUG_SEND_SUBSYSTEM_MESSAGE = "debug_send_subsystem_message"
 
 
 class Command(str, enum.Enum):
