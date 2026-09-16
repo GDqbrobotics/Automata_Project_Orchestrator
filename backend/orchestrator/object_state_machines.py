@@ -49,7 +49,7 @@ class ObjectStateMachines:
 
         # Per-object state machines keyed by object_id
         self._machines: Dict[str, StateMachineEngine] = {}
-        # Per-object operator-assigned alias IDs (cloud database)
+        # Per-object operator-assigned alias IDs (local database)
         self._aliases: Dict[str, str] = {}
         # Per-object state descriptions keyed by object_id
         self._state_descriptions: Dict[str, str] = {}
@@ -199,13 +199,14 @@ class ObjectStateMachines:
             }
 
     # ------------------------------------------------------------------
-    # Alias IDs (operator-assigned, used by the cloud database)
+    # Alias IDs (operator-assigned, used by the local database)
     # ------------------------------------------------------------------
     def set_alias(self, object_id: str, alias: str) -> bool:
         """Set (or replace) the operator-assigned alias ID of an object.
 
         The machine keeps working with the auto-assigned object_id; the
-        alias is what the cloud database uses for the object's record.
+        alias is what the local database uses for the object's record
+        (data is stored locally and the database is updated manually).
 
         Args:
             object_id: The object to tag.

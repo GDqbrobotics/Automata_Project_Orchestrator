@@ -1,20 +1,20 @@
-# 3DI/HSI Imaging Subsystem Configuration
-name: imaging_3di_hsi
-display_name: 3DI/HSI Imaging
+# HSI Imaging Subsystem Configuration
+name: imaging_hsi
+display_name: HSI Imaging
 type: imaging
 mqtt_topic: "automata/subsystem/{name}"
 initial_state: initializing
 required: true
 metadata:
-  description: "3D imaging and hyperspectral imaging modules"
-  # Simulation timings (seconds) used by backend/simulation/imaging_3di_hsi_sim.py
+  description: "Hyperspectral imaging module (performed second, after 3DI)"
+  # Simulation timings (seconds) used by backend/simulation/imaging_hsi_sim.py
   init_duration: 1.5
   work_durations:
     capturing: 4.0
 
 states:
   initializing:
-    description: "Imaging system is initializing"
+    description: "HSI imaging system is initializing"
     transitions:
       - event: init_complete
         target: ready
@@ -27,7 +27,7 @@ states:
           - log_event
 
   ready:
-    description: "Imaging system is ready and idle"
+    description: "HSI imaging system is ready and idle"
     transitions:
       - event: capture
         target: capturing
@@ -40,7 +40,7 @@ states:
           - log_event
 
   capturing:
-    description: "System is capturing 3DI/HSI data"
+    description: "System is capturing HSI data"
     transitions:
       - event: complete
         target: ready
@@ -58,7 +58,7 @@ states:
           - log_event
 
   stopped:
-    description: "Imaging system has stopped"
+    description: "HSI imaging system has stopped"
     transitions:
       - event: ready
         target: ready
@@ -71,7 +71,7 @@ states:
           - log_event
 
   error:
-    description: "Imaging system is in error state"
+    description: "HSI imaging system is in error state"
     transitions:
       - event: reset
         target: ready

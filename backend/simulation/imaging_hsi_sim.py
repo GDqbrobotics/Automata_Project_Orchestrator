@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Simulated imaging_3di_hsi subsystem – standalone process, MQTT-only.
+"""Simulated imaging_hsi subsystem – standalone process, MQTT-only.
 
-Runs the imaging_3di_hsi state machine (backend/config/subsystems/imaging_3di_hsi.yaml, the
+Runs the imaging_hsi state machine (backend/config/subsystems/imaging_hsi.yaml, the
 same file the orchestrator uses) as a separate process that communicates
 with the GUI orchestrator exclusively over MQTT – identical to how the
-real imaging_3di_hsi subsystem will behave.
+real imaging_hsi subsystem will behave.
 
 Usage:
-    python backend/simulation/imaging_3di_hsi_sim.py --broker localhost --port 1883
+    python backend/simulation/imaging_hsi_sim.py --broker localhost --port 1883
 """
 import sys
 from pathlib import Path
@@ -19,4 +19,4 @@ if str(_PROJECT_ROOT) not in sys.path:
 from backend.simulation.subsystem_sim import main  # noqa: E402
 
 if __name__ == "__main__":
-    main("imaging_3di_hsi", default_num_objects=0)
+    main("imaging_hsi", default_num_objects=0)

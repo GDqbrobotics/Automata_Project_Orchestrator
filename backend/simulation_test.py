@@ -50,13 +50,13 @@ from backend.adapters.subsystem import (
     ALL_SUBSYSTEMS,
     VISION,
     AI_ANALYSIS,
-    IMAGING_3DI_HSI,
+    IMAGING_3DI,
+    IMAGING_HSI,
     ROTATING_PLATFORM,
     XRF,
     RAMAN,
     ROBOT_FIRST,
     ROBOT_SECOND,
-    CLOUD_DB,
 )
 from backend.domain.models import WorkflowState, SubsystemState, ObjectState
 from backend.messaging.mqtt_client import (
@@ -542,7 +542,7 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
     DISK_FIRST_STATES = {
         "object_going_second_position", "ai_processing", "XRF_RAMAN_analysis", "moving_to_box",
     }
-    DISK_SECOND_STATES = {"HSI_3DI_analysis", "object_going_first_position"}
+    DISK_SECOND_STATES = {"3DI_analysis", "HSI_analysis", "object_going_first_position"}
     IN_BOX_STATES = {"identified_in_box", "waiting_for_disk", "object_analyzed"}
     invariant_violations: List[tuple] = []
 
@@ -929,8 +929,16 @@ def test_subsystem_config() -> None:
         "Subsystem 'robot_first' is configured",
     )
     results.check(
-        "cloud_database" in names,
-        "Subsystem 'cloud_database' is configured",
+        "imaging_3di" in names,
+        "Subsystem 'imaging_3di' is configured",
+    )
+    results.check(
+        "imaging_hsi" in names,
+        "Subsystem 'imaging_hsi' is configured",
+    )
+    results.check(
+        "cloud_database" not in names,
+        "Subsystem 'cloud_database' is removed (local storage, manual update)",
     )
 
     results.check(
@@ -978,7 +986,8 @@ def test_object_state_machine_config() -> None:
         "identified_in_box",
         "waiting_for_disk",
         "moving_to_disk",
-        "HSI_3DI_analysis",
+        "3DI_analysis",
+        "HSI_analysis",
         "object_going_second_position",
         "XRF_RAMAN_analysis",
         "object_going_first_position",
@@ -998,11 +1007,14 @@ def test_object_state_machine_config() -> None:
     # actually free (the physical platform holds at most 2 objects).
     # The object waits on the first disk ('object_going_second_position')
     # for the rotation to the second (imaging) position; imaging commands
-    # fire only when the object arrives there.
+    # fire only when the object arrives there. Imaging is two sequential
+    # stages on the second position: 3DI first, then HSI (two separate
+    # imaging subsystems).
     expected_scoped_events = {
         "waiting_for_disk": ["robot_first/pick"],
         "moving_to_disk": ["workflow/rotation_requested_second"],
-        "object_going_second_position": ["imaging_3di_hsi/capture", "robot_second/scan_hsi_3d"],
+        "object_going_second_position": ["imaging_3di/capture", "robot_second/scan_3d"],
+        "3DI_analysis": ["imaging_hsi/capture", "robot_second/scan_hsi"],
         # The AI plans the XRF/Raman points from the imaging data, in
         # parallel with the rotation back to the first position. Rotation
         # requests are internal 'workflow/' events: the platform rotates
@@ -1013,10 +1025,9 @@ def test_object_state_machine_config() -> None:
         # waits there until the AI finishes extracting the interest points;
         # only then does the XRF/Raman stage start (ai_complete fires the
         # measurement commands).
-        "HSI_3DI_analysis": ["ai_analysis/plan", "workflow/rotation_requested_first"],
+        "HSI_analysis": ["ai_analysis/plan", "workflow/rotation_requested_first"],
         "ai_processing": ["robot_first/measure_xrf_raman", "xrf/measure", "raman/measure"],
         "XRF_RAMAN_analysis": ["robot_first/return"],
-        "moving_to_box": ["cloud_database/upload"],
     }
     for state, expected_events in expected_scoped_events.items():
         transitions = manager.config.states[state].transitions
@@ -1060,8 +1071,9 @@ def test_object_state_machine_transitions() -> None:
         ("queued_for_analysis", "waiting_for_disk"),
         ("object_picked", "moving_to_disk"),
         ("object_placed_on_disk", "object_going_second_position"),
-        ("platform_rotated_to_second", "HSI_3DI_analysis"),
-        ("imaging_capture_complete", "object_going_first_position"),
+        ("platform_rotated_to_second", "3DI_analysis"),
+        ("3di_capture_complete", "HSI_analysis"),
+        ("hsi_capture_complete", "object_going_first_position"),
         ("platform_rotated_to_first", "ai_processing"),
         ("ai_complete", "XRF_RAMAN_analysis"),
         ("measurements_complete", "moving_to_box"),
@@ -1155,8 +1167,9 @@ async def test_object_in_orchestrator() -> None:
     # Fire complete sequence
     transition_sequence = [
         ("object_placed_on_disk", "object_going_second_position"),
-        ("platform_rotated_to_second", "HSI_3DI_analysis"),
-        ("imaging_capture_complete", "object_going_first_position"),
+        ("platform_rotated_to_second", "3DI_analysis"),
+        ("3di_capture_complete", "HSI_analysis"),
+        ("hsi_capture_complete", "object_going_first_position"),
         ("platform_rotated_to_first", "ai_processing"),
         ("ai_complete", "XRF_RAMAN_analysis"),
         ("measurements_complete", "moving_to_box"),

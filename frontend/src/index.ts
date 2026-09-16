@@ -18,8 +18,8 @@ app.onBindCommands({
 });
 
 // Alias ID assignment: the operator picks an object and gives it the ID
-// the cloud database will use (the machine keeps working with the
-// auto-assigned object_id in the meantime).
+// the local database will use when the data is updated manually (the
+// machine keeps working with the auto-assigned object_id in the meantime).
 const submitAlias = (): void => {
   const select = document.getElementById('aliasObjectSelect') as HTMLSelectElement | null;
   const input = document.getElementById('aliasInput') as HTMLInputElement | null;

@@ -12,78 +12,42 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - All state machines are YAML-driven: `backend/config/workflow.yaml`, `object.yaml`, `subsystems/*.yaml`, `global.yaml`. Simulated subsystems load the *same* YAML as the orchestrator. Work durations live in the subsystem YAML metadata (`work_durations`).
 - The object flow is driven by `backend/orchestrator/pipeline.py` (PipelineController) from MQTT status reports — identical code path for simulated and real subsystems.
 - Object workflow has an explicit `ai_processing` state between `object_going_first_position` and `XRF_RAMAN_analysis`: the object waits on the first position until the AI finishes extracting the XRF/Raman interest points (see Latest changes 2026-09-14 / ai_processing).
+- Object data is stored **locally**; the local database is updated manually — there is no cloud_database subsystem (operator alias IDs are the local-database IDs).
+- Imaging on the second disk position is two sequential stages, **3DI first then HSI**, handled by two subsystems: `imaging_3di` and `imaging_hsi` (see Latest changes 2026-09-16).
 
-## Latest changes (2026-09-14 — object SM: ai_processing state before XRF_RAMAN_analysis)
+## Latest changes (2026-09-16 — cloud_database removed; imaging split into 3DI + HSI)
 
-New intermediate object state `ai_processing` between
-`object_going_first_position` and `XRF_RAMAN_analysis`: the AI must finish
-analyzing the object's imaging data (interest points) before the puntual
-XRF/Raman measurements can start, and that wait is now an explicit object
-state instead of an implicit bookkeeping detail of the pipeline.
+Two subsystem changes (see `docs/PROJECT_CONTEXT.md` for the machine context):
 
-- `object.yaml`: `object_going_first_position --platform_rotated_to_first-->
-  ai_processing` (no actions); new `ai_processing --ai_complete-->
-  XRF_RAMAN_analysis` fires `robot_first/measure_xrf_raman` + `xrf/measure`
-  + `raman/measure` (moved here from the old `platform_rotated_to_first`
-  transition). `ai_analysis/plan` still fires on `imaging_capture_complete`
-  (the AI keeps running in parallel with the rotation back).
-- `pipeline.py`: `MEASUREMENT_SUBSYSTEMS` no longer includes `ai_analysis`
-  (it gates the stage start instead of joining the parallel set); new
-  `_ai_object` bookkeeping — on rotation landing the object enters
-  `ai_processing` and `_ai_object` tracks it; when the AI reports ready
-  from `analyzing`, `_on_subsystem_completed` fires `ai_complete` on the
-  object and starts measurement tracking (new helper
-  `_start_measurement_tracking`, extracted from `_finish_rotation`). Skip
-  guard: if the AI already finished during the rotation (or its plan
-  command never landed), `ai_complete` fires immediately on landing so the
-  pipeline never stalls. Run-finish condition + `reset()` include
-  `_ai_object`.
-- `global.yaml` state_order/state_colors + frontend `object-styles.ts`
-  defaults: `ai_processing` inserted (new `planning` color class, green
-  teal, in app.css). `ObjectState.AI_PROCESSING` added to the enum.
-- simulation_test.py: expected state/transition sequences updated (121
-  checks); the full-workflow run exercises BOTH paths — "AI planning done
-  for X – starting measurements" (AI finishes after the rotation lands)
-  and "AI already done for X – starting measurements immediately" (skip
-  guard).
-
-## Latest changes (2026-09-14 — debug mode: user-driven MQTT injection from subsystem windows)
-
-New feature: `python launch_gui.py --debug`. In debug mode every subsystem
-inspector window shows a debug panel: a selector of the MQTT topics the real
-subsystem is expected to publish (`automata/subsystem/<name>/status` and
-`/response`), a state quick-pick for `/status` (states come from the
-subsystem YAML definition already sent to the frontend), an editable JSON
-payload pre-filled with a sensible default, and a Send button. Sending
-publishes the message on the broker AND feeds the orchestrator's own
-`_on_mqtt_message` receive path (the broker does not loop a client's own
-publishes back), so it is processed exactly like a message from the real
-subsystem: local subsystem SM sync, pipeline reactions, and the inspector
-feed shows it as `← received`. Like a simulation, but driven by the user.
-
-- `launch_gui.py` / `backend/orchestrator/main.py`: new `--debug` flag →
-  `WorkflowOrchestrator(debug_mode=...)`.
-- `workflow.py`: `debug_mode` gate; `_build_debug_topics()` (per-subsystem
-  outgoing topics + default payloads; vision's default response is an
-  `objects_detected` list sized to `num_objects`); new WS command
-  `debug_send_subsystem_message` (`_handle_debug_send_subsystem_message`)
-  validates subsystem + topic (only `/status` and `/response` allowed) and
-  payload (JSON object).
-- `frontend_server.py`: `set_debug_topics()` — the descriptor travels with
-  every status broadcast as `details.debug = {enabled, topics}` so
-  (re)connecting clients get it; absent when debug mode is off.
-- Frontend: `debug` in the store; the SM modal renders the panel (topic
-  select, state select, JSON textarea, Send) built once in `open()` and
-  never re-rendered, so operator edits survive live broadcasts; hidden for
-  object modals and when debug mode is off. New WS command in contracts.
-- `simulation_test.py`: TEST 12 (12 checks) — debug config in broadcast,
-  injected status report syncs the local SM, feed shows it as received,
-  `/event` topic rejected, command rejected when debug off, no `debug`
-  key in broadcast when off.
-- Fix (found while testing): `launch_gui.py` now starts children with
-  `start_new_session=True` and shuts them down by process group —
-  terminating npm used to orphan vite, which kept port 3000 bound and
-  blocked the next launch (`check_ports_free`).
+- **cloud_database removed** — object data is stored locally on the machine
+  and the local database is updated manually (no upload command anymore).
+  `object.yaml`: `moving_to_box` no longer fires `cloud_database/upload`,
+  and `object_analyzed` now says the data is stored locally. `workflow.py`
+  `_on_object_event` no longer builds the cloud-upload payload (object_id/
+  alias). Deleted `backend/config/subsystems/cloud_database.yaml` and
+  `backend/simulation/cloud_database_sim.py`; adapter constants
+  (`CLOUD_DB`), the `launch_gui.py` sim list, tests and docs updated.
+  Alias IDs are KEPT: they are now the local-database IDs (wording updated
+  in backend, frontend tooltips/comments and docs).
+- **imaging_3di_hsi split into imaging_3di + imaging_hsi** (3DI before HSI).
+  New YAMLs + sims `imaging_3di` (capturing 3.0 s) and `imaging_hsi`
+  (capturing 4.0 s); the combined YAML/sim are deleted. `robot_second.yaml`
+  has two scan stages: `scan_3d` → `scanning_3d` (2.5 s) and `scan_hsi` →
+  `scanning_hsi` (3.5 s). Object workflow: the single `HSI_3DI_analysis`
+  state is replaced by `3DI_analysis` (fires `imaging_3di/capture` +
+  `robot_second/scan_3d`) → `3di_capture_complete` → `HSI_analysis` (fires
+  `imaging_hsi/capture` + `robot_second/scan_hsi`) → `hsi_capture_complete`
+  → `object_going_first_position` (the `ai_analysis/plan` +
+  `workflow/rotation_requested_first` actions moved here from the old
+  combined state). `pipeline.py`: completion handlers for both imaging
+  subsystems (3DI completion keeps `_imaging_object` set, HSI completion
+  clears it; both guard on the object's current state) and a two-stage skip
+  guard in `_finish_rotation` (an unavailable 3DI/HSI subsystem skips its
+  stage immediately). `global.yaml` state_order/state_colors, frontend
+  `object-styles.ts` defaults and the `ObjectState` enum were updated.
+- simulation_test.py: expected states/transitions/scoped events updated
+  (TEST 2 disk-position states, TEST 7 subsystem config — now also checks
+  `cloud_database` is gone, TEST 8, TEST 9, TEST 10).
 
 ## Next steps
 

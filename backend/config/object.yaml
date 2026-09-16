@@ -33,19 +33,31 @@ states:
           - event: workflow/rotation_requested_second
 
   object_going_second_position:
-    description: Object waits on the first disk for a platform rotation to the second imaging position (3DI/HSI is performed by robot 2)
+    description: Object waits on the first disk for a platform rotation to the second imaging position (3DI, then HSI, are performed by robot 2)
     transitions:
       - event: platform_rotated_to_second
-        target: HSI_3DI_analysis
+        target: 3DI_analysis
         actions:
           - log_event
-          - event: imaging_3di_hsi/capture
-          - event: robot_second/scan_hsi_3d
+          # 3DI is the first imaging stage on the second position.
+          - event: imaging_3di/capture
+          - event: robot_second/scan_3d
 
-  HSI_3DI_analysis:
-    description: 3D imaging and hyperspectral imaging capture is being performed on the object (second position)
+  3DI_analysis:
+    description: 3D imaging capture is being performed on the object (second position, first imaging stage)
     transitions:
-      - event: imaging_capture_complete
+      - event: 3di_capture_complete
+        target: HSI_analysis
+        actions:
+          - log_event
+          # 3DI is done: the HSI capture starts (same position, same robot).
+          - event: imaging_hsi/capture
+          - event: robot_second/scan_hsi
+
+  HSI_analysis:
+    description: Hyperspectral imaging capture is being performed on the object (second position, second imaging stage)
+    transitions:
+      - event: hsi_capture_complete
         target: object_going_first_position
         actions:
           - log_event
@@ -96,7 +108,8 @@ states:
         target: object_analyzed
         actions:
           - log_event
-          - event: cloud_database/upload
+          # No subsystem command: the object's data is stored locally on
+          # the machine; the local database is updated manually (no cloud).
 
   object_analyzed:
-    description: Object analysis is complete – data has been uploaded to the cloud database
+    description: Object analysis is complete – data is stored locally (the local database is updated manually)

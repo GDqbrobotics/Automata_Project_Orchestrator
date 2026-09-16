@@ -11,9 +11,9 @@ from backend.adapters.subsystem import (
     ROTATING_PLATFORM,
     XRF,
     RAMAN,
-    IMAGING_3DI_HSI,
+    IMAGING_3DI,
+    IMAGING_HSI,
     AI_ANALYSIS,
-    CLOUD_DB,
 )
 
 __all__ = [
@@ -27,7 +27,7 @@ __all__ = [
     "ROTATING_PLATFORM",
     "XRF",
     "RAMAN",
-    "IMAGING_3DI_HSI",
+    "IMAGING_3DI",
+    "IMAGING_HSI",
     "AI_ANALYSIS",
-    "CLOUD_DB",
 ]

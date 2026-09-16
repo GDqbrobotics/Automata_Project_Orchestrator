@@ -33,7 +33,8 @@ class ObjectState(str, enum.Enum):
     IDENTIFIED = "identified_in_box"
     WAITING_FOR_DISK = "waiting_for_disk"
     MOVING_TO_DISK = "moving_to_disk"
-    HSI_3DI_ANALYSIS = "HSI_3DI_analysis"
+    THREE_DI_ANALYSIS = "3DI_analysis"
+    HSI_ANALYSIS = "HSI_analysis"
     GOING_SECOND_POSITION = "object_going_second_position"
     XRF_RAMAN_ANALYSIS = "XRF_RAMAN_analysis"
     GOING_FIRST_POSITION = "object_going_first_position"
@@ -219,9 +220,9 @@ class ObjectInfo:
     created: str = ""
     last_state_change: str = ""
     transitions: List[Dict[str, Any]] = field(default_factory=list)
-    # Operator-assigned alias ID for the cloud database ("" = none yet).
-    # The machine keeps working with object_id; the alias rides along in
-    # the cloud_database/upload command payload.
+    # Operator-assigned alias ID for the local database ("" = none yet).
+    # The machine keeps working with object_id; the alias is the ID the
+    # locally stored data gets when the database is updated manually.
     alias: str = ""
 
     def to_dict(self) -> Dict[str, Any]:

@@ -115,8 +115,7 @@ class SubsystemAdapter:
 
         Args:
             event: The transition event.
-            data: Optional context merged into the MQTT command payload
-                (e.g. the cloud upload command carries object_id/alias).
+            data: Optional context merged into the MQTT command payload.
 
         Returns the new state name.
         Raises SubsystemStateMachineError if the transition is invalid.
@@ -233,11 +232,11 @@ ALL_SUBSYSTEMS: List[str] = [
     "robot_first",
     "robot_second",
     "rotating_platform",
+    "imaging_3di",
+    "imaging_hsi",
     "xrf",
     "raman",
-    "imaging_3di_hsi",
     "ai_analysis",
-    "cloud_database",
 ]
 
 # Aliases used in simulation_test.py
@@ -247,6 +246,6 @@ ROBOT_SECOND = "robot_second"
 ROTATING_PLATFORM = "rotating_platform"
 XRF = "xrf"
 RAMAN = "raman"
-IMAGING_3DI_HSI = "imaging_3di_hsi"
+IMAGING_3DI = "imaging_3di"
+IMAGING_HSI = "imaging_hsi"
 AI_ANALYSIS = "ai_analysis"
-CLOUD_DB = "cloud_database"

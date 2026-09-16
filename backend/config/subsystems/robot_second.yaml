@@ -6,12 +6,13 @@ mqtt_topic: "automata/subsystem/{name}"
 initial_state: initializing
 required: true
 metadata:
-  description: "Second robot arm – 3DI/HSI scanning"
+  description: "Second robot arm – 3DI and HSI scanning (3DI first, then HSI)"
   hardware: "Custom end effector (HSI + 3DI)"
   # Simulation timings (seconds) used by backend/simulation/robot_second_sim.py
   init_duration: 1.5
   work_durations:
-    scanning_hsi_3d: 4.0
+    scanning_3d: 2.5
+    scanning_hsi: 3.5
 
 states:
   initializing:
@@ -30,8 +31,13 @@ states:
   ready:
     description: "Robot is ready and idle"
     transitions:
-      - event: scan_hsi_3d
-        target: scanning_hsi_3d
+      - event: scan_3d
+        target: scanning_3d
+        actions:
+          - log_event
+
+      - event: scan_hsi
+        target: scanning_hsi
         actions:
           - log_event
 
@@ -45,8 +51,26 @@ states:
         actions:
           - log_event
 
-  scanning_hsi_3d:
-    description: "Robot is executing the 3DI/HSI scan trajectory"
+  scanning_3d:
+    description: "Robot is executing the 3DI scan trajectory"
+    transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+
+      - event: stop
+        target: stopped
+        actions:
+          - log_event
+
+      - event: error
+        target: error
+        actions:
+          - log_event
+
+  scanning_hsi:
+    description: "Robot is executing the HSI scan trajectory"
     transitions:
       - event: complete
         target: ready
@@ -71,8 +95,13 @@ states:
         actions:
           - log_event
 
-      - event: scan_hsi_3d
-        target: scanning_hsi_3d
+      - event: scan_3d
+        target: scanning_3d
+        actions:
+          - log_event
+
+      - event: scan_hsi
+        target: scanning_hsi
         actions:
           - log_event
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Simulated cloud_database subsystem – standalone process, MQTT-only.
+"""Simulated imaging_3di subsystem – standalone process, MQTT-only.
 
-Runs the cloud_database state machine (backend/config/subsystems/cloud_database.yaml, the
+Runs the imaging_3di state machine (backend/config/subsystems/imaging_3di.yaml, the
 same file the orchestrator uses) as a separate process that communicates
 with the GUI orchestrator exclusively over MQTT – identical to how the
-real cloud_database subsystem will behave.
+real imaging_3di subsystem will behave.
 
 Usage:
-    python backend/simulation/cloud_database_sim.py --broker localhost --port 1883
+    python backend/simulation/imaging_3di_sim.py --broker localhost --port 1883
 """
 import sys
 from pathlib import Path
@@ -19,4 +19,4 @@ if str(_PROJECT_ROOT) not in sys.path:
 from backend.simulation.subsystem_sim import main  # noqa: E402
 
 if __name__ == "__main__":
-    main("cloud_database", default_num_objects=0)
+    main("imaging_3di", default_num_objects=0)

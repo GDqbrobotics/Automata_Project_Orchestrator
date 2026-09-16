@@ -290,7 +290,7 @@ export class App {
       card.appendChild(top);
       if (obj.alias) {
         const aliasEl = el('div', 'object-alias', obj.alias);
-        aliasEl.title = 'Alias ID (cloud database)';
+        aliasEl.title = 'Alias ID (local database)';
         card.appendChild(aliasEl);
       }
       card.appendChild(el('div', 'object-state-desc', obj.state_description || ''));

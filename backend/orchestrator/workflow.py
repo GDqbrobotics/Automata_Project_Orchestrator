@@ -231,8 +231,7 @@ class WorkflowOrchestrator:
         """Route internal events fired by state machines.
 
         `data` (optional) is merged into the MQTT command payload when the
-        event is routed to a subsystem (e.g. the cloud upload command
-        carries the object_id and its operator-assigned alias).
+        event is routed to a subsystem.
 
         Events can be:
           - Unscoped: "error" → broadcast to all subsystems
@@ -402,17 +401,8 @@ class WorkflowOrchestrator:
             # transition path); the controller only sets flags here.
             self._pipeline.on_object_workflow_event(object_id, local_event)
             return
-        # The cloud upload command (object.yaml: 'cloud_database/upload'
-        # fired when an object is analyzed) carries the object reference so
-        # the cloud database can store the record under its alias ID.
-        data = None
-        if scope == "cloud_database" and local_event == "upload":
-            data = {
-                "object_id": object_id,
-                "alias": self.object_manager.get_alias(object_id),
-            }
         # Reuse the same routing logic as workflow events
-        self._on_event(event_name, data=data)
+        self._on_event(event_name)
 
     # ------------------------------------------------------------------
     # Operator Command Handlers
@@ -518,9 +508,10 @@ class WorkflowOrchestrator:
         self.frontend.broadcast_status(self._status)
 
     # Alias IDs: the operator tags objects during the workflow; the alias
-    # is the ID the cloud database uses for the object's record while the
+    # is the ID the local database uses for the object's record while the
     # machine keeps working with the auto-assigned object_id
-    # (docs/PROJECT_CONTEXT.md).
+    # (docs/PROJECT_CONTEXT.md). The local database is updated manually –
+    # there is no cloud subsystem.
     ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_\-\. ]{1,64}$")
 
     def _handle_assign_alias(self, data: Dict[str, Any]) -> None:
@@ -562,7 +553,7 @@ class WorkflowOrchestrator:
                     {"message": f"Alias assignment: unknown object '{object_id}'"},
                 )
                 return
-            # Aliases become cloud database IDs: keep them unique (the
+            # Aliases become local database IDs: keep them unique (the
             # machine's own object_ids are unique by construction).
             alias_lc = alias.lower()
             for oid in self.object_manager.get_object_ids():

@@ -123,11 +123,11 @@ SIMULATED_SUBSYSTEMS = [
     "robot_first",
     "robot_second",
     "rotating_platform",
-    "imaging_3di_hsi",
+    "imaging_3di",
+    "imaging_hsi",
     "xrf",
     "raman",
     "ai_analysis",
-    "cloud_database",
 ]
 
 

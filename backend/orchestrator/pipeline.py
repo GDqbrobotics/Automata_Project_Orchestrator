@@ -27,7 +27,8 @@ many objects outside the box at the same time):
 Stage mapping (docs/PROJECT_CONTEXT.md workflow):
 
 * first disk position:  robot 1 – pick / place / XRF+Raman / return to box
-* second disk position: robot 2 – 3DI+HSI scan (imaging interface)
+* second disk position: robot 2 – 3DI scan, then HSI scan (two imaging
+  subsystems, imaging_3di and imaging_hsi; 3DI always comes first)
 * the AI plans the XRF/Raman points between imaging and measurement:
   it starts in parallel with the rotation back to the first position, and
   the object waits in the ai_processing state until the AI reports done
@@ -53,9 +54,9 @@ VISION = "vision"
 ROBOT_FIRST = "robot_first"
 ROBOT_SECOND = "robot_second"
 ROTATING_PLATFORM = "rotating_platform"
-IMAGING_3DI_HSI = "imaging_3di_hsi"
+IMAGING_3DI = "imaging_3di"
+IMAGING_HSI = "imaging_hsi"
 AI_ANALYSIS = "ai_analysis"
-CLOUD_DB = "cloud_database"
 # Subsystems that work in parallel during the measurement stage on the
 # FIRST disk position (robot 1 + XRF/Raman analyzers). The AI is NOT in the
 # set: it must finish planning the points BEFORE the stage starts (the
@@ -65,7 +66,8 @@ MEASUREMENT_SUBSYSTEMS: Tuple[str, ...] = ("xrf", "raman", "robot_first")
 # Object states used for pipeline coordination (see object.yaml)
 OBJ_WAITING = "waiting_for_disk"            # in the box, queued
 OBJ_GOING_SECOND = "object_going_second_position"   # on the first disk, waiting for rotation to imaging
-OBJ_HSI = "HSI_3DI_analysis"                # on the second disk, being imaged
+OBJ_3DI = "3DI_analysis"                    # on the second disk, 3DI capture (first imaging stage)
+OBJ_HSI = "HSI_analysis"                    # on the second disk, HSI capture (second imaging stage)
 OBJ_GOING_FIRST = "object_going_first_position"     # on the second disk, waiting for rotation back to measurement
 OBJ_AI_PROCESSING = "ai_processing"         # on the first disk, AI planning the XRF/Raman points
 OBJ_XRF_RAMAN = "XRF_RAMAN_analysis"        # on the first disk, being measured
@@ -241,14 +243,25 @@ class PipelineController:
             #  in flight and is counted as a measurement completion below)
             return
 
-        if name == IMAGING_3DI_HSI and was_state == "capturing" and self._imaging_object:
+        if name == IMAGING_3DI and was_state == "capturing" and self._imaging_object:
+            # 3DI capture done: the object moves to the HSI stage (same
+            #    position, same robot); the object transition commands the
+            #    HSI capture and robot 2's HSI scan. _imaging_object stays
+            #    set: the object is still on the imaging position.
+            if self._obj_state(self._imaging_object) == OBJ_3DI:
+                self._fire_object(self._imaging_object, "3di_capture_complete")
+            return
+
+        if name == IMAGING_HSI and was_state == "capturing" and self._imaging_object:
             object_id = self._imaging_object
             self._imaging_object = None
-            # -> object_going_first_position; the object transition starts
-            #    the AI (point planning) and requests the rotation back.
-            #    Robot 2's scan completion is not tracked: the imaging
-            #    interface owns the data the AI needs.
-            self._fire_object(object_id, "imaging_capture_complete")
+            if self._obj_state(object_id) == OBJ_HSI:
+                # -> object_going_first_position; the object transition
+                #    starts the AI (point planning) and requests the
+                #    rotation back. Robot 2's scan completion is not
+                #    tracked: the imaging interfaces own the data the AI
+                #    needs.
+                self._fire_object(object_id, "hsi_capture_complete")
             return
 
         if name == AI_ANALYSIS and was_state == "analyzing" and self._ai_object:
@@ -316,18 +329,27 @@ class PipelineController:
         first, second = self._disk_first, self._disk_second
 
         if first is not None and self._obj_state(first) == OBJ_GOING_SECOND:
-            # -> HSI_3DI_analysis; the object transition commands the
-            #    imaging subsystem and robot 2's scan (second position).
+            # -> 3DI_analysis: the object transition commands the 3DI
+            #    imaging subsystem and robot 2's 3D scan (second position);
+            #    the HSI stage follows in the same position once the 3DI
+            #    capture is done (imaging_3di completion fires
+            #    3di_capture_complete).
             if self._fire_object(first, "platform_rotated_to_second"):
                 self._imaging_object = first
-                if self._sm_state(IMAGING_3DI_HSI) != "capturing":
-                    # Imaging subsystem unavailable: skip the stage so the
-                    # pipeline does not stall.
+                if self._sm_state(IMAGING_3DI) != "capturing":
+                    # 3DI subsystem unavailable: skip the stage so the
+                    # pipeline does not stall (the 3di_capture_complete
+                    # transition then commands the HSI capture).
                     logger.warning(
-                        "Pipeline: imaging not capturing – completing stage immediately"
+                        "Pipeline: 3DI not capturing – completing stage immediately"
                     )
-                    self._imaging_object = None
-                    self._fire_object(first, "imaging_capture_complete")
+                    if self._fire_object(first, "3di_capture_complete"):
+                        if self._sm_state(IMAGING_HSI) != "capturing":
+                            logger.warning(
+                                "Pipeline: HSI not capturing – completing stage immediately"
+                            )
+                            self._fire_object(first, "hsi_capture_complete")
+                            self._imaging_object = None
 
         if second is not None and self._obj_state(second) == OBJ_GOING_FIRST:
             # -> ai_processing: the object waits on the first position for

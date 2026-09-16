@@ -72,7 +72,7 @@ export interface ObjectInfo {
   created: string;
   last_state_change: string;
   transitions: Array<{ from: string; to: string; event: string; timestamp: string }>;
-  /** Operator-assigned alias ID used by the cloud database ('' = none). */
+  /** Operator-assigned alias ID used by the local database ('' = none). */
   alias?: string;
 }
 

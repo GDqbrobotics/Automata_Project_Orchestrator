@@ -21,7 +21,8 @@ object_workflow:
     - waiting_for_disk
     - moving_to_disk
     - object_going_second_position
-    - HSI_3DI_analysis
+    - 3DI_analysis
+    - HSI_analysis
     - object_going_first_position
     - ai_processing
     - XRF_RAMAN_analysis
@@ -32,7 +33,8 @@ object_workflow:
     identified_in_box: identified
     waiting_for_disk: waiting
     moving_to_disk: moving
-    HSI_3DI_analysis: imaging
+    3DI_analysis: imaging
+    HSI_analysis: imaging
     object_going_second_position: rotating
     XRF_RAMAN_analysis: measuring
     object_going_first_position: rotating

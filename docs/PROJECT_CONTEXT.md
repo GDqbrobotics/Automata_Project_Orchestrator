@@ -3,7 +3,7 @@ This document is a description of the project context and the role of the GUI wi
 ## What is AUTOMATA project
 
 AUTOMATA is a project financiated by the European Union that involves various companies and universities, the aim is to create a machine that automatize the analysis of archeological objects. This machine will be used by museums, universities and research institutions to create a database of digital twins for pottery pieces and lithics.
-The operator will load the machine with a gridded box, where the samples are placed, and the system will perform 3D Imaging (3DI), Hyper Spectral Imaging (HSI), uXRF measures and Raman measures. Then all this data will be automatically sent to a database in the cloud.
+The operator will load the machine with a gridded box, where the samples are placed, and the system will perform 3D Imaging (3DI), Hyper Spectral Imaging (HSI), uXRF measures and Raman measures. All this data is stored locally on the machine; the local database is updated manually (there is no automatic cloud upload).
 
 ## Design of the AUTOMATA machine
 
@@ -17,17 +17,17 @@ Going a little bit further in the physical structure of the machine, it is compo
 4. First Robot and picks up the target object.
 5. The object is placed on the transparent disk in first position.
 6. The platform rotated and the disk with the object arrives in the second position.
-7. The Second Robot and performs 3DI and HSI on the object. {First Robot picks up the next object and put on the other transparent disk}
+7. The Second Robot and performs 3DI and then HSI on the object. {First Robot picks up the next object and put on the other transparent disk}
 8. An AI system uses that data in order to extrapolate interest points on the object for next puntual measurements.
 9. The platform rotated and the disk with the object goes back in the first position. {The next object on the other disk goes in second position}
-10. First Robot performs XRF and Raman measurements on the AI's choosen points. {The Second Robot performs 3DI and HSI on the other object}
+10. First Robot performs XRF and Raman measurements on the AI's choosen points. {The Second Robot performs 3DI and then HSI on the other object}
 11. First Robot, picks the object from disk and put it back in its original place inside box and picks the next target object from the box.
 12. Repeat untill all object in the box have been analyzed.
 
-This workflow allows to cut time because the 2 robots are working in parallel. This workflow has been organized in order that HSI and £DI are performed before XRF and Raman becouse this last two analysis are puntual and the points are decided after analyzing HSI and 3DI data. Also this split of duty between the 2 robots follows a timing logic: {XRF + Raman + 'Put back object in box' + 'Pick a new object from box'} has a similar execution time of {HSI + 3DI + 'AI point extrapolation'} 
+This workflow allows to cut time because the 2 robots are working in parallel. This workflow has been organized in order that 3DI and HSI are performed before XRF and Raman becouse this last two analysis are puntual and the points are decided after analyzing 3DI and HSI data. Also this split of duty between the 2 robots follows a timing logic: {XRF + Raman + 'Put back object in box' + 'Pick a new object from box'} has a similar execution time of {3DI + HSI + 'AI point extrapolation'} 
 
-During the workflow the human operator can insert alias IDs from the GUI to the objects in the box, this IDs will be used for on the database in cloud (the machine is already working in the meanwhile with the automatically assigned IDs).
-After storage database IDs are confirmed, the data will be sent to the cloud for each object completed.
+During the workflow the human operator can insert alias IDs from the GUI to the objects in the box, this IDs will be used for the local database (the machine is already working in the meanwhile with the automatically assigned IDs).
+The data is stored locally on the machine for each object completed; the local database is updated manually using the alias IDs.
 
 ## Software Architecture
 
@@ -44,9 +44,9 @@ The sub-systems are:
 | Second robotic arm | Robot arm, custom end effector (HSI + 3DI)| HSI and 3DI trajectory of scanning execution | Docker, ROS2 nodes |
 | XRF interface | XRF analyzer hardware | manage communication, trigger acquisition, and transfer data from XRF device | ? |
 | Raman interface | Raman analyzer hardware | manage communication, trigger acquisition, and transfer data from Raman device | ? |
-| 3DI/HSI interface | 3DI and HSI imaging modules | manage communication, synchronization, and data acquisition from 3DI/HSI devices | ? |
+| 3DI interface | 3DI imaging module | manage communication, synchronization, and data acquisition from the 3DI device (performed first) | ? |
+| HSI interface | HSI imaging module | manage communication, synchronization, and data acquisition from the HSI device (performed after 3DI) | ? |
 | AI analysis | local compute server | interest point extraction, measurement planning for XRF/Raman | ? |
-| Cloud database interface | network connection, cloud servers | data upload, ID confirmation, storage of object records | ? |
 
 ## GUI design principles
 
