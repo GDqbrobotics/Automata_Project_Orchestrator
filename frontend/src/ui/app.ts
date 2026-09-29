@@ -101,6 +101,16 @@ export class App {
   }
 
   /**
+   * Simulation mode (--simulation): toggle whether one subsystem is served
+   * by its simulated process or by the real hardware. The backend rejects
+   * it when it is not running with --simulation, or when the workflow is
+   * not in a pre-start state (idle / stopped / error).
+   */
+  toggleSubsystemSimulation(subsystemId: string): void {
+    this.client.send('toggle_subsystem_simulation', { subsystem: subsystemId });
+  }
+
+  /**
    * Debug mode (--debug): inject an MQTT message on one of the topics a
    * real subsystem is expected to publish, as if the subsystem sent it.
    * The backend rejects it when it is not running with --debug.
@@ -125,6 +135,7 @@ export class App {
     this.updateObjectsGrid();
     this.updateAliasSelect();
     this.updateSubsystemGrid();
+    this.updateSimulationBadge();
     this.updateActionButtons();
     this.updateConnectionIndicator();
     this.updateEventLog();
@@ -317,6 +328,12 @@ export class App {
     const countEl = document.getElementById('subsystemsCount');
     if (countEl) countEl.textContent = `${allNames.length}`;
 
+    // Simulation mode: per-card SIM/REAL toggle (see simulation chip below)
+    const simInfo = this.state.simulation;
+    const toggleAllowed = simInfo?.enabled
+      ? getButtonRules(this.state.workflowState).start
+      : false;
+
     if (allNames.length === 0) {
       grid.appendChild(el('div', 'empty-hint', 'No subsystems configured'));
       return;
@@ -343,6 +360,32 @@ export class App {
       }
       top.appendChild(nameEl);
 
+      // Simulation mode: SIM/REAL toggle chip on the card. Clicking it
+      // switches this subsystem between its simulated process and the real
+      // hardware, but only before the workflow starts (the backend enforces
+      // the same rule). Clicking the rest of the card still opens the
+      // inspector.
+      if (simInfo?.enabled) {
+        const isSimulated = simInfo.simulated.includes(name);
+        const chip = el(
+          'button',
+          `sim-toggle${isSimulated ? ' is-sim' : ' is-real'}`,
+          isSimulated ? 'SIM' : 'REAL',
+        ) as HTMLButtonElement;
+        chip.type = 'button';
+        chip.disabled = !toggleAllowed;
+        chip.title = toggleAllowed
+          ? isSimulated
+            ? 'Simulated by its simulated process – click to use the real subsystem'
+            : 'Served by the real subsystem – click to simulate it'
+          : 'Simulation can only be changed before starting the workflow';
+        chip.addEventListener('click', (e) => {
+          e.stopPropagation(); // do not open the inspector
+          this.toggleSubsystemSimulation(name);
+        });
+        top.appendChild(chip);
+      }
+
       card.appendChild(top);
       card.appendChild(el('span', `subsystem-state tone-${tone}`, state));
       if (description) {
@@ -352,6 +395,29 @@ export class App {
       card.addEventListener('click', () => this.openDetail('subsystem', name));
       grid.appendChild(card);
     }
+  }
+
+  /** Subsystems panel header: show the simulation summary in simulation mode. */
+  private updateSimulationBadge(): void {
+    const badge = document.getElementById('simModeBadge');
+    if (!badge) return;
+    const simInfo = this.state.simulation;
+    if (!simInfo?.enabled) {
+      badge.hidden = true;
+      badge.textContent = '';
+      return;
+    }
+    // Same name set as the grid: config order + any extra from status
+    const configNames = this.state.subsystemsConfig.map((cfg) => cfg.name);
+    const names = [
+      ...configNames,
+      ...Object.keys(this.state.subsystems).filter((n) => !configNames.includes(n)),
+    ];
+    const simulated = names.filter((n) => simInfo.simulated.includes(n)).length;
+    badge.hidden = false;
+    badge.textContent = `simulation · ${simulated}/${names.length}`;
+    badge.title =
+      'Launched with --simulation: click the SIM/REAL chip on each subsystem card to decide which subsystems run as simulated processes (only before starting the workflow)';
   }
 
   /** Keep the alias-assignment object selector in sync with tracked objects. */

@@ -8,6 +8,7 @@ export type WorkflowCommand =
   | 'request_status'
   | 'reset_workflow'
   | 'assign_alias'
+  | 'toggle_subsystem_simulation'
   | 'debug_send_subsystem_message';
 
 export type WorkflowEvent =
@@ -20,6 +21,7 @@ export type WorkflowEvent =
   | 'object_added'
   | 'object_removed'
   | 'object_alias_assigned'
+  | 'subsystem_simulation_toggled'
   | 'subsystem_message'
   | 'object_message'
   | 'messages_cleared';
@@ -112,6 +114,20 @@ export interface DebugTopicDescriptor {
   description: string;
   /** Sensible starting payload, editable in the inspector. */
   default_payload: Record<string, unknown>;
+}
+
+/**
+ * Simulation info sent with status broadcasts when the backend runs
+ * --simulation: which subsystems are currently served by their simulated
+ * process (the operator can toggle each one from its card before the
+ * workflow starts).
+ */
+export interface SimulationInfo {
+  enabled: boolean;
+  /** Subsystem names currently served by a simulated process. */
+  simulated: string[];
+  /** Subsystem names for which a simulator exists (all toggled-off ones can be re-enabled). */
+  available?: string[];
 }
 
 /** Debug config sent with status broadcasts when the backend runs --debug. */

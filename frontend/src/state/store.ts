@@ -8,6 +8,7 @@ import type {
   SubsystemMessage,
   ObjectMessage,
   DebugConfig,
+  SimulationInfo,
 } from '../contracts.js';
 import { getStateMessage } from '../config/state-messages.js';
 
@@ -37,6 +38,8 @@ export interface UiState {
   objectStateMachine: StateMachineDef | null;
   /** Debug config (null when the backend is not running with --debug). */
   debug: DebugConfig | null;
+  /** Simulation info (null when the backend is not running with --simulation). */
+  simulation: SimulationInfo | null;
   /** Recent MQTT messages per subsystem (sent/received). */
   subsystemMessages: Record<string, SubsystemMessage[]>;
   /** Recent internal messages per object (transitions + fired events). */
@@ -67,6 +70,7 @@ export function createInitialState(): UiState {
     subsystemStateMachines: {},
     objectStateMachine: null,
     debug: null,
+    simulation: null,
     subsystemMessages: {},
     objectMessages: {},
     logs: [],
@@ -247,6 +251,10 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (d.debug && typeof d.debug === 'object') {
       updated.debug = d.debug as DebugConfig;
     }
+    // Simulation info (backend started with --simulation)
+    if (d.simulation && typeof d.simulation === 'object') {
+      updated.simulation = d.simulation as SimulationInfo;
+    }
   }
 
   // Handle top-level status updates (broadcast_status payload)
@@ -259,6 +267,7 @@ export function reduceState(state: UiState, msg: unknown): UiState {
       subsystem_state_machines?: Record<string, StateMachineDef>;
       object_state_machine?: StateMachineDef;
       debug?: DebugConfig;
+      simulation?: SimulationInfo;
     };
     updated.workflowState = s.state;
     updated.progress = s.progress;
@@ -306,6 +315,10 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (s.debug && typeof s.debug === 'object') {
       updated.debug = s.debug;
     }
+    // Simulation info from top-level payload (backend started with --simulation)
+    if (s.simulation && typeof s.simulation === 'object') {
+      updated.simulation = s.simulation as SimulationInfo;
+    }
   }
 
   // Handle individual object state changes
@@ -338,6 +351,28 @@ export function reduceState(state: UiState, msg: unknown): UiState {
         level: 'info',
       });
     }
+  }
+
+  // Handle per-subsystem simulation toggle (simulation mode, operator action)
+  if (m.event === 'subsystem_simulation_toggled' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const name = d.subsystem as string;
+    const simulated = Boolean(d.simulated);
+    if (name && updated.simulation) {
+      const set = new Set(updated.simulation.simulated);
+      if (simulated) {
+        set.add(name);
+      } else {
+        set.delete(name);
+      }
+      updated.simulation = { ...updated.simulation, simulated: [...set].sort() };
+    }
+    logs.push({
+      time: now(),
+      source: 'simulation',
+      message: `${name}: ${simulated ? 'simulated' : 'real hardware'}`,
+      level: 'info',
+    });
   }
 
   // Handle object alias assignment (operator action)

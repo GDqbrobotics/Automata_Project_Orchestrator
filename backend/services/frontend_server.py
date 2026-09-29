@@ -57,6 +57,10 @@ class FrontendServer:
         # default payloads), broadcast with status when the orchestrator
         # runs with --debug (user-driven MQTT injection in the inspector).
         self._debug_topics: Optional[Dict[str, List[Dict[str, Any]]]] = None
+        # Simulation info (enabled + which subsystems are simulated),
+        # broadcast with status when the orchestrator runs with
+        # --simulation (per-subsystem SIM/REAL toggle on the cards).
+        self._simulation_info: Optional[Dict[str, Any]] = None
         # Last full-status payload, replayed to newly connected clients so a
         # (re)connecting UI immediately gets state + SM definitions.
         self._last_status_payload: Dict[str, Any] | None = None
@@ -176,6 +180,9 @@ class FrontendServer:
                 "enabled": True,
                 "topics": self._debug_topics,
             }
+        # Include simulation info (only when launched with --simulation)
+        if self._simulation_info is not None:
+            status_dict["simulation"] = self._simulation_info
         # Include any extra details (e.g. object workflow state order/colors)
         if extra_details:
             status_dict.update(extra_details)
@@ -207,6 +214,22 @@ class FrontendServer:
         """Set the subsystem configuration to broadcast with status updates."""
         self._subsystem_config = config_list
         logger.info("Subsystem config set: %d subsystems", len(config_list))
+
+    def set_simulation_info(self, info: Optional[Dict[str, Any]]) -> None:
+        """Set the simulation info broadcast with every status update.
+
+        Only called when the orchestrator runs with --simulation: it tells
+        the frontend that per-subsystem simulation toggles are available
+        and which subsystems are currently simulated, so it can render the
+        SIM/REAL toggle on each subsystem card. Updated whenever the
+        operator toggles a subsystem.
+        """
+        self._simulation_info = info
+        if info is not None:
+            logger.info(
+                "Simulation info set: %d/%d subsystems simulated",
+                len(info.get("simulated", [])), len(info.get("available", [])),
+            )
 
     def set_debug_topics(self, topics: Dict[str, List[Dict[str, Any]]]) -> None:
         """Set the debug topic descriptors (subsystem -> topics the real

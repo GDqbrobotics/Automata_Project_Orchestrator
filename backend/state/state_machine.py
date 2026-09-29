@@ -204,6 +204,27 @@ class StateMachineEngine:
             for t in transitions
         }
 
+    def reset_to_initial(self) -> str:
+        """Force the machine back to its configured initial state.
+
+        Used when the orchestrator's view of a subsystem must be wiped
+        (e.g. the simulated process behind it was stopped and the
+        subsystem is expected to report its state again from scratch).
+        This bypasses the transition graph on purpose: it is an operator-
+        initiated reset of the orchestrator's local view, not a machine
+        event.
+
+        Returns the (new) current state.
+        """
+        previous = self.current_state
+        self.current_state = self.config.initial_state
+        if previous != self.current_state:
+            logger.info(
+                "State machine '%s': reset %s -> %s",
+                self.config_name, previous, self.current_state,
+            )
+        return self.current_state
+
     # ------------------------------------------------------------------
     # Transition firing
     # ------------------------------------------------------------------

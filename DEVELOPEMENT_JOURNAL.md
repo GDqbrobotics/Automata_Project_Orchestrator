@@ -6,7 +6,8 @@ Keep this file brief, is meant to show the next developer the work of the last o
 
 Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-based simulation** (one simulated subsystem process per real subsystem, all MQTT).
 
-- Launch everything: `python launch_gui.py --simulation --num-objects 3` (UI on http://localhost:3000; starts mosquitto + 9 `backend/simulation/*_sim.py` processes + backend + frontend)
+- Launch everything: `python launch_gui.py --simulation --num-objects 3` (UI on http://localhost:3000; starts mosquitto + backend + frontend — in simulation mode the *backend* starts the `backend/simulation/*_sim.py` processes itself)
+- Per-subsystem simulation toggle: in simulation mode each subsystem card has a **SIM/REAL** chip (before starting the workflow) to decide which subsystems are simulated and which are real (see Latest changes 2026-09-29)
 - Debug mode: `python launch_gui.py --debug` — subsystem inspector windows gain a panel to manually send the MQTT messages a real subsystem would publish (user-driven simulation; see Latest changes 2026-09-14)
 - Validate: `timeout 500 python backend/simulation_test.py` — **always wrap in a timeout** (a bug can make it hang forever)
 - All state machines are YAML-driven: `backend/config/workflow.yaml`, `object.yaml`, `subsystems/*.yaml`, `global.yaml`. Simulated subsystems load the *same* YAML as the orchestrator. Work durations live in the subsystem YAML metadata (`work_durations`).
@@ -14,6 +15,43 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - Object workflow has an explicit `ai_processing` state between `object_going_first_position` and `XRF_RAMAN_analysis`: the object waits on the first position until the AI finishes extracting the XRF/Raman interest points (see Latest changes 2026-09-14 / ai_processing).
 - Object data is stored **locally**; the local database is updated manually — there is no cloud_database subsystem (operator alias IDs are the local-database IDs).
 - Imaging on the second disk position is two sequential stages, **3DI first then HSI**, handled by two subsystems: `imaging_3di` and `imaging_hsi` (see Latest changes 2026-09-16).
+
+## Latest changes (2026-09-29 — per-subsystem simulation toggle)
+
+Simulation mode is now a **per-subsystem** choice, togglable from the GUI before the workflow starts:
+
+- **The orchestrator owns the simulated processes** — new
+  `backend/simulation/process_manager.py` (`SubsystemProcessManager`):
+  starts/stops the `backend/simulation/<name>_sim.py` processes and
+  discovers simmable subsystems by the script's presence. In simulation
+  mode `WorkflowOrchestrator` starts the processes of every toggled-on
+  subsystem at startup (default: all of them), re-ensures they are
+  running on Start, and stops them all on `stop()`. `launch_gui.py`
+  no longer starts sim processes itself (the `SIMULATED_SUBSYSTEMS`
+  list is gone).
+- **New WS command `toggle_subsystem_simulation`** (event
+  `subsystem_simulation_toggled`; see `WorkflowCommand`/`BackendEvent`
+  in `backend/domain/models.py`): switches one subsystem between its
+  simulated process (SIM) and the real hardware over MQTT (REAL).
+  Only accepted when launched with `--simulation` AND in a workflow
+  state where Start is allowed (idle/stopped/error) — i.e. before the
+  process starts. Toggle-off stops the process and resets the
+  orchestrator's view (local subsystem SM → initial state via the new
+  `StateMachineEngine.reset_to_initial()`, adapter → offline, waiting
+  for the real subsystem's first MQTT report); toggle-on (re)starts the
+  process (self-init initializing→ready over MQTT, as usual).
+- **Frontend**: in simulation mode each subsystem card carries a
+  SIM/REAL chip (clicking the chip does NOT open the inspector; it is
+  disabled while the workflow is active), a "simulation · N/9" badge in
+  the subsystems panel header, and the full status broadcast now
+  carries `simulation: {enabled, simulated[], available[]}`
+  (`FrontendServer.set_simulation_info`, same pattern as the --debug
+  topics).
+- simulation_test.py: TEST 2 no longer starts external sim processes
+  (the orchestrator owns them); new TEST 13 covers the toggle
+  end-to-end (default set = all, off/on cycle, status payload,
+  rejection while active, allowed again after stop).
+- README updated (Running / Using the GUI / Configuration).
 
 ## Latest changes (2026-09-16 — cloud_database removed; imaging split into 3DI + HSI)
 

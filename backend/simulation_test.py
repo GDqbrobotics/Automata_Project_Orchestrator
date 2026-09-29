@@ -198,55 +198,14 @@ def stop_mosquitto_broker(proc: subprocess.Popen) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Simulated subsystem processes (backend/simulation/*_sim.py)
-# ---------------------------------------------------------------------------
-# In simulation mode every subsystem is simulated as an individual process
-# that communicates with the orchestrator exclusively over MQTT – identical
-# to how the real subsystems will behave.
-ACTIVE_SIM_PROCS: List[subprocess.Popen] = []
-
-
-def start_simulator_processes(port: int, num_objects: int) -> None:
-    """Start one simulated subsystem process per configured subsystem."""
-    stop_simulator_processes()  # defensive: clean up leftovers from a failed run
-    sim_dir = Path(__file__).resolve().parent / "simulation"
-    for name in ALL_SUBSYSTEMS:
-        cmd = [
-            sys.executable, str(sim_dir / f"{name}_sim.py"),
-            "--broker", MQTT_BROKER_HOST,
-            "--port", str(port),
-        ]
-        if name == "vision":
-            cmd.extend(["--num-objects", str(num_objects)])
-        logger.info("Starting simulated subsystem process: %s", name)
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        _start_pipe_drainers(proc)
-        ACTIVE_SIM_PROCS.append(proc)
-
-
-def stop_simulator_processes() -> None:
-    """Stop all simulated subsystem processes."""
-    for proc in ACTIVE_SIM_PROCS:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-    for proc in ACTIVE_SIM_PROCS:
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    ACTIVE_SIM_PROCS.clear()
-
-
-# ---------------------------------------------------------------------------
 # Orchestrator runner (headless)
 # ---------------------------------------------------------------------------
+# NOTE: in simulation mode the orchestrator OWNS the simulated subsystem
+# processes (backend/simulation/process_manager.py): starting the
+# orchestrator with use_simulation=True also starts the sim processes for
+# every subsystem the operator has toggled on (default: all of them), and
+# orchestrator.stop() stops them. The test suite therefore no longer starts
+# sim processes itself – that is exactly what the GUI toggle does.
 class OrchestratorRunner:
     """Runs the orchestrator in the main process (no thread needed for test)."""
 
@@ -473,12 +432,9 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
     """
     logger.info("--- TEST 2: Full Workflow Simulation (GUI via WebSocket) ---")
 
-    # Start the simulated subsystem processes (self-init over MQTT)
-    start_simulator_processes(MQTT_BROKER_PORT, num_objects)
-    # Give them time to connect to the broker and self-initialize
-    time.sleep(2.5)
-
-    # Start orchestrator in simulation mode with the correct number of objects
+    # Start orchestrator in simulation mode with the correct number of
+    # objects: it also starts the simulated subsystem processes itself
+    # (self-init over MQTT), exactly like the real launcher does.
     runner = OrchestratorRunner(
         CONFIG_PATH,
         SUBSYSTEMS_CONFIG_DIR,
@@ -486,6 +442,8 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
         num_objects=num_objects,
     )
     runner.start()
+    # Give the sim processes time to connect to the broker and self-init
+    time.sleep(2.5)
 
     # Connect WebSocket client (simulating GUI)
     ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
@@ -604,10 +562,10 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
         + (f" [violations: {invariant_violations[:3]}...]" if invariant_violations else ""),
     )
 
-    # ---- Cleanup ----
+    # ---- Cleanup (runner.stop() also stops the sim processes owned by
+    #      the orchestrator) ----
     runner.stop()
     await ws_client.close()
-    stop_simulator_processes()
 
     logger.info("Full workflow simulation with GUI commands complete.\n")
 
@@ -1446,6 +1404,159 @@ async def test_debug_mode() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 13: Per-subsystem simulation toggle (GUI)
+# ---------------------------------------------------------------------------
+async def test_simulation_toggle() -> None:
+    """Test: in simulation mode the operator toggles each subsystem's
+    simulation from the GUI before starting the workflow.
+
+    Covers the per-subsystem SIM/REAL toggle end-to-end:
+    - the orchestrator owns the sim processes and starts them all by
+      default,
+    - the toggle (only accepted before starting) stops/starts the process
+      and resets the orchestrator's view of the subsystem,
+    - the status broadcast carries the simulation info (which subsystems
+      are currently simulated),
+    - the toggle is rejected while the workflow is active, and allowed
+      again once the workflow is stopped.
+    """
+    logger.info("--- TEST 13: Per-Subsystem Simulation Toggle (GUI) ---")
+
+    # Starting the orchestrator in simulation mode also starts the sim
+    # processes for every subsystem (default toggle state: all simulated).
+    runner = OrchestratorRunner(
+        CONFIG_PATH,
+        SUBSYSTEMS_CONFIG_DIR,
+        use_simulation=True,
+        num_objects=3,
+    )
+    runner.start()
+    # Give the sim processes time to boot and report over MQTT
+    time.sleep(2.5)
+
+    ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+    await ws_client.connect()
+    time.sleep(0.3)
+
+    orch = runner.orchestrator
+
+    # ── Default: every simmable subsystem is simulated ──
+    results.check(
+        sorted(orch._simulated) == sorted(ALL_SUBSYSTEMS),
+        f"Default simulation set includes all {len(ALL_SUBSYSTEMS)} subsystems",
+    )
+    for name in ALL_SUBSYSTEMS:
+        results.check(
+            orch._sim_procs.is_running(name),
+            f"Simulated process running for '{name}' by default",
+        )
+
+    # ── Toggle one subsystem OFF (-> real hardware) while idle ──
+    await ws_client.send_command(
+        "toggle_subsystem_simulation", {"subsystem": IMAGING_3DI},
+    )
+    await ws_client.receive()
+    time.sleep(0.5)
+    results.check(IMAGING_3DI not in orch._simulated, "imaging_3di toggled off (real)")
+    results.check(
+        not orch._sim_procs.is_running(IMAGING_3DI),
+        "imaging_3di simulated process stopped",
+    )
+    adapter = orch.adapters[IMAGING_3DI]
+    results.check(
+        adapter.state == SubsystemState.OFFLINE,
+        "imaging_3di marked offline, waiting for the real subsystem to report",
+    )
+
+    # The status broadcast carries the updated simulation info. Broadcasts
+    # are scheduled after command acks, so scan both the recorded messages
+    # and the freshly drained ones.
+    await ws_client.send_command("request_status")
+    await ws_client.receive()
+    drained = await ws_client.drain_messages()
+    sim_infos = [
+        (m.get("details") or {}).get("simulation")
+        for m in ws_client.received_messages + drained
+        if m.get("event") == "workflow_state_changed"
+    ]
+    sim_infos = [s for s in sim_infos if isinstance(s, dict)]
+    results.check(len(sim_infos) > 0, "Status broadcast carries simulation info")
+    last_sim = sim_infos[-1] if sim_infos else {}
+    results.check(
+        last_sim.get("enabled") is True
+        and IMAGING_3DI not in last_sim.get("simulated", []),
+        "Simulation info reflects imaging_3di toggled off",
+    )
+
+    # ── Toggle it back ON ──
+    await ws_client.send_command(
+        "toggle_subsystem_simulation", {"subsystem": IMAGING_3DI},
+    )
+    await ws_client.receive()
+    time.sleep(0.5)
+    results.check(
+        IMAGING_3DI in orch._simulated and orch._sim_procs.is_running(IMAGING_3DI),
+        "imaging_3di toggled back on (simulated process restarted)",
+    )
+
+    # ── Toggle is rejected while the workflow is active ──
+    ws_client.received_messages.clear()
+    await ws_client.send_command("start_workflow")
+    await ws_client.receive()
+    for _ in range(60):
+        if runner.current_state_name in ("starting", "running"):
+            break
+        await ws_client.drain_messages()
+        time.sleep(0.25)
+    results.check(
+        runner.current_state_name in ("starting", "running"),
+        "Workflow started for the toggle-rejection check",
+    )
+    await ws_client.send_command("toggle_subsystem_simulation", {"subsystem": XRF})
+    await ws_client.receive()
+    # The error broadcast is scheduled after the command ack, so it can
+    # arrive just after receive() returned: collect the drained messages too.
+    drained = await ws_client.drain_messages()
+    errors = [
+        m for m in ws_client.received_messages + drained
+        if m.get("event") == "error_reported"
+    ]
+    results.check(len(errors) > 0, "Toggle rejected while the workflow is active")
+    results.check(
+        XRF in orch._simulated and orch._sim_procs.is_running(XRF),
+        "xrf untouched by the rejected toggle",
+    )
+
+    # ── Stop the workflow: the toggle is allowed again ──
+    await ws_client.send_command("stop_workflow")
+    await ws_client.receive()
+    for _ in range(60):
+        if runner.current_state_name == "stopped":
+            break
+        await ws_client.drain_messages()
+        time.sleep(0.25)
+    results.check(
+        runner.current_state_name == "stopped",
+        "Workflow stopped before the post-stop toggle",
+    )
+    ws_client.received_messages.clear()
+    await ws_client.send_command("toggle_subsystem_simulation", {"subsystem": RAMAN})
+    await ws_client.receive()
+    drained = await ws_client.drain_messages()
+    errors = [
+        m for m in ws_client.received_messages + drained
+        if m.get("event") == "error_reported"
+    ]
+    results.check(len(errors) == 0, "Toggle accepted again once the workflow is stopped")
+    results.check(RAMAN not in orch._simulated, "raman toggled off after the stop")
+
+    await ws_client.close()
+    runner.stop()  # also stops the remaining simulated processes
+
+    logger.info("Per-subsystem simulation toggle test complete.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def run_all_tests(num_objects: int = 3) -> bool:
@@ -1484,13 +1595,14 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         test_scoped_event_routing()
         time.sleep(1)
         await test_debug_mode()
+        time.sleep(1)
+        await test_simulation_toggle()
 
     except Exception as exc:
         logger.error("Test suite error: %s", exc, exc_info=True)
         results.check(False, f"Test suite completed without exception: {exc}")
 
     finally:
-        stop_simulator_processes()
         stop_mosquitto_broker(broker_proc)
 
     print(results.summary())

@@ -622,6 +622,52 @@ body {
 
 .required-badge { color: var(--error); font-weight: 800; margin-left: 3px; }
 
+/* per-subsystem simulation toggle chip (simulation mode only) */
+.sim-toggle {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-family: var(--font);
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.sim-toggle.is-sim {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  border-color: rgba(91, 141, 239, 0.55);
+}
+.sim-toggle.is-real {
+  background: transparent;
+  color: var(--text-faint);
+  border-color: var(--border);
+}
+.sim-toggle:not(:disabled):hover {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  border-color: var(--accent);
+}
+.sim-toggle:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* simulation summary badge (subsystems panel header) */
+.sim-badge {
+  margin-left: auto;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  border: 1px solid rgba(91, 141, 239, 0.4);
+  white-space: nowrap;
+  cursor: help;
+}
+
 .subsystem-state {
   align-self: flex-start;
   font-size: 0.67rem;

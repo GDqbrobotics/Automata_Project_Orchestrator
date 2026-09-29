@@ -118,13 +118,16 @@ Everything is started from a single command:
 python launch_gui.py --simulation --num-objects 5
 ```
 
-This starts the MQTT broker, **nine simulated subsystem processes**, the
-backend and the frontend; the operator UI is then served at
-<http://localhost:3000>. It is the recommended way to try the system: in
-simulation mode every subsystem is a real, separate process that loads the
-*same* YAML state machine the orchestrator uses and communicates over MQTT
-exactly like the real hardware would. Nothing in the orchestrator knows or
-cares that the subsystems are fake.
+This starts the MQTT broker, the backend and the frontend; the operator UI
+is then served at <http://localhost:3000>. In simulation mode the backend
+itself starts **one simulated process per subsystem** (by default all of
+them). It is the recommended way to try the system: every simulated
+subsystem is a real, separate process that loads the *same* YAML state
+machine the orchestrator uses and communicates over MQTT exactly like the
+real hardware would. Nothing in the orchestrator knows or cares that a
+subsystem is fake — and since the orchestrator owns the simulated
+processes, the operator can decide **per subsystem** which ones are
+simulated and which are real (see "Using the GUI").
 
 Other useful invocations:
 
@@ -147,6 +150,12 @@ over an already-running instance (port conflict) is intentional.
   opens its *inspector*: a graphical view of that subsystem's state machine
   (current state highlighted, rendered from the same YAML the machine runs
   on) plus a live feed of the MQTT traffic to and from it.
+- **Simulation toggle** (only with `--simulation`) — each subsystem card
+  carries a **SIM / REAL** chip. Before starting the workflow, click it to
+  decide whether that subsystem is served by its simulated process (SIM,
+  the default) or by the real hardware speaking MQTT (REAL). The chip is
+  disabled while the workflow is running; the backend enforces the same
+  rule.
 - **Object cards** — one card per analyzed sample, showing where it is in
   its journey, plus an overall progress counter. Clicking a card shows the
   object's state machine and the internal events it fired.
@@ -177,10 +186,11 @@ rejects anything the configuration does not define.
 YAML in `backend/config/subsystems/` with the subsystem's name and state
 machine, and the orchestrator discovers it automatically (its card, its
 MQTT topics, its place in the GUI). To have it simulated as well, copy one
-of the existing one-line scripts `backend/simulation/<name>_sim.py` for the
-new name, and add the name to the `SIMULATED_SUBSYSTEMS` list in
-`launch_gui.py` and to the `ALL_SUBSYSTEMS` list in
-`backend/adapters/subsystem.py` (used by the test suite).
+of the existing one-line scripts as `backend/simulation/<name>_sim.py` —
+the orchestrator discovers the simulator by the script's presence and the
+subsystem becomes toggleable in the GUI (simulation mode) — and add the
+name to the `ALL_SUBSYSTEMS` list in `backend/adapters/subsystem.py`
+(used by the test suite).
 
 ## Testing
 

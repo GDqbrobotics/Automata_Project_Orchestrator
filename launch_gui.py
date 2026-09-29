@@ -114,52 +114,6 @@ def start_mosquitto_broker(port: int = 1883) -> subprocess.Popen:
     raise RuntimeError("Failed to start mosquitto broker")
 
 
-# One simulated process per subsystem (backend/simulation/<name>_sim.py).
-# Each process runs the subsystem's own state machine (the same YAML the
-# orchestrator uses) and communicates with the orchestrator exclusively
-# over MQTT – identical to how the real subsystems will behave.
-SIMULATED_SUBSYSTEMS = [
-    "vision",
-    "robot_first",
-    "robot_second",
-    "rotating_platform",
-    "imaging_3di",
-    "imaging_hsi",
-    "xrf",
-    "raman",
-    "ai_analysis",
-]
-
-
-def start_subsystem_simulators(
-    broker_host: str = "localhost",
-    broker_port: int = 1883,
-    num_objects: int = 3,
-) -> list[subprocess.Popen]:
-    """Start one simulated subsystem process per subsystem (simulation mode)."""
-    procs: list[subprocess.Popen] = []
-    sim_dir = project_root / "backend" / "simulation"
-    for name in SIMULATED_SUBSYSTEMS:
-        cmd = [
-            sys.executable, str(sim_dir / f"{name}_sim.py"),
-            "--broker", broker_host,
-            "--port", str(broker_port),
-        ]
-        if name == "vision":
-            cmd.extend(["--num-objects", str(num_objects)])
-        logger.info("Starting simulated subsystem: %s", name)
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=str(project_root),
-            start_new_session=True,
-        )
-        start_pipe_drainers(proc)
-        procs.append(proc)
-    return procs
-
-
 def start_backend(
     broker_host: str = "localhost",
     broker_port: int = 1883,
@@ -328,14 +282,10 @@ def main() -> None:
         broker_proc = start_mosquitto_broker(args.mqtt_port)
         processes.append(broker_proc)
         
-        # Start simulated subsystem processes (simulation mode only)
-        if args.simulation:
-            processes.extend(start_subsystem_simulators(
-                broker_host=args.broker,
-                broker_port=args.mqtt_port,
-                num_objects=args.num_objects,
-            ))
-            time.sleep(0.5)
+        # In simulation mode the backend orchestrator owns the simulated
+        # subsystem processes (it starts them on startup and lets the
+        # operator toggle each subsystem's simulation from the GUI before
+        # the workflow starts), so the launcher does not start them itself.
         
         # Start backend
         backend_proc = start_backend(
@@ -364,8 +314,10 @@ def main() -> None:
         logger.info("  MQTT broker: localhost:%d", args.mqtt_port)
         if args.simulation:
             logger.info(
-                "  Simulation mode: %d objects (%d simulated subsystem processes)",
-                args.num_objects, len(SIMULATED_SUBSYSTEMS),
+                "  Simulation mode: %d objects – the backend starts the "
+                "simulated subsystem processes; toggle each subsystem "
+                "SIM/REAL from its card before starting the workflow",
+                args.num_objects,
             )
         if args.debug:
             logger.info(

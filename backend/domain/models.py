@@ -51,6 +51,10 @@ class WorkflowCommand(str, enum.Enum):
     REQUEST_STATUS = "request_status"
     RESET_WORKFLOW = "reset_workflow"
     ASSIGN_ALIAS = "assign_alias"
+    # Simulation mode only (--simulation): toggle whether one subsystem
+    # is served by its simulated process or by the real hardware. Only
+    # accepted before the workflow starts (idle / stopped / error).
+    TOGGLE_SUBSYSTEM_SIMULATION = "toggle_subsystem_simulation"
     # Debug mode only (--debug): inject an MQTT message on one of the
     # topics a real subsystem publishes, as if the subsystem sent it.
     DEBUG_SEND_SUBSYSTEM_MESSAGE = "debug_send_subsystem_message"
@@ -74,6 +78,9 @@ class BackendEvent(str, enum.Enum):
     OBJECT_ADDED = "object_added"
     OBJECT_REMOVED = "object_removed"
     OBJECT_ALIAS_ASSIGNED = "object_alias_assigned"  # operator set an alias ID
+    # Simulation mode: the operator toggled a subsystem's simulation
+    # (subsystem is now served by its simulated process / by real hardware)
+    SUBSYSTEM_SIMULATION_TOGGLED = "subsystem_simulation_toggled"
     # Message traffic for the state-machine inspector modal:
     SUBSYSTEM_MESSAGE = "subsystem_message"    # MQTT sent to / received from a subsystem
     OBJECT_MESSAGE = "object_message"          # internal messages of one object's SM

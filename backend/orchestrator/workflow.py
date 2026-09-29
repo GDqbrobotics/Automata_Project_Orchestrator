@@ -48,7 +48,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import yaml
 
@@ -74,6 +74,7 @@ from backend.domain.models import (
 )
 from backend.messaging.mqtt_client import MqttClient, TOPIC_SUBSYSTEM
 from backend.services.frontend_server import FrontendServer
+from backend.simulation.process_manager import SubsystemProcessManager
 from backend.state.state_machine import StateMachineEngine, StateMachineError
 from backend.orchestrator.object_state_machines import ObjectStateMachines
 from backend.orchestrator.pipeline import PipelineController
@@ -203,10 +204,25 @@ class WorkflowOrchestrator:
         self._pipeline = PipelineController(self)
 
         # ─── Simulation Mode ───
-        # Marker only: in simulation mode the subsystems behind the MQTT
-        # boundary are simulated processes (backend/simulation/*_sim.py);
-        # the orchestrator code path is the same in both modes.
+        # In simulation mode the subsystems behind the MQTT boundary are
+        # simulated processes (backend/simulation/*_sim.py) owned by this
+        # orchestrator: the operator can toggle each subsystem between
+        # simulated and real from the GUI before starting the workflow
+        # (default: every simmable subsystem is simulated). The
+        # orchestrator code path is the same in both modes.
         self._use_simulation = use_simulation
+        self._sim_procs: Optional[SubsystemProcessManager] = None
+        self._simulated: Set[str] = set()
+        if use_simulation:
+            self._sim_procs = SubsystemProcessManager(
+                # Follow the live MQTT client so the sim processes always
+                # target the broker the orchestrator itself uses.
+                endpoint=lambda: (self.mqtt.broker, self.mqtt.port),
+                num_objects=self._total_objects,
+            )
+            self._simulated = set(
+                self._sim_procs.available(list(self.adapters.keys()))
+            )
 
         # ─── Command Handlers ───
         self.frontend.set_command_handler(WorkflowCommand.START_WORKFLOW, self._handle_start)
@@ -216,6 +232,10 @@ class WorkflowOrchestrator:
         self.frontend.set_command_handler(WorkflowCommand.REQUEST_STATUS, self._handle_status)
         self.frontend.set_command_handler(WorkflowCommand.RESET_WORKFLOW, self._handle_reset)
         self.frontend.set_command_handler(WorkflowCommand.ASSIGN_ALIAS, self._handle_assign_alias)
+        self.frontend.set_command_handler(
+            WorkflowCommand.TOGGLE_SUBSYSTEM_SIMULATION,
+            self._handle_toggle_subsystem_simulation,
+        )
         self.frontend.set_command_handler(
             WorkflowCommand.DEBUG_SEND_SUBSYSTEM_MESSAGE,
             self._handle_debug_send_subsystem_message,
@@ -409,6 +429,9 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     def _handle_start(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: start_workflow")
+        # Simulation mode: make sure the simulated subsystem processes
+        # that are toggled on are actually running (restart any that died).
+        self._ensure_simulated_processes_running()
         # Always clear previous state before starting a new workflow.
         # This handles starting from stopped, error, or idle.
         self._reset_workflow_state()
@@ -571,6 +594,141 @@ class WorkflowOrchestrator:
             {"object_id": object_id, "alias": alias, "source": "operator"},
         )
         self._broadcast_objects()
+
+    # ------------------------------------------------------------------
+    # Simulation mode (--simulation): per-subsystem simulation toggle
+    # ------------------------------------------------------------------
+    @property
+    def simulation_info(self) -> Dict[str, Any]:
+        """Simulation info for the frontend ({} when not in simulation mode)."""
+        if self._sim_procs is None:
+            return {}
+        return {
+            "enabled": True,
+            "simulated": sorted(self._simulated),
+            "available": sorted(self._sim_procs.available(list(self.adapters.keys()))),
+        }
+
+    def _ensure_simulated_processes_running(self) -> None:
+        """(Re)start the simulated process of every toggled-on subsystem."""
+        if self._sim_procs is None:
+            return
+        for name in sorted(self._simulated):
+            if not self._sim_procs.is_running(name):
+                logger.info("[sim] ensuring simulated process for '%s'", name)
+                self._sim_procs.start(name)
+
+    def _reset_subsystem_view(self, name: str) -> None:
+        """Reset the orchestrator's local view of a subsystem.
+
+        Used after toggling its simulation on or off: the state history of
+        the previous (simulated) process is meaningless for a fresh start,
+        so the local subsystem SM goes back to its initial state and the
+        adapter waits for the first status report over MQTT (offline) –
+        exactly like a not-yet-seen real subsystem.
+        """
+        adapter = self.adapters.get(name)
+        if adapter is None:
+            return
+        if adapter.state_machine is not None:
+            adapter.state_machine.reset_to_initial()
+        adapter.update_state(SubsystemState.OFFLINE)
+        self._refresh_subsystem_info(name)
+        self._fire_frontend_event(
+            BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
+            {
+                "subsystem": name,
+                "new_state": (
+                    adapter.state_machine.current_state
+                    if adapter.state_machine
+                    else adapter.initial_state
+                ),
+                "state_description": adapter._get_state_description(),
+                "source": "simulation_toggle",
+            },
+        )
+
+    def _handle_toggle_subsystem_simulation(self, data: Dict[str, Any]) -> None:
+        """Toggle one subsystem between simulated and real (simulation mode).
+
+        Command payload: {command, subsystem: str}
+
+        Only accepted before the workflow starts (idle / stopped / error –
+        the same states where the operator can press Start): a subsystem is
+        a black box behind the MQTT boundary, and switching it in the middle
+        of a run would leave the pipeline without a valid counterpart.
+        """
+        name = str(data.get("subsystem") or "").strip()
+
+        if self._sim_procs is None:
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {
+                    "message": (
+                        "Simulation toggles are only available when "
+                        "launched with --simulation"
+                    )
+                },
+            )
+            return
+        if self.state_machine.state not in (
+            WorkflowState.IDLE, WorkflowState.STOPPED, WorkflowState.ERROR,
+        ):
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {
+                    "message": (
+                        "Subsystem simulation can only be changed before "
+                        "starting the workflow"
+                    )
+                },
+            )
+            return
+        if name not in self.adapters:
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": f"Simulation toggle: unknown subsystem '{name}'"},
+            )
+            return
+        if not self._sim_procs.has_sim(name):
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {
+                    "message": (
+                        f"Simulation toggle: no simulator available "
+                        f"for '{name}'"
+                    )
+                },
+            )
+            return
+
+        if name in self._simulated:
+            # Simulated -> real: stop the process; the real subsystem is
+            # then expected to report over MQTT like in normal mode.
+            self._simulated.discard(name)
+            self._sim_procs.stop(name)
+            logger.info(
+                "[sim] subsystem '%s' toggled OFF (real hardware expected)",
+                name,
+            )
+        else:
+            # Real -> simulated: (re)start the process; it self-initializes
+            # (initializing -> ready) and reports over MQTT like hardware.
+            self._simulated.add(name)
+            self._sim_procs.start(name)
+            logger.info(
+                "[sim] subsystem '%s' toggled ON (simulated process started)",
+                name,
+            )
+
+        self._reset_subsystem_view(name)
+        # Propagate the new simulation set to all connected frontends.
+        self.frontend.set_simulation_info(self.simulation_info)
+        self._fire_frontend_event(
+            BackendEvent.SUBSYSTEM_SIMULATION_TOGGLED.value,
+            {"subsystem": name, "simulated": name in self._simulated},
+        )
+        self.frontend.broadcast_with_display_config(self._status)
 
     # ------------------------------------------------------------------
     # Debug mode (--debug): user-driven MQTT injection
@@ -1397,6 +1555,16 @@ class WorkflowOrchestrator:
         if self._debug_mode:
             self.frontend.set_debug_topics(self._build_debug_topics())
             logger.info("Debug mode enabled: subsystem inspector offers manual MQTT injection")
+        # Simulation mode: the orchestrator owns the simulated subsystem
+        # processes. Start the ones toggled on (default: all simmable) and
+        # advertise the per-subsystem toggle to the frontend.
+        if self._sim_procs is not None:
+            self.frontend.set_simulation_info(self.simulation_info)
+            self._ensure_simulated_processes_running()
+            logger.info(
+                "Simulation mode: %d of %d subsystems simulated",
+                len(self._simulated), len(self.adapters),
+            )
         # (Re)connecting clients get a FRESH full status (built from the
         # live subsystem snapshots) instead of the cached last broadcast.
         self.frontend.set_status_callback(lambda: self._status)
@@ -1421,13 +1589,13 @@ class WorkflowOrchestrator:
         # Full status broadcast (includes the SM definitions) so clients
         # that are connected right away get the complete picture.
         self.frontend.broadcast_with_display_config(self._status)
-        if self._use_simulation:
-            logger.info("Simulation mode enabled")
         logger.info("Workflow orchestrator started")
 
     def stop(self) -> None:
         """Stop the orchestrator cleanly."""
         logger.info("Stopping workflow orchestrator...")
+        if self._sim_procs is not None:
+            self._sim_procs.stop_all()
         self.frontend.stop()
         self.mqtt.disconnect()
         logger.info("Workflow orchestrator stopped")
