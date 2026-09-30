@@ -85,6 +85,10 @@ class BackendEvent(str, enum.Enum):
     SUBSYSTEM_MESSAGE = "subsystem_message"    # MQTT sent to / received from a subsystem
     OBJECT_MESSAGE = "object_message"          # internal messages of one object's SM
     MESSAGES_CLEARED = "messages_cleared"      # history reset (workflow reset)
+    # A subsystem was commanded into a state but, after the configured
+    # timeout, has not reported that (or any other) state: its real state
+    # lags the expectation (see adapters/subsystem.py STATE_EXPECT_TIMEOUT).
+    SUBSYSTEM_STATE_MISMATCH = "subsystem_state_mismatch"
 
 
 @dataclass

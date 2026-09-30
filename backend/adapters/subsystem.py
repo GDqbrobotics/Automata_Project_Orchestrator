@@ -15,12 +15,15 @@ routed by the orchestrator – they never send MQTT to each other directly.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.domain.models import SubsystemConfig, SubsystemInfo, SubsystemState
+from backend.state.state_machine import StateMachineError
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,17 @@ logger = logging.getLogger(__name__)
 # When the local subsystem SM mirrors such a report it fires these events
 # locally, and they must NOT be re-published as commands.
 REPORT_EVENTS = frozenset({"complete", "init_complete"})
+
+# States that are not work stages. A reported state outside this set means the
+# subsystem is actively performing a work stage (picking, capturing, ...).
+NON_WORK_STATES = frozenset({"initializing", "ready", "stopped", "error"})
+
+# How long (seconds) the orchestrator waits for a subsystem to confirm the
+# state it was commanded into before raising a discrepancy warning. Real
+# subsystems take time to react, so the local SM is NOT advanced on command:
+# it only mirrors the state the subsystem reports over MQTT, and this timeout
+# flags a subsystem that never reports the expected state.
+STATE_EXPECT_TIMEOUT = 10.0
 
 
 class SubsystemStateMachineError(Exception):
@@ -61,6 +75,24 @@ class SubsystemAdapter:
     # subsystem's topics (used by the orchestrator to feed the frontend's
     # message inspector). Called with (topic, payload).
     on_mqtt_publish: Optional[Callable[[str, Any], None]] = None
+
+    # ── Expected-state tracking (discrepancy check) ────────────────────
+    # When a command is issued the orchestrator knows which state the
+    # subsystem is expected to enter, but it does NOT advance the local SM:
+    # the subsystem's real state (its MQTT status reports) is authoritative.
+    # These fields track the pending expectation so a subsystem that never
+    # reports the expected state can be flagged after STATE_EXPECT_TIMEOUT.
+    expected_state: Optional[str] = None       # state expected after last command
+    expected_command: Optional[str] = None     # the command that set the expectation
+    expected_pre_state: Optional[str] = None   # local SM state before the command
+    expected_since: Optional[float] = None     # monotonic time the command was issued
+    # Optional observer for a state discrepancy (set by the orchestrator).
+    # Called with (name, expected_state, reported_state, command).
+    on_state_discrepancy: Optional[Callable[[str, str, str, str], None]] = None
+    _expected_reached: bool = field(default=False, repr=False)
+    _expected_warned: bool = field(default=False, repr=False)
+    _expected_timer: Optional[threading.Timer] = field(default=None, repr=False)
+    _expected_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def info(self) -> SubsystemInfo:
@@ -104,26 +136,48 @@ class SubsystemAdapter:
     def fire_transition(
         self, event: str, data: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Fire a transition on the subsystem's state machine (BOUNDARY).
+        """Issue a command to the subsystem (BOUNDARY) without advancing the
+        local state machine.
 
         The subsystem SM is the boundary layer between internal events and
-        external MQTT communication: every successful transition publishes
-        the command to automata/subsystem/<name>/event, so the (simulated or
-        real) subsystem receives it and acts on it. Completion reports
-        (complete / init_complete) are excluded: they flow the other way,
-        over the /status topic.
+        external MQTT communication: the command is published to
+        automata/subsystem/<name>/event so the (simulated or real) subsystem
+        receives it and acts on it. Completion reports (complete /
+        init_complete) are excluded: they flow the other way, over the
+        /status topic.
+
+        IMPORTANT: the local state machine is NOT transitioned here. Real
+        subsystems take time to react, so advancing the local SM on command
+        would make it disagree with the state the subsystem actually reports
+        over MQTT. Instead the local SM is a *mirror* of the subsystem's real
+        state and is only advanced from its MQTT status reports (see
+        :meth:`mirror_reported_state`). The state the subsystem is expected to
+        enter is recorded for the discrepancy check (see
+        ``STATE_EXPECT_TIMEOUT``): if the subsystem never reports it, a
+        warning is raised.
 
         Args:
-            event: The transition event.
+            event: The command event.
             data: Optional context merged into the MQTT command payload.
 
-        Returns the new state name.
-        Raises SubsystemStateMachineError if the transition is invalid.
+        Returns the expected new state name (the command's target state).
+        Raises SubsystemStateMachineError if there is no state machine, or
+        StateMachineError if the event is not valid in the current state.
         """
         if self.state_machine is None:
             raise SubsystemStateMachineError(f"No state machine for subsystem '{self.name}'")
-        new_state = self.state_machine.fire(event, None)
+        sm = self.state_machine
+        transitions = sm.get_available_transitions()
+        if event not in transitions:
+            raise StateMachineError(
+                f"No transition for event '{event}' in state '{sm.current_state}'"
+            )
+        expected = transitions[event]
         if event not in REPORT_EVENTS:
+            # Outgoing command: record the expectation (discrepancy check) and
+            # publish it. The local SM keeps its last reported state until the
+            # subsystem confirms the new state over MQTT.
+            self._record_expected(expected, event, sm.current_state)
             topic = f"automata/subsystem/{self.name}/event"
             payload = {
                 "event": event,
@@ -134,12 +188,139 @@ class SubsystemAdapter:
                 payload.update(data)
             self.mqtt_client.publish(topic, payload, qos=1)
             logger.info(
-                "[Boundary] Subsystem '%s' command '%s' -> %s (MQTT '%s')",
-                self.name, event, new_state, topic,
+                "[Boundary] Subsystem '%s' command '%s' -> expected '%s' (MQTT '%s')",
+                self.name, event, expected, topic,
             )
             if self.on_mqtt_publish:
                 self.on_mqtt_publish(topic, payload)
-        return new_state
+        return expected
+
+    def mirror_reported_state(self, reported: str) -> Optional[str]:
+        """Mirror the local state machine to a state reported over MQTT.
+
+        The subsystem's real state (its MQTT status reports) is the source of
+        truth. This advances the local SM to the reported state WITHOUT
+        publishing any MQTT (the report already flowed subsystem ->
+        orchestrator; re-publishing it as a command would loop). It also
+        updates the expected-state discrepancy check (a report that matches
+        the expectation, or that otherwise shows the subsystem reacted to the
+        command, clears it).
+
+        Returns the new local state, or ``None`` when the local SM could not
+        be moved to the reported state.
+        """
+        if self.state_machine is None or not reported:
+            return None
+        sm = self.state_machine
+        if reported == sm.current_state:
+            self._note_report(reported)
+            return reported
+        event = sm.event_to(reported)
+        if event is None:
+            logger.warning(
+                "Subsystem '%s': cannot mirror local SM to reported state '%s' "
+                "(no transition from '%s' in its YAML)",
+                self.name, reported, sm.current_state,
+            )
+        else:
+            try:
+                sm.fire(event)
+            except StateMachineError as exc:
+                logger.warning(
+                    "Subsystem '%s': mirror to reported state '%s' failed: %s",
+                    self.name, reported, exc,
+                )
+                return None
+            logger.info(
+                "Subsystem '%s': local SM mirrored to reported state '%s'",
+                self.name, reported,
+            )
+        self._note_report(reported)
+        return sm.current_state
+
+    # ------------------------------------------------------------------
+    # Expected-state tracking (discrepancy check)
+    # ------------------------------------------------------------------
+    def _record_expected(self, expected: str, command: str, pre_state: str) -> None:
+        """Record the state the subsystem should enter after a command.
+
+        (Re)arms the discrepancy check: a timer fires after
+        STATE_EXPECT_TIMEOUT and warns if the subsystem has not reported the
+        expected state (or otherwise reacted to the command) by then.
+        """
+        with self._expected_lock:
+            self.expected_state = expected
+            self.expected_command = command
+            self.expected_pre_state = pre_state
+            self.expected_since = time.monotonic()
+            self._expected_reached = False
+            self._expected_warned = False
+            self._reset_expected_timer_locked()
+
+    def _reset_expected_timer_locked(self) -> None:
+        if self._expected_timer is not None:
+            self._expected_timer.cancel()
+        self._expected_timer = threading.Timer(
+            STATE_EXPECT_TIMEOUT, self._check_expected
+        )
+        self._expected_timer.daemon = True
+        self._expected_timer.start()
+
+    def _clear_expected_locked(self) -> None:
+        self.expected_state = None
+        self.expected_command = None
+        self.expected_pre_state = None
+        self.expected_since = None
+        self._expected_reached = False
+        self._expected_warned = False
+        if self._expected_timer is not None:
+            self._expected_timer.cancel()
+            self._expected_timer = None
+
+    def _note_report(self, reported: str) -> None:
+        """Update the discrepancy check with a state reported over MQTT."""
+        with self._expected_lock:
+            if self.expected_state is None:
+                return
+            reached = reported == self.expected_state or (
+                self.expected_pre_state is not None and reported != self.expected_pre_state
+            )
+            if reached:
+                self._clear_expected_locked()
+
+    def reset_expected(self) -> None:
+        """Drop any pending expectation (e.g. on reset / simulation toggle)."""
+        with self._expected_lock:
+            self._clear_expected_locked()
+
+    def _check_expected(self) -> None:
+        """Timer callback: warn if the expected state was never reported."""
+        with self._expected_lock:
+            if (
+                self.expected_state is None
+                or self._expected_reached
+                or self._expected_warned
+            ):
+                return
+            expected = self.expected_state
+            command = self.expected_command or "?"
+            self._expected_warned = True
+        current = (
+            self.state_machine.current_state if self.state_machine else None
+        )
+        message = (
+            f"Subsystem '{self.name}': expected state '{expected}' after "
+            f"command '{command}', but last reported state is '{current}' "
+            f"after {STATE_EXPECT_TIMEOUT:.0f}s"
+        )
+        logger.warning("%s (state discrepancy)", message)
+        if self.on_state_discrepancy is not None:
+            try:
+                self.on_state_discrepancy(self.name, expected, current, command)
+            except Exception:
+                logger.exception(
+                    "Subsystem '%s': state-discrepancy callback failed", self.name
+                )
 
     def send_command(self, command: str, payload: Optional[Dict[str, Any]] = None) -> None:
         topic = f"automata/subsystem/{self.name}/command"

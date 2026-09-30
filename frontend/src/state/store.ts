@@ -197,6 +197,23 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     }
   }
 
+  // Subsystem was commanded into a state but never reported it within the
+  // timeout: its real state (over MQTT) lags the expectation. Warning only –
+  // the card keeps showing the last reported (real) state.
+  if (m.event === 'subsystem_state_mismatch' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const name = d.subsystem as string;
+    const expected = d.expected_state as string;
+    const reported = d.reported_state as string;
+    const command = d.command as string;
+    const message =
+      (d.message as string) ||
+      `${name}: expected '${expected}' after '${command}', reported '${reported}'`;
+    if (name) {
+      logs.push({ time: now(), source: 'subsystem', message, level: 'warning' });
+    }
+  }
+
   // Handle object list updates from workflow_state_changed details
   if (m.event === 'workflow_state_changed' && m.details) {
     const d = m.details as Record<string, unknown>;

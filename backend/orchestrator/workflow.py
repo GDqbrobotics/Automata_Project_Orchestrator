@@ -56,6 +56,7 @@ import yaml
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 from backend.adapters.subsystem import (
+    NON_WORK_STATES,
     SubsystemAdapter,
     SubsystemAdapterFactory,
     SubsystemState,
@@ -148,6 +149,11 @@ class WorkflowOrchestrator:
         # message inspector (subsystem detail modal).
         for _name, _adapter in self.adapters.items():
             _adapter.on_mqtt_publish = self._make_publish_recorder(_name)
+
+        # A subsystem that is commanded into a state but never reports it
+        # (checked after STATE_EXPECT_TIMEOUT) raises a discrepancy warning.
+        for _adapter in self.adapters.values():
+            _adapter.on_state_discrepancy = self._on_subsystem_state_mismatch
 
         # Note: the subsystem -> MQTT boundary is owned by the adapters
         # (SubsystemAdapter.fire_transition publishes every command to
@@ -303,15 +309,18 @@ class WorkflowOrchestrator:
         event_name: str,
         data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Fire an event on a specific subsystem's state machine.
+        """Route a scoped event to a specific subsystem (issue a command).
 
-        This is internal communication only – no MQTT involved.
-        The subsystem's state machine handles the event and may fire
-        its own on_event_callback to publish MQTT.
+        The event is published to the subsystem over MQTT (the boundary).
+        The orchestrator's local subsystem SM is NOT advanced: the
+        subsystem's real state is authoritative and arrives as MQTT status
+        reports, which mirror the local SM (see _update_subsystem_status).
+        The state the subsystem is expected to enter is tracked so a slow or
+        unresponsive subsystem is flagged (discrepancy check).
 
         Args:
             subsystem_name: The target subsystem.
-            event_name: The event to fire on that subsystem.
+            event_name: The command event to issue.
             data: Optional context merged into the MQTT command payload.
         """
         adapter = self.adapters.get(subsystem_name)
@@ -324,21 +333,15 @@ class WorkflowOrchestrator:
             return
 
         try:
-            new_state = adapter.fire_transition(event_name, data)
+            expected = adapter.fire_transition(event_name, data)
             logger.info(
-                "Subsystem '%s' transitioned: %s (event: %s)",
-                subsystem_name, new_state, event_name,
+                "Subsystem '%s' commanded '%s' -> expected '%s' (current: '%s')",
+                subsystem_name, event_name, expected,
+                adapter.state_machine.current_state,
             )
+            # Keep the full-status snapshot fresh (it reflects the last
+            # reported state; the card updates when the subsystem confirms).
             self._refresh_subsystem_info(subsystem_name)
-            # Update frontend with subsystem state change
-            self._fire_frontend_event(
-                BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
-                {
-                    "subsystem": subsystem_name,
-                    "new_state": new_state,
-                    "event": event_name,
-                },
-            )
         except StateMachineError as exc:
             logger.warning(
                 "Subsystem '%s' rejected event '%s': %s",
@@ -632,6 +635,7 @@ class WorkflowOrchestrator:
             return
         if adapter.state_machine is not None:
             adapter.state_machine.reset_to_initial()
+        adapter.reset_expected()
         adapter.update_state(SubsystemState.OFFLINE)
         self._refresh_subsystem_info(name)
         self._fire_frontend_event(
@@ -861,9 +865,17 @@ class WorkflowOrchestrator:
         self._status.current_object = None
         self._status.objects = []
         self._object_event_buffer.clear()
+        # Drop any pending expected-state checks from the previous run so a
+        # stale command cannot raise a spurious discrepancy warning.
+        self._clear_all_subsystem_expected()
         # Clear the frontend message inspector history (subsystem + object)
         self._fire_frontend_event(BackendEvent.MESSAGES_CLEARED.value, {})
         logger.info("Workflow state reset: cleared objects and progress")
+
+    def _clear_all_subsystem_expected(self) -> None:
+        """Drop every pending expected-state check (cancel their timers)."""
+        for _adapter in self.adapters.values():
+            _adapter.reset_expected()
 
     def _start_workflow_immediately(self) -> None:
         """Start the workflow immediately from idle when all subsystems are ready."""
@@ -1140,47 +1152,66 @@ class WorkflowOrchestrator:
         reported: str,
         was_state: Optional[str],
     ) -> None:
-        """Advance the local subsystem SM to match the reported state.
+        """Mirror the local subsystem SM to the state reported over MQTT.
 
-        The local transition goes through the adapter boundary, which
-        filters completion reports (REPORT_EVENTS in
-        backend/adapters/subsystem.py) so they are not re-published as
-        commands.
+        The subsystem's real state (its MQTT status reports) is the source of
+        truth: the local SM follows it. The adapter performs the transition
+        WITHOUT re-publishing MQTT (the report already flowed subsystem ->
+        orchestrator), and updates the expected-state discrepancy check.
         """
         adapter = self.adapters.get(subsystem_name)
-        if not adapter or not adapter.state_machine:
+        if not adapter or not adapter.state_machine or not reported:
             return
-        sm = adapter.state_machine
-        if not was_state or was_state == reported or not reported:
-            return
+        # No-op when already in the reported state (still updates the
+        # expected-state check, e.g. a confirming heartbeat).
+        adapter.mirror_reported_state(reported)
 
-        event: Optional[str] = None
-        if reported == "ready":
-            if was_state == "initializing":
-                event = "init_complete"
-            elif was_state == "stopped":
-                event = "ready"
-            elif was_state == "error":
-                event = "reset"
-            else:
-                event = "complete"
-        elif reported == "error":
-            event = "error"
-        elif reported == "stopped":
-            event = "stop"
+    def _on_subsystem_state_mismatch(
+        self,
+        subsystem_name: str,
+        expected: str,
+        reported: str,
+        command: str,
+    ) -> None:
+        """A commanded state was never reported within the timeout.
 
-        if event and event in sm.get_available_transitions():
-            try:
-                adapter.fire_transition(event)
-                logger.info(
-                    "Subsystem '%s' local SM synced: %s -> %s (reported: %s)",
-                    subsystem_name, was_state, sm.current_state, reported,
-                )
-            except StateMachineError as exc:
-                logger.warning(
-                    "Subsystem '%s' local SM sync failed: %s",
-                    subsystem_name, exc,
-                )
+        The subsystem's real state (over MQTT) lags the state it was told to
+        enter: it may be slow, stuck, or not receiving commands. Surface it as
+        a warning (log + frontend) without changing the workflow state.
+        """
+        message = (
+            f"Subsystem '{subsystem_name}': expected state '{expected}' after "
+            f"command '{command}', but last reported state is '{reported}' "
+            "after the expected-state timeout"
+        )
+        logger.warning(message)
+        self._fire_frontend_event(
+            BackendEvent.SUBSYSTEM_STATE_MISMATCH.value,
+            {
+                "subsystem": subsystem_name,
+                "expected_state": expected,
+                "reported_state": reported,
+                "command": command,
+                "message": message,
+            },
+        )
+
+    def subsystem_effective_state(self, subsystem_name: str) -> Optional[str]:
+        """The state the pipeline should treat a subsystem as being in.
+
+        If a command that would move the subsystem into a working state has
+        been issued but not yet confirmed by a status report, that (expected)
+        state is returned – the subsystem is in flight. Otherwise the last
+        reported state is returned. This keeps physical gating correct even
+        though the local SM no longer advances on command.
+        """
+        adapter = self.adapters.get(subsystem_name)
+        if adapter is None or adapter.state_machine is None:
+            return None
+        expected = adapter.expected_state
+        if expected is not None and expected not in NON_WORK_STATES:
+            return expected
+        return adapter.state_machine.current_state
 
     # ------------------------------------------------------------------
     # Subsystem State Machine Transitions
@@ -1190,10 +1221,12 @@ class WorkflowOrchestrator:
         subsystem_name: str,
         event: str,
     ) -> bool:
-        """Fire a transition on a subsystem's state machine.
+        """Issue a command to a subsystem (boundary layer).
 
-        This is used by the simulation and external callers.
-        The subsystem SM handles MQTT publishing via its boundary callback.
+        This is used by the pipeline controller and external callers. The
+        command is published over MQTT; the local subsystem SM is NOT advanced
+        (the subsystem's reported state is authoritative and mirrors it). The
+        expected state is tracked for the discrepancy check.
         """
         adapter = self.adapters.get(subsystem_name)
         if adapter is None:
@@ -1205,53 +1238,22 @@ class WorkflowOrchestrator:
             return False
 
         try:
-            old_state = adapter.state_machine.current_state
-            new_state = adapter.fire_transition(event)  # boundary: publishes MQTT
+            expected = adapter.fire_transition(event)  # boundary: publishes MQTT
             logger.info(
-                "Subsystem '%s' transition: %s -> %s (event: %s)",
-                subsystem_name, old_state, new_state, event,
+                "Subsystem '%s' commanded '%s' -> expected '%s' (current: '%s')",
+                subsystem_name, event, expected, adapter.state_machine.current_state,
             )
-
-            self._fire_frontend_event(
-                BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
-                {
-                    "subsystem": subsystem_name,
-                    "new_state": new_state,
-                    "state_description": adapter._get_state_description(),
-                    "source": "state_machine",
-                },
-            )
-
+            # Keep the full-status snapshot fresh; the card reflects the last
+            # reported state and updates when the subsystem confirms.
             self._refresh_subsystem_info(subsystem_name)
-            self._check_workflow_state_on_subsystem_change(subsystem_name, new_state)
             return True
 
         except Exception as exc:
             logger.error(
-                "Failed to fire transition on subsystem '%s': %s",
-                subsystem_name, exc,
+                "Failed to issue command '%s' on subsystem '%s': %s",
+                event, subsystem_name, exc,
             )
             return False
-
-    def _check_workflow_state_on_subsystem_change(
-        self,
-        subsystem_name: str,
-        new_state: str,
-    ) -> None:
-        """Check if a subsystem state change should trigger a workflow state transition."""
-        if new_state == "ready" and self.state_machine.state == WorkflowState.STARTING:
-            required_adapters = self.adapter_factory.get_required()
-            all_ready = all(
-                a.state == SubsystemState.READY for a in required_adapters
-            )
-            if all_ready:
-                logger.info("All required subsystems ready!")
-                self.state_machine.fire("subsystem_ready", self._status)
-                self._update_state(WorkflowState.RUNNING)
-                self._fire_frontend_event(
-                    BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                    {"new_state": "running", "source": "subsystems_ready"},
-                )
 
     # ------------------------------------------------------------------
     # State Management
@@ -1596,6 +1598,9 @@ class WorkflowOrchestrator:
         logger.info("Stopping workflow orchestrator...")
         if self._sim_procs is not None:
             self._sim_procs.stop_all()
+        # Cancel any pending expected-state timers so they do not fire
+        # (and warn) after the orchestrator has shut down.
+        self._clear_all_subsystem_expected()
         self.frontend.stop()
         self.mqtt.disconnect()
         logger.info("Workflow orchestrator stopped")

@@ -24,7 +24,8 @@ export type WorkflowEvent =
   | 'subsystem_simulation_toggled'
   | 'subsystem_message'
   | 'object_message'
-  | 'messages_cleared';
+  | 'messages_cleared'
+  | 'subsystem_state_mismatch';
 
 export type WorkflowStateType =
   | 'idle'

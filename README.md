@@ -36,7 +36,12 @@ communicate exclusively through **internal events**, some of which are
 the 3DI subsystem, `all/stop` goes to everyone. When a subsystem machine
 fires a transition, the orchestrator publishes the command to
 `automata/subsystem/<name>/event`; the subsystem answers with status
-reports on `automata/subsystem/<name>/status`.
+reports on `automata/subsystem/<name>/status`. The orchestrator's local
+subsystem SM does **not** advance on command (real subsystems lag) — it is
+a *mirror* of the state the subsystem reports, and if a subsystem never
+reports the state it was commanded into within 10 s a discrepancy warning
+is raised (see [docs/STATE_MACHINE.md](docs/STATE_MACHINE.md), principles
+11–12).
 
 On top of the state machines, a **pipeline controller** keeps track of the
 physical flow: the rotating platform has two disk positions and robot 1

@@ -113,10 +113,11 @@ class PipelineController:
         return self._orch.object_manager.get_object_state(object_id)
 
     def _sm_state(self, name: str) -> Optional[str]:
-        adapter = self._orch.adapters.get(name)
-        if adapter and adapter.state_machine:
-            return adapter.state_machine.current_state
-        return None
+        # The orchestrator's local subsystem SM no longer advances on command
+        # (the real reported state is authoritative), so ask the orchestrator
+        # for the *effective* state: the pending expected working state if a
+        # command is in flight, else the last reported state.
+        return self._orch.subsystem_effective_state(name)
 
     def _fire_object(self, object_id: str, event: str) -> bool:
         new_state = self._orch.fire_object_transition(object_id, event)

@@ -204,6 +204,21 @@ class StateMachineEngine:
             for t in transitions
         }
 
+    def event_to(self, target_state: str) -> Optional[str]:
+        """Return the event that leads from the current state to ``target_state``.
+
+        Used by the subsystem adapters to mirror the local state machine to a
+        state reported over MQTT (the subsystem's real state is the source of
+        truth). Returns ``None`` when no such transition is defined.
+        """
+        current = self.current_state
+        if current not in self.config.states:
+            return None
+        for t in self.config.states[current].transitions:
+            if t.target == target_state:
+                return t.event
+        return None
+
     def reset_to_initial(self) -> str:
         """Force the machine back to its configured initial state.
 
