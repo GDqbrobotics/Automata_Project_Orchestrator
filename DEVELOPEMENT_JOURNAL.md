@@ -18,7 +18,16 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - The orchestrator's local **subsystem SM is a mirror, not a predictor**: issuing a command does NOT advance it (real subsystems lag); it only follows the state the subsystem reports over MQTT. An expected-state **discrepancy check** warns if a subsystem never reports the state it was commanded into (window: `orchestration.state_expect_timeout` in `global.yaml`, default 10 s).
 - **The YAML is the single source of truth** (docs/CONFIG_CHANGE_GUIDE.md, implemented 2026-10-08): no state/event names, subsystem names, topics, durations or button rules are hardcoded in Python or TypeScript. The GUI derives its operator-button matrix, state-machine graphs, tones and display vocabulary from the same YAML, broadcast at startup; a rename in `backend/config/` is a config-only change.
 
-## Latest changes (2026-10-08 — YAML single source of truth: R1–R9 + F1–F8)
+## Latest changes (2026-10-08 — continuous two-object flow: the platform stays full)
+
+The next object now enters the platform as soon as the entry position frees up, instead of waiting for the current object to be completely measured and returned. Apart from the very start and the very end, **two objects are on the rotating platform at all times**: one being measured on the first position, the other being imaged on the second (the newcomer's imaging overlaps the returning object's measurement). The 3-object test run drops from ~69 s to ~58 s; steady-state throughput gains the measurement+return duration (~13 s) per object.
+
+- **What changed** (only `backend/orchestrator/pipeline.py`, `PipelineController._advance`): dispatch is now checked **before** the pending rotation, and the dispatch gate no longer blocks a pick while a disk object waits to come back to the measurement position (the `robot_needed_soon` condition stays on the *rotation* gate only).
+- **Why it is safe**: the return-rotation cannot start while the newcomer is in transit — an in-transit object sits on the entry disk with `meta.position: hand`, so `_disks_stable()` is false until the placement — and a placed newcomer means the robot is free the moment the rotation lands, so the measurement commands (robot + XRF + Raman) are never lost (the stall that motivated the old dispatch gate cannot reappear). A defensive `not self._rotating` guard keeps the robot away from a moving platform.
+- This is a scheduling policy, not a layout fact: it is **not** expressible in the YAML alone (the config defines the machine and the journey; the controller decides *when* a pick/rotation is allowed) — which is why the change lives in `pipeline.py` even though no config file changed.
+- Validation: `timeout 500 python backend/simulation_test.py` → **151/151**; the physical invariants (≤1 object per disk position, ≤1 in the robot's hand, ≤2 on the platform) held through the run.
+
+## Earlier changes (2026-10-08 — YAML single source of truth: R1–R9 + F1–F8)
 
 Implemented [docs/CONFIG_CHANGE_GUIDE.md](docs/CONFIG_CHANGE_GUIDE.md): every piece of behaviour that was hardcoded in the backend or the frontend is now derived from `backend/config/*.yaml`.
 

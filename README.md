@@ -75,8 +75,11 @@ physically safe to do so.
    of interest from the imaging data.
 6. Robot 1 performs XRF and Raman measurements at those points.
 7. The object goes back into the box and the next one starts. Thanks to the
-   two disks and two robots, the machine works on up to two objects at a
-   time.
+   two disks and two robots, the machine works on two objects at a time —
+   and keeps it that way: as soon as an object is returned, the next one
+   is placed while the previous one finishes its measurement (one object
+   measuring on the first position, one imaging on the second), so apart
+   from the first and the last object the platform is always full.
 8. All data is **stored locally**; the local database is updated manually.
 
 During the run the operator can assign each object an **alias ID**

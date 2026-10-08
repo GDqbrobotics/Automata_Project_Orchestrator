@@ -28,9 +28,13 @@ What it knows about the *flow* comes from the object blueprint
 
 What is coded here is only the *physical rules* (parameterised by the
 layout above): a rotation moves every disk at once, so it is only issued
-when every occupied disk holds an object that requested it; and the
+when every occupied disk holds an object that requested it; the
 dispatching robot must be free before a rotation that brings an object
-back to the disk where the robot will act on it.
+back to the disk where the robot will act on it; and dispatch is checked
+before rotation and allowed while an object waits to come back, so the
+next object is placed first and the platform holds two objects at all
+times (the newcomer's imaging overlaps the returning object's
+measurement – see `_advance`).
 
 Threading: methods may be called from the MQTT callback thread, the
 WebSocket command thread, or re-entrantly from object-transition events.
@@ -546,11 +550,12 @@ class PipelineController:
         """Is a disk object about to be rotated back to a position where the
         dispatching robot must act on it (the measurement stage)?
 
-        Used as a gate for both the rotation (combined with the robot's
-        availability) and the robot dispatch (unconditional: the moment the
-        rotation lands, the robot is needed, so no new pick may start in
-        the meantime – a pick in flight would hold the robot when the
-        measurement stage starts and its command would be lost).
+        Gates the return-rotation (combined with the robot's availability):
+        the rotation may not land while the robot is busy or has a task in
+        flight, because the measurement stage commands it the moment the
+        object arrives. Robot dispatch is NOT gated on this: the newcomer
+        is placed first, so the robot is free when the rotation lands (the
+        stable-disk gate keeps the rotation waiting until the placement).
         """
         if self._chain_subsystem is None or self._disk_count < 2:
             return False
@@ -607,10 +612,49 @@ class PipelineController:
 
         robot_needed_soon = self._robot_needed_soon()
 
-        # 1. Pending platform rotation (every disk must be stable, and if an
-        #    object comes back to the measurement position the dispatching
-        #    robot must be ready and task-free – it is needed the moment the
-        #    rotation lands).
+        # 1. Robot dispatch – checked BEFORE the pending rotation: the next
+        #    object leaves the box as soon as the entry disk position is
+        #    free and the robot is free, even while a disk object is waiting
+        #    to come back to the robot's position. Placing the newcomer
+        #    first keeps two objects on the platform at all times (its
+        #    imaging overlaps the returning object's measurement) and is
+        #    safe: the return-rotation below cannot start while the newcomer
+        #    is in transit (an in-transit object sits on the entry disk with
+        #    meta.position 'hand', so _disks_stable() is false until it is
+        #    placed), and a placed newcomer means the robot is free when the
+        #    rotation lands – the measurement commands are never lost.
+        if (
+            self._robot_task is None
+            and self._hand_slots > 0
+            and not self._rotating
+            and self._chain_subsystem is not None
+            and self._sm_state(self._chain_subsystem) == self._ready_state()
+            and self._entry_disk is not None
+            and self._disks[self._entry_disk] is None
+            and self._queue_pos < len(self._order)
+        ):
+            object_id = self._order[self._queue_pos]
+            if self._obj_state(object_id) == self._dispatch_state:
+                logger.info("Pipeline: dispatching %s to the platform", object_id)
+                self._disks[self._entry_disk] = object_id
+                self._queue_pos += 1
+                if self._dispatch_event and self._fire_object_event(
+                    object_id, self._dispatch_event
+                ):
+                    subsystem, entry = self._chain_by_object_event[self._dispatch_event]
+                    self._robot_task = (
+                        object_id,
+                        self._chain_completion(subsystem, entry["op"]),
+                    )
+                else:
+                    self._disks[self._entry_disk] = None
+                    self._queue_pos -= 1
+
+        # 2. Pending platform rotation (every disk must be stable – an
+        #    in-transit object on the entry disk keeps it unstable until
+        #    placed – and if an object comes back to the measurement
+        #    position the dispatching robot must be ready and task-free: it
+        #    is needed the moment the rotation lands).
         if (
             self._rotation_requested
             and not self._rotating
@@ -631,39 +675,6 @@ class PipelineController:
                 self._command(self._platform, command)
                 self._rotation_requested = False
                 self._rotating = True
-
-        # 2. Robot dispatch: the next object leaves the box only when the
-        #    entry disk position is free and the robot is free – and never
-        #    while a disk object is coming back to the robot's position
-        #    (the rotation gate above keeps the robot free for it, but a
-        #    pick started in the meantime would hold the robot when the
-        #    measurement stage starts and its command would be lost).
-        if (
-            self._robot_task is None
-            and self._hand_slots > 0
-            and self._chain_subsystem is not None
-            and self._sm_state(self._chain_subsystem) == self._ready_state()
-            and self._entry_disk is not None
-            and self._disks[self._entry_disk] is None
-            and not robot_needed_soon
-            and self._queue_pos < len(self._order)
-        ):
-            object_id = self._order[self._queue_pos]
-            if self._obj_state(object_id) == self._dispatch_state:
-                logger.info("Pipeline: dispatching %s to the platform", object_id)
-                self._disks[self._entry_disk] = object_id
-                self._queue_pos += 1
-                if self._dispatch_event and self._fire_object_event(
-                    object_id, self._dispatch_event
-                ):
-                    subsystem, entry = self._chain_by_object_event[self._dispatch_event]
-                    self._robot_task = (
-                        object_id,
-                        self._chain_completion(subsystem, entry["op"]),
-                    )
-                else:
-                    self._disks[self._entry_disk] = None
-                    self._queue_pos -= 1
 
         # 3. Run finished? (every object back in the box)
         if (
