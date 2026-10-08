@@ -27,14 +27,12 @@ export type WorkflowEvent =
   | 'messages_cleared'
   | 'subsystem_state_mismatch';
 
-export type WorkflowStateType =
-  | 'idle'
-  | 'starting'
-  | 'running'
-  | 'paused'
-  | 'stopping'
-  | 'stopped'
-  | 'error';
+/**
+ * A workflow state name. workflow.yaml is the single source of truth (R3):
+ * the backend sends raw state names and the GUI derives its behaviour from
+ * the broadcast state machine definition (F1), so this is an open string.
+ */
+export type WorkflowStateType = string;
 
 export interface WorkflowStatus {
   state: WorkflowStateType;
@@ -52,9 +50,13 @@ export interface SubsystemStatus {
   type: string;
   state: string;
   state_description: string;
-  ready: boolean;
+  /**
+   * Visual tone (ready / busy / error / idle / offline / warning) computed
+   * by the backend from the configured vocabulary (global.yaml `states:`);
+   * the UI renders it as-is instead of enumerating state names (F3).
+   */
+  tone?: string;
   required: boolean;
-  error: string | null;
   metadata: Record<string, unknown>;
 }
 
@@ -96,6 +98,12 @@ export interface StateMachineDef {
   name: string;
   initial_state: string;
   states: Record<string, SmStateDef>;
+  /**
+   * The YAML `metadata:` section. For the workflow definition it carries
+   * the operator-event map the GUI derives its button matrix from (F1);
+   * the object definition carries the machine layout / task chains.
+   */
+  metadata?: Record<string, unknown>;
 }
 
 /** One MQTT message seen on a subsystem's topics. */
@@ -112,6 +120,12 @@ export interface SubsystemMessage {
 export interface DebugTopicDescriptor {
   /** Full topic, e.g. 'automata/subsystem/xrf/status'. */
   topic: string;
+  /** Topic kind: 'status' (state report) or 'response'. Drives the UI. */
+  kind?: string;
+  /** For kind='status': the payload field carrying the reported state. */
+  state_field?: string;
+  /** For kind='status': the payload field mirroring the ready flag. */
+  ready_field?: string;
   description: string;
   /** Sensible starting payload, editable in the inspector. */
   default_payload: Record<string, unknown>;
@@ -153,14 +167,12 @@ export interface ObjectMessage {
 }
 
 export interface FrontendMessage {
+  /** Client pseudo-events: 'connected' | 'disconnected' | 'error'. */
   type?: string;
-  command?: WorkflowCommand;
+  /** Backend event name (see WorkflowEvent). */
   event?: WorkflowEvent;
-  received?: boolean;
+  /** Client pseudo-event detail (e.g. the WebSocket error message). */
   error?: string;
-  new_state?: string;
-  message?: string;
+  /** Backend event details (status broadcasts, object/subsystem events). */
   details?: Record<string, unknown>;
-  subsystems?: SubsystemConfig[];
-  objects?: ObjectInfo[];
 }

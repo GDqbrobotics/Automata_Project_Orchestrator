@@ -1,6 +1,5 @@
 import type {
   WorkflowStateType,
-  WorkflowStatus,
   SubsystemStatus,
   SubsystemConfig,
   ObjectInfo,
@@ -10,7 +9,6 @@ import type {
   DebugConfig,
   SimulationInfo,
 } from '../contracts.js';
-import { getStateMessage } from '../config/state-messages.js';
 
 /** Max messages kept per subsystem / object in the inspector history. */
 const MESSAGE_HISTORY_LIMIT = 100;
@@ -20,7 +18,6 @@ export interface UiState {
   progress: number;
   totalObjects: number;
   currentObject: string | null;
-  message: string;
   error: string | null;
   subsystems: Record<string, SubsystemStatus>;
   subsystemsConfig: SubsystemConfig[];
@@ -32,10 +29,22 @@ export interface UiState {
   objectStateColors: Record<string, string>;
   /** Workflow state display messages, sent by backend from global.yaml */
   workflowStateMessages: Record<string, string>;
+  /** Object journey final states (object.yaml, F4): the "done" styling. */
+  objectFinalStates: string[];
+  /** Ready state of subsystems (global.yaml states.ready, F5). */
+  readyState: string;
+  /** Alias input constraint (global.yaml, F7): regex pattern. */
+  aliasPattern: string;
   /** Subsystem state machine graph definitions (for the inspector modal). */
   subsystemStateMachines: Record<string, StateMachineDef>;
   /** Object state machine graph definition (shared blueprint). */
   objectStateMachine: StateMachineDef | null;
+  /**
+   * Workflow state machine definition (broadcast with status): carries the
+   * metadata.operator_events map the GUI derives its button matrix from (F1)
+   * and metadata.error_state (the error-state message, F5).
+   */
+  workflowStateMachine: StateMachineDef | null;
   /** Debug config (null when the backend is not running with --debug). */
   debug: DebugConfig | null;
   /** Simulation info (null when the backend is not running with --simulation). */
@@ -58,7 +67,6 @@ export function createInitialState(): UiState {
     progress: 0,
     totalObjects: 0,
     currentObject: null,
-    message: 'Waiting for operator input',
     error: null,
     subsystems: {},
     subsystemsConfig: [],
@@ -67,8 +75,12 @@ export function createInitialState(): UiState {
     objectStateOrder: [],
     objectStateColors: {},
     workflowStateMessages: {},
+    objectFinalStates: [],
+    readyState: 'ready',
+    aliasPattern: '^[A-Za-z0-9_\\-\\. ]{1,64}$',
     subsystemStateMachines: {},
     objectStateMachine: null,
+    workflowStateMachine: null,
     debug: null,
     simulation: null,
     subsystemMessages: {},
@@ -82,34 +94,6 @@ export function reduceState(state: UiState, msg: unknown): UiState {
   const logs = [...state.logs];
   const m = msg as Record<string, unknown>;
 
-  // Handle subsystem configuration (top-level or within details)
-  if (m.subsystems && Array.isArray(m.subsystems)) {
-    updated.subsystemsConfig = m.subsystems as SubsystemConfig[];
-    logs.push({
-      time: now(),
-      source: 'config',
-      message: `Loaded ${updated.subsystemsConfig.length} subsystem config(s)`,
-      level: 'info',
-    });
-  }
-  if (m.subsystems_config && Array.isArray(m.subsystems_config)) {
-    updated.subsystemsConfig = m.subsystems_config as SubsystemConfig[];
-    logs.push({
-      time: now(),
-      source: 'config',
-      message: `Loaded ${updated.subsystemsConfig.length} subsystem config(s)`,
-      level: 'info',
-    });
-  }
-
-  if (m.new_state) {
-    const newState = m.new_state as WorkflowStateType;
-    updated.workflowState = newState;
-
-    updated.message = getStateMessage(newState, state.error || undefined);
-    logs.push({ time: now(), source: 'workflow', message: `State → ${newState}`, level: 'info' });
-  }
-
   if (m.event === 'workflow_state_changed' && m.details) {
     const d = m.details as Record<string, unknown>;
     // Incremental events carry new_state; full status broadcasts (and the
@@ -121,9 +105,6 @@ export function reduceState(state: UiState, msg: unknown): UiState {
         logs.push({ time: now(), source: 'workflow', message: `State → ${newState}`, level: 'info' });
       }
       updated.workflowState = newState;
-      // The backend does not send a display message; derive it so the
-      // stored message never degrades to an empty string.
-      updated.message = getStateMessage(newState, state.error || undefined);
     }
     // Subsystem config may be included in the details
     if (d.subsystems_config && Array.isArray(d.subsystems_config)) {
@@ -183,7 +164,9 @@ export function reduceState(state: UiState, msg: unknown): UiState {
           ...existing,
           name,
           state: newState,
-          ready: newState === 'ready',
+          // Visual tone from the configured vocabulary (F3); the payload
+          // carries it, fall back to the last known one otherwise.
+          tone: (d.tone as string) || existing.tone || 'busy',
           state_description:
             (d.state_description as string) || existing.state_description || '',
         } as SubsystemStatus,
@@ -257,12 +240,26 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (d.state_messages && typeof d.state_messages === 'object') {
       updated.workflowStateMessages = d.state_messages as Record<string, string>;
     }
-    // State machine graph definitions (inspector modal)
+    // Object journey final states (object.yaml, F4): the "done" styling
+    if (d.final_states && Array.isArray(d.final_states)) {
+      updated.objectFinalStates = d.final_states as string[];
+    }
+    // Shared vocabulary the UI must not re-hardcode (F5/F7)
+    if (typeof d.ready_state === 'string' && d.ready_state) {
+      updated.readyState = d.ready_state;
+    }
+    if (typeof d.alias_pattern === 'string' && d.alias_pattern) {
+      updated.aliasPattern = d.alias_pattern;
+    }
+    // State machine graph definitions (inspector modal + button matrix F1)
     if (d.subsystem_state_machines && typeof d.subsystem_state_machines === 'object') {
       updated.subsystemStateMachines = d.subsystem_state_machines as Record<string, StateMachineDef>;
     }
     if (d.object_state_machine && typeof d.object_state_machine === 'object') {
       updated.objectStateMachine = d.object_state_machine as StateMachineDef;
+    }
+    if (d.workflow_state_machine && typeof d.workflow_state_machine === 'object') {
+      updated.workflowStateMachine = d.workflow_state_machine as StateMachineDef;
     }
     // Debug config (backend started with --debug)
     if (d.debug && typeof d.debug === 'object') {
@@ -271,70 +268,6 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     // Simulation info (backend started with --simulation)
     if (d.simulation && typeof d.simulation === 'object') {
       updated.simulation = d.simulation as SimulationInfo;
-    }
-  }
-
-  // Handle top-level status updates (broadcast_status payload)
-  if (m.state) {
-    const s = m as unknown as WorkflowStatus & {
-      subsystems_config?: SubsystemConfig[];
-      objects?: ObjectInfo[];
-      state_order?: string[];
-      state_colors?: Record<string, string>;
-      subsystem_state_machines?: Record<string, StateMachineDef>;
-      object_state_machine?: StateMachineDef;
-      debug?: DebugConfig;
-      simulation?: SimulationInfo;
-    };
-    updated.workflowState = s.state;
-    updated.progress = s.progress;
-    updated.totalObjects = s.total_objects;
-    updated.currentObject = s.current_object;
-    updated.error = s.error;
-    if (s.subsystems) {
-      updated.subsystems = s.subsystems;
-    }
-    if (s.subsystems_config && Array.isArray(s.subsystems_config)) {
-      updated.subsystemsConfig = s.subsystems_config;
-      logs.push({
-        time: now(),
-        source: 'config',
-        message: `Loaded ${updated.subsystemsConfig.length} subsystem config(s)`,
-        level: 'info',
-      });
-    }
-    if (s.objects && Array.isArray(s.objects)) {
-      updated.objects = s.objects as ObjectInfo[];
-      if (updated.objects.length > 0) {
-        logs.push({
-          time: now(),
-          source: 'objects',
-          message: `Loaded ${updated.objects.length} object(s)`,
-          level: 'info',
-        });
-      }
-    }
-    // Update object workflow display config from top-level payload
-    if (s.state_order && Array.isArray(s.state_order)) {
-      updated.objectStateOrder = s.state_order as string[];
-    }
-    if (s.state_colors && typeof s.state_colors === 'object') {
-      updated.objectStateColors = s.state_colors as Record<string, string>;
-    }
-    // State machine graph definitions from top-level payload
-    if (s.subsystem_state_machines && typeof s.subsystem_state_machines === 'object') {
-      updated.subsystemStateMachines = s.subsystem_state_machines as Record<string, StateMachineDef>;
-    }
-    if (s.object_state_machine && typeof s.object_state_machine === 'object') {
-      updated.objectStateMachine = s.object_state_machine as StateMachineDef;
-    }
-    // Debug config from top-level payload (backend started with --debug)
-    if (s.debug && typeof s.debug === 'object') {
-      updated.debug = s.debug;
-    }
-    // Simulation info from top-level payload (backend started with --simulation)
-    if (s.simulation && typeof s.simulation === 'object') {
-      updated.simulation = s.simulation as SimulationInfo;
     }
   }
 
@@ -417,9 +350,13 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     const d = m.details as Record<string, unknown>;
     const objectId = d.object_id as string;
     if (objectId) {
+      // Fallback for the initial state: the object blueprint's initial state
+      // (object.yaml) — not a hardcoded state name (R6/F4).
+      const initialObjectState =
+        updated.objectStateMachine?.initial_state || state.objectStateMachine?.initial_state;
       const objInfo = {
         object_id: objectId,
-        state: d.state as string || 'identified_in_box',
+        state: (d.state as string) || initialObjectState || 'unknown',
         state_description: d.state_description as string || '',
         created: now(),
         last_state_change: now(),

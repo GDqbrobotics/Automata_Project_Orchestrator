@@ -220,24 +220,58 @@ def check_ports_free(port_whats: dict) -> None:
                 raise SystemExit(1)
 
 
+def _load_global_defaults() -> dict:
+    """Defaults from backend/config/global.yaml (single source of truth).
+
+    CLI args still override them; the YAML is only read for the argparse
+    defaults so launcher and orchestrator can never drift apart (R9).
+    """
+    import yaml
+
+    path = project_root / "backend" / "config" / "global.yaml"
+    defaults = {
+        "broker": "localhost",
+        "mqtt_port": 1883,
+        "ws_port": 8080,
+        "num_objects": 3,
+        "dev_port": 3000,
+    }
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except OSError:
+        return defaults
+    mqtt_cfg = data.get("mqtt", {})
+    frontend_cfg = data.get("frontend", {})
+    sim_cfg = data.get("simulation", {})
+    defaults["broker"] = mqtt_cfg.get("broker", defaults["broker"])
+    defaults["mqtt_port"] = mqtt_cfg.get("port", defaults["mqtt_port"])
+    defaults["ws_port"] = frontend_cfg.get("port", defaults["ws_port"])
+    defaults["dev_port"] = frontend_cfg.get("dev_port", defaults["dev_port"])
+    defaults["num_objects"] = sim_cfg.get(
+        "default_num_objects", defaults["num_objects"]
+    )
+    return defaults
+
+
 def main() -> None:
+    defaults = _load_global_defaults()
     parser = argparse.ArgumentParser(description="Launch AUTOMATA GUI Orchestrator")
     parser.add_argument(
         "--broker",
         type=str,
-        default="localhost",
+        default=defaults["broker"],
         help="MQTT broker hostname",
     )
     parser.add_argument(
         "--mqtt-port",
         type=int,
-        default=1883,
+        default=defaults["mqtt_port"],
         help="MQTT broker port",
     )
     parser.add_argument(
         "--ws-port",
         type=int,
-        default=8080,
+        default=defaults["ws_port"],
         help="WebSocket frontend server port",
     )
     parser.add_argument(
@@ -248,7 +282,7 @@ def main() -> None:
     parser.add_argument(
         "--num-objects",
         type=int,
-        default=3,
+        default=defaults["num_objects"],
         help="Number of objects to simulate",
     )
     parser.add_argument(
@@ -267,11 +301,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Refuse to stack a second instance on top of a running one.
+    # Refuse to stack a second instance on top of a running one. The dev
+    # server port comes from global.yaml frontend.dev_port (it must track
+    # the port in frontend/vite.config.ts).
     check_ports_free(
         {
             args.ws_port: "Another orchestrator",
-            3000: "Another frontend dev server",
+            defaults["dev_port"]: "Another frontend dev server",
         }
     )
 
@@ -309,7 +345,7 @@ def main() -> None:
         logger.info("=" * 60)
         logger.info("  AUTOMATA GUI Orchestrator launched")
         logger.info("=" * 60)
-        logger.info("  Frontend: http://localhost:3000")
+        logger.info("  Frontend: http://localhost:%d", defaults["dev_port"])
         logger.info("  Backend WebSocket: ws://localhost:%d", args.ws_port)
         logger.info("  MQTT broker: localhost:%d", args.mqtt_port)
         if args.simulation:

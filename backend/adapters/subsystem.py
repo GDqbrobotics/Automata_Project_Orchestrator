@@ -22,26 +22,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from backend.domain.models import SubsystemConfig, SubsystemInfo, SubsystemState
+from backend.domain.models import (
+    GlobalConfig,
+    SubsystemConfig,
+    SubsystemInfo,
+    SubsystemState,
+)
 from backend.state.state_machine import StateMachineError
 
 logger = logging.getLogger(__name__)
-
-# Completion reports flow subsystem -> orchestrator over the /status topics.
-# When the local subsystem SM mirrors such a report it fires these events
-# locally, and they must NOT be re-published as commands.
-REPORT_EVENTS = frozenset({"complete", "init_complete"})
-
-# States that are not work stages. A reported state outside this set means the
-# subsystem is actively performing a work stage (picking, capturing, ...).
-NON_WORK_STATES = frozenset({"initializing", "ready", "stopped", "error"})
-
-# How long (seconds) the orchestrator waits for a subsystem to confirm the
-# state it was commanded into before raising a discrepancy warning. Real
-# subsystems take time to react, so the local SM is NOT advanced on command:
-# it only mirrors the state the subsystem reports over MQTT, and this timeout
-# flags a subsystem that never reports the expected state.
-STATE_EXPECT_TIMEOUT = 10.0
 
 
 class SubsystemStateMachineError(Exception):
@@ -58,6 +47,11 @@ class SubsystemAdapter:
 
     The state machine boundary callback (set by the orchestrator)
     publishes MQTT messages when the subsystem fires events.
+
+    The shared vocabulary (report events, non-work states, ready state)
+    and the discrepancy timeout come from global.yaml (via GlobalConfig,
+    docs/CONFIG_CHANGE_GUIDE.md R1); the MQTT topics come from the
+    subsystem YAML's `mqtt_topic` field (R4).
     """
 
     name: str
@@ -67,6 +61,20 @@ class SubsystemAdapter:
     initial_state: str = "ready"
     required: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Per-subsystem MQTT topic template (subsystem YAML `mqtt_topic`).
+    mqtt_topic: str = "automata/subsystem/{name}"
+    # Shared vocabulary (global.yaml `states:`)
+    ready_state: str = "ready"
+    non_work_states: frozenset = field(
+        default_factory=lambda: frozenset(
+            {"initializing", "ready", "stopped", "error"}
+        )
+    )
+    report_events: frozenset = field(
+        default_factory=lambda: frozenset({"complete", "init_complete"})
+    )
+    # Discrepancy-check window (global.yaml orchestration.state_expect_timeout)
+    state_expect_timeout: float = 10.0
     state: SubsystemState = SubsystemState.READY
     error: Optional[str] = None
     state_machine: Any = None  # StateMachineEngine instance
@@ -81,7 +89,8 @@ class SubsystemAdapter:
     # subsystem is expected to enter, but it does NOT advance the local SM:
     # the subsystem's real state (its MQTT status reports) is authoritative.
     # These fields track the pending expectation so a subsystem that never
-    # reports the expected state can be flagged after STATE_EXPECT_TIMEOUT.
+    # reports the expected state can be flagged after state_expect_timeout
+    # (global.yaml orchestration.state_expect_timeout).
     expected_state: Optional[str] = None       # state expected after last command
     expected_command: Optional[str] = None     # the command that set the expectation
     expected_pre_state: Optional[str] = None   # local SM state before the command
@@ -94,16 +103,59 @@ class SubsystemAdapter:
     _expected_timer: Optional[threading.Timer] = field(default=None, repr=False)
     _expected_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
+    # ------------------------------------------------------------------
+    # MQTT topics (from the per-YAML `mqtt_topic`, R4)
+    # ------------------------------------------------------------------
+    @property
+    def topic_prefix(self) -> str:
+        return self.mqtt_topic.replace("{name}", self.name)
+
+    @property
+    def event_topic(self) -> str:
+        return self.topic_prefix + "/event"
+
+    @property
+    def command_topic(self) -> str:
+        return self.topic_prefix + "/command"
+
+    @property
+    def status_topic(self) -> str:
+        return self.topic_prefix + "/status"
+
+    @property
+    def response_topic(self) -> str:
+        return self.topic_prefix + "/response"
+
+    def tone(self, state: Optional[str]) -> str:
+        """Visual tone for a raw subsystem state (F3)."""
+        if state is None:
+            return "offline"
+        if state == "error":
+            return "error"
+        if state == "offline":
+            return "offline"
+        if state == self.ready_state:
+            return "ready"
+        if state in self.non_work_states:
+            return "idle"
+        return "busy"
+
     @property
     def info(self) -> SubsystemInfo:
+        current = (
+            self.state_machine.current_state
+            if self.state_machine
+            else self.initial_state
+        )
         return SubsystemInfo(
             name=self.name,
             display_name=self.display_name or self.name,
             type=self.subsystem_type,
-            current_state=self.state_machine.current_state if self.state_machine else self.initial_state,
+            current_state=current,
             state_description=self._get_state_description(),
+            tone=self.tone(current),
             required=self.required,
-            topic_prefix=f"automata/subsystem/{self.name}",
+            topic_prefix=self.topic_prefix,
             metadata=self.metadata,
         )
 
@@ -122,6 +174,7 @@ class SubsystemAdapter:
             name=self.name,
             display_name=self.display_name or self.name,
             type=self.subsystem_type,
+            mqtt_topic=self.mqtt_topic,
             initial_state=self.initial_state,
             required=self.required,
             metadata=self.metadata,
@@ -153,7 +206,7 @@ class SubsystemAdapter:
         state and is only advanced from its MQTT status reports (see
         :meth:`mirror_reported_state`). The state the subsystem is expected to
         enter is recorded for the discrepancy check (see
-        ``STATE_EXPECT_TIMEOUT``): if the subsystem never reports it, a
+        ``state_expect_timeout``): if the subsystem never reports it, a
         warning is raised.
 
         Args:
@@ -173,12 +226,12 @@ class SubsystemAdapter:
                 f"No transition for event '{event}' in state '{sm.current_state}'"
             )
         expected = transitions[event]
-        if event not in REPORT_EVENTS:
+        if event not in self.report_events:
             # Outgoing command: record the expectation (discrepancy check) and
             # publish it. The local SM keeps its last reported state until the
             # subsystem confirms the new state over MQTT.
             self._record_expected(expected, event, sm.current_state)
-            topic = f"automata/subsystem/{self.name}/event"
+            topic = self.event_topic
             payload = {
                 "event": event,
                 "source": "orchestrator",
@@ -245,7 +298,7 @@ class SubsystemAdapter:
         """Record the state the subsystem should enter after a command.
 
         (Re)arms the discrepancy check: a timer fires after
-        STATE_EXPECT_TIMEOUT and warns if the subsystem has not reported the
+        state_expect_timeout and warns if the subsystem has not reported the
         expected state (or otherwise reacted to the command) by then.
         """
         with self._expected_lock:
@@ -261,7 +314,7 @@ class SubsystemAdapter:
         if self._expected_timer is not None:
             self._expected_timer.cancel()
         self._expected_timer = threading.Timer(
-            STATE_EXPECT_TIMEOUT, self._check_expected
+            self.state_expect_timeout, self._check_expected
         )
         self._expected_timer.daemon = True
         self._expected_timer.start()
@@ -311,7 +364,7 @@ class SubsystemAdapter:
         message = (
             f"Subsystem '{self.name}': expected state '{expected}' after "
             f"command '{command}', but last reported state is '{current}' "
-            f"after {STATE_EXPECT_TIMEOUT:.0f}s"
+            f"after {self.state_expect_timeout:.0f}s"
         )
         logger.warning("%s (state discrepancy)", message)
         if self.on_state_discrepancy is not None:
@@ -323,7 +376,7 @@ class SubsystemAdapter:
                 )
 
     def send_command(self, command: str, payload: Optional[Dict[str, Any]] = None) -> None:
-        topic = f"automata/subsystem/{self.name}/command"
+        topic = self.command_topic
         self.mqtt_client.publish(topic, payload or {})
         if self.on_mqtt_publish:
             self.on_mqtt_publish(topic, payload or {})
@@ -340,10 +393,13 @@ class SubsystemAdapterFactory:
         mqtt_client: Any,
         subsystems_config: List[SubsystemConfig],
         config_dir: Optional[Path] = None,
+        global_config: Optional[GlobalConfig] = None,
     ) -> None:
         self.mqtt_client = mqtt_client
         self.subsystems_config = subsystems_config
         self.config_dir = config_dir or Path(__file__).resolve().parent.parent / "config" / "subsystems"
+        # Shared vocabulary + discrepancy timeout (global.yaml, R1).
+        self.global_config = global_config or GlobalConfig()
         self.adapters: Dict[str, SubsystemAdapter] = {}
         self._build_adapters()
 
@@ -364,6 +420,11 @@ class SubsystemAdapterFactory:
                 initial_state=cfg.initial_state,
                 required=cfg.required,
                 metadata=cfg.metadata,
+                mqtt_topic=cfg.mqtt_topic,
+                ready_state=self.global_config.states_ready,
+                non_work_states=self.global_config.non_work_states,
+                report_events=self.global_config.report_events,
+                state_expect_timeout=self.global_config.state_expect_timeout,
                 state_machine_path=state_machine_path,
                 # Until the first status report arrives over MQTT the
                 # subsystem's real state is unknown – report it as offline
@@ -403,30 +464,3 @@ class SubsystemAdapterFactory:
 
     def get_required_names(self) -> List[str]:
         return [a.name for a in self.adapters.values() if a.required]
-
-
-# ------------------------------------------------------------------
-# Legacy constants for backward compatibility (simulation_test.py)
-# ------------------------------------------------------------------
-ALL_SUBSYSTEMS: List[str] = [
-    "vision",
-    "robot_first",
-    "robot_second",
-    "rotating_platform",
-    "imaging_3di",
-    "imaging_hsi",
-    "xrf",
-    "raman",
-    "ai_analysis",
-]
-
-# Aliases used in simulation_test.py
-VISION = "vision"
-ROBOT_FIRST = "robot_first"
-ROBOT_SECOND = "robot_second"
-ROTATING_PLATFORM = "rotating_platform"
-XRF = "xrf"
-RAMAN = "raman"
-IMAGING_3DI = "imaging_3di"
-IMAGING_HSI = "imaging_hsi"
-AI_ANALYSIS = "ai_analysis"

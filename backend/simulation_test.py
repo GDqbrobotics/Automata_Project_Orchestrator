@@ -35,37 +35,23 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Add project root to path so the backend package (at backend/) works.
 project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+import yaml
+
 import paho.mqtt.client as mqtt
 import websockets
 
 # Backend imports
-from backend.adapters.subsystem import (
-    ALL_SUBSYSTEMS,
-    VISION,
-    AI_ANALYSIS,
-    IMAGING_3DI,
-    IMAGING_HSI,
-    ROTATING_PLATFORM,
-    XRF,
-    RAMAN,
-    ROBOT_FIRST,
-    ROBOT_SECOND,
-)
-from backend.domain.models import WorkflowState, SubsystemState, ObjectState
-from backend.messaging.mqtt_client import (
-    TOPIC_COMMAND,
-    TOPIC_STATUS,
-    TOPIC_SUBSYSTEM,
-)
-from backend.orchestrator.workflow import WorkflowOrchestrator
-from backend.state.state_machine import StateMachineEngine, StateMachineError
+from backend.adapters.subsystem import SubsystemState
+from backend.domain.models import GlobalConfig
+from backend.orchestrator.workflow import WorkflowOrchestrator, WorkflowNames
+from backend.state.state_machine import StateMachineConfig, StateMachineEngine, StateMachineError
 from backend.orchestrator.object_state_machines import ObjectStateMachines
 
 # ---------------------------------------------------------------------------
@@ -74,8 +60,102 @@ from backend.orchestrator.object_state_machines import ObjectStateMachines
 MQTT_BROKER_HOST = "localhost"
 MQTT_BROKER_PORT = 1883
 FRONTEND_PORT = 8081
-CONFIG_PATH = str(Path(__file__).resolve().parent / "config" / "workflow.yaml")
-SUBSYSTEMS_CONFIG_DIR = str(Path(__file__).resolve().parent / "config" / "subsystems")
+CONFIG_DIR = Path(__file__).resolve().parent / "config"
+CONFIG_PATH = str(CONFIG_DIR / "workflow.yaml")
+SUBSYSTEMS_CONFIG_DIR = str(CONFIG_DIR / "subsystems")
+
+# The suite derives the names it validates from the same YAML files it
+# tests (R9): no legacy Python constants, so a config rename surfaces as a
+# readable test diff instead of a mysterious pipeline stall.
+_GLOBAL_CONFIG = GlobalConfig.from_yaml(CONFIG_DIR / "global.yaml")
+TOPIC_SUBSYSTEM = _GLOBAL_CONFIG.mqtt_topic_prefix
+TOPIC_STATUS = "status"
+TOPIC_COMMAND = "command"
+
+
+def _load_subsystem_yamls() -> Dict[str, Dict[str, Any]]:
+    """Glob config/subsystems/*.yaml and return {name: yaml data}."""
+    subs: Dict[str, Dict[str, Any]] = {}
+    for f in sorted(Path(SUBSYSTEMS_CONFIG_DIR).glob("*.yaml")):
+        data = yaml.safe_load(f.read_text()) or {}
+        if data.get("name"):
+            subs[data["name"]] = data
+    return subs
+
+
+SUBSYSTEM_YAMLS = _load_subsystem_yamls()
+ALL_SUBSYSTEMS = list(SUBSYSTEM_YAMLS)
+
+# Subsystem names referenced by the behaviour tests (literals: these
+# assertions *are* the expected behaviour; the discovery above covers
+# existence/consistency with the YAML files).
+ROTATING_PLATFORM = "rotating_platform"
+IMAGING_3DI = "imaging_3di"
+XRF = "xrf"
+RAMAN = "raman"
+
+
+def _load_workflow_config() -> StateMachineConfig:
+    return StateMachineConfig.from_yaml(CONFIG_PATH)
+
+
+def _load_object_config() -> StateMachineConfig:
+    return StateMachineConfig.from_yaml(CONFIG_DIR / "object.yaml")
+
+
+# The workflow is a perpetual process (no state is terminal in the YAML),
+# so 'the run ended' is defined by its lifecycle metadata (R3): the state
+# the run ends in after a full stop (the stop-completion event's target)
+# and the error state. Derived from workflow.yaml via WorkflowNames (same
+# derivation the orchestrator uses), so a rename is a config change the
+# test follows.
+_workflow_names = WorkflowNames.from_config(_load_workflow_config())
+_wf_cfg = _load_workflow_config()
+_stop_done_state = ""
+if _workflow_names.stop_state in _wf_cfg.states and _workflow_names.stop_completion_event:
+    _t = next(
+        (
+            t
+            for t in _wf_cfg.states[_workflow_names.stop_state].transitions
+            if t.event == _workflow_names.stop_completion_event
+        ),
+        None,
+    )
+    _stop_done_state = _t.target if _t else ""
+_WORKFLOW_DONE_STATES = {_stop_done_state, _workflow_names.error_state} - {""}
+
+
+# Object states by physical position, from object.yaml meta (R2 metadata):
+# the pipeline's capacity invariants are checked against these sets.
+_OBJ_CFG = _load_object_config()
+_OBJ_STATES_BY_POSITION: Dict[str, List[str]] = {}
+for _s, _c in _OBJ_CFG.states.items():
+    _pos = (_c.meta or {}).get("position")
+    if _pos:
+        _OBJ_STATES_BY_POSITION.setdefault(_pos, []).append(_s)
+DISK_FIRST_STATES = set(_OBJ_STATES_BY_POSITION.get("disk_first", []))
+DISK_SECOND_STATES = set(_OBJ_STATES_BY_POSITION.get("disk_second", []))
+IN_BOX_STATES = set(_OBJ_STATES_BY_POSITION.get("box", []))
+HAND_STATES = set(_OBJ_STATES_BY_POSITION.get("hand", []))
+
+
+def _object_journey() -> List[Tuple[str, str]]:
+    """Walk the object.yaml journey from the initial state: a list of
+    (event, target_state) pairs up to the final state (linear blueprint)."""
+    steps: List[Tuple[str, str]] = []
+    state = _OBJ_CFG.initial_state
+    seen = {state}
+    while True:
+        cfg = _OBJ_CFG.states.get(state)
+        if cfg is None or not cfg.transitions:
+            break
+        t = cfg.transitions[0]
+        steps.append((t.event, t.target))
+        if t.target in seen:
+            break  # safety: the blueprint is linear
+        seen.add(t.target)
+        state = t.target
+    return steps
 
 logging.basicConfig(
     level=logging.INFO,
@@ -239,10 +319,6 @@ class OrchestratorRunner:
         return self.orchestrator.fire_event(event)
 
     @property
-    def state(self) -> WorkflowState:
-        return self.orchestrator.state_machine.state
-
-    @property
     def current_state_name(self) -> str:
         return self.orchestrator.state_machine.current_state
 
@@ -347,7 +423,7 @@ class SubsystemSimulator:
         data = {
             "state": state,
             "name": self.name,
-            "ready": state == "ready",
+            "ready": state == _GLOBAL_CONFIG.states_ready,
         }
         self.client.publish(f"{TOPIC_SUBSYSTEM}/{self.name}/status", json.dumps(data), qos=1)
         self._state = state
@@ -387,15 +463,19 @@ def test_state_machine_config() -> None:
     assert config_path.exists(), f"Config file not found: {config_path}"
 
     sm = StateMachineEngine(config_path)
+    initial = sm.config.initial_state
     results.check(
-        sm.current_state == "idle",
-        "Initial state is 'idle'",
+        sm.current_state == initial,
+        f"Initial state is the configured one ('{initial}')",
     )
 
+    # Operator events come from the workflow.yaml metadata (R3)
+    operator_events = (sm.config.metadata or {}).get("operator_events", {})
+    start_event = operator_events.get("start", "start_requested")
     available = sm.get_available_transitions()
     results.check(
-        "start_requested" in available,
-        "idle state has 'start_requested' transition",
+        start_event in available,
+        f"'{initial}' state has the configured '{start_event}' transition",
     )
 
     # Test invalid transition
@@ -405,16 +485,16 @@ def test_state_machine_config() -> None:
     except StateMachineError:
         results.check(True, "Invalid transition raises StateMachineError")
 
-    # Verify known states exist in config
+    # Verify the run states exist in config
     results.check("running" in sm.config.states, "State 'running' is defined in config")
     results.check("paused" in sm.config.states, "State 'paused' is defined in config")
     results.check("error" in sm.config.states, "State 'error' is defined in config")
 
     # Verify transition targets exist
-    idle_transitions = sm.config.states["idle"].transitions
+    initial_transitions = sm.config.states[initial].transitions
     results.check(
-        all(t.target in sm.config.states for t in idle_transitions),
-        "All idle transitions have valid target states",
+        all(t.target in sm.config.states for t in initial_transitions),
+        f"All '{initial}' transitions have valid target states",
     )
 
     logger.info("State machine tests complete.\n")
@@ -456,13 +536,13 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
         "Orchestrator starts in 'idle' state",
     )
 
-    # Verify subsystems are created with 'initializing' as initial state
+    # Verify the subsystem SMs load the initial state their YAML declares
     for name in ALL_SUBSYSTEMS:
         adapter = runner.orchestrator.adapters.get(name)
         if adapter and adapter.state_machine:
             results.check(
-                adapter.state_machine.config.initial_state == "initializing",
-                f"Subsystem '{name}' YAML defines 'initializing' as initial state",
+                adapter.state_machine.config.initial_state == SUBSYSTEM_YAMLS[name]["initial_state"],
+                f"Subsystem '{name}' SM initial state matches its YAML",
             )
 
     # ---- Phase 2: Operator starts workflow via GUI ----
@@ -483,8 +563,8 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
 
     # ---- Phase 3: Wait for simulation to complete ----
     logger.info("Waiting for simulation to complete...")
-    # Terminal states: stopped/error = workflow completion
-    terminal_states = {"stopped", "error"}
+    # Done states: the workflow.yaml stop/error states (metadata, R3)
+    terminal_states = set(_WORKFLOW_DONE_STATES)
     # Stage durations are slowed down for GUI visibility, so the full
     # pipeline takes a while (roughly 8-10 s per object after the first).
     max_wait = 180  # seconds
@@ -495,13 +575,10 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
     #  - the rotating platform has 2 disk slots (imaging + measurement),
     #  - robot 1 has a single end effector (1 object in transit),
     #  - every other object must stay in the box.
-    # Object states occupying each physical position (imaging happens on
-    # the second disk, XRF/Raman measurement on the first one):
-    DISK_FIRST_STATES = {
-        "object_going_second_position", "ai_processing", "XRF_RAMAN_analysis", "moving_to_box",
-    }
-    DISK_SECOND_STATES = {"3DI_analysis", "HSI_analysis", "object_going_first_position"}
-    IN_BOX_STATES = {"identified_in_box", "waiting_for_disk", "object_analyzed"}
+    # The object states occupying each physical position come from the
+    # object.yaml meta (module top): the layout is config, not code.
+    n_disks = int(_OBJ_CFG.metadata.get("disks", 2))
+    n_hands = int(_OBJ_CFG.metadata.get("hand_slots", 1))
     invariant_violations: List[tuple] = []
 
     while time.monotonic() - start_wait < max_wait:
@@ -517,9 +594,14 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
         if object_states:
             n_disk_first = sum(s in DISK_FIRST_STATES for s in object_states)
             n_disk_second = sum(s in DISK_SECOND_STATES for s in object_states)
-            n_in_transit = sum(s == "moving_to_disk" for s in object_states)
+            n_in_transit = sum(s in HAND_STATES for s in object_states)
             n_out_of_box = sum(s not in IN_BOX_STATES for s in object_states)
-            if n_disk_first > 1 or n_disk_second > 1 or n_in_transit > 1 or n_out_of_box > 3:
+            if (
+                n_disk_first > n_disks // 2
+                or n_disk_second > n_disks // 2
+                or n_in_transit > n_hands
+                or n_out_of_box > n_disks + n_hands
+            ):
                 invariant_violations.append(
                     (n_in_transit, n_disk_first, n_disk_second, n_out_of_box)
                 )
@@ -541,8 +623,8 @@ async def test_full_workflow_with_gui_commands(num_objects: int = 3) -> None:
     final_progress = max_progress
 
     results.check(
-        final_state in ("stopped", "error"),
-        f"Simulation reached terminal state ('stopped' or 'error', got '{final_state}')",
+        final_state in terminal_states,
+        f"Simulation reached a done state ({sorted(terminal_states)}, got '{final_state}')",
     )
 
     results.check(
@@ -642,8 +724,13 @@ async def test_pause_resume_gui() -> None:
         "After stop_workflow, state transitions to 'stopped'",
     )
 
-    # Reset from stopped back to idle
-    runner.fire_event("reset_requested")
+    # Reset from stopped back to idle (operator event from workflow.yaml metadata)
+    reset_event = (
+        _load_workflow_config().metadata.get("operator_events", {}).get(
+            "reset", "reset_requested"
+        )
+    )
+    runner.fire_event(reset_event)
     time.sleep(0.2)
 
     results.check(
@@ -702,7 +789,7 @@ async def test_mqtt_topic_publishing() -> None:
             pass
 
     checker_client.on_message = on_workflow_cmd
-    checker_client.subscribe("automata/#", qos=1)
+    checker_client.subscribe(f"{TOPIC_SUBSYSTEM}/#", qos=1)
     checker_client.subscribe("command/#", qos=1)
     time.sleep(0.3)
 
@@ -786,8 +873,11 @@ async def test_error_recovery() -> None:
         "Workflow reached 'running' after subsystems ready",
     )
 
-    # Error during run
-    runner.fire_event("subsystem_error")
+    # Error during run (event name from workflow.yaml metadata)
+    error_event = (
+        _load_workflow_config().metadata.get("error_event", "subsystem_error")
+    )
+    runner.fire_event(error_event)
     time.sleep(0.3)
 
     results.check(
@@ -842,8 +932,9 @@ async def test_subsystem_state_machine() -> None:
             )
 
     # Test firing a transition on a subsystem state machine
-    if runner.orchestrator.adapters.get(VISION) and runner.orchestrator.adapters[VISION].state_machine:
-        adapter = runner.orchestrator.adapters[VISION]
+    vision = "vision"
+    if runner.orchestrator.adapters.get(vision) and runner.orchestrator.adapters[vision].state_machine:
+        adapter = runner.orchestrator.adapters[vision]
         available = adapter.state_machine.get_available_transitions()
 
         if "capture" in available:
@@ -878,25 +969,20 @@ def test_subsystem_config() -> None:
     )
 
     names = [cfg.name for cfg in runner.orchestrator.subsystems_config]
-    results.check(
-        "vision" in names,
-        "Subsystem 'vision' is configured",
-    )
-    results.check(
-        "robot_first" in names,
-        "Subsystem 'robot_first' is configured",
-    )
-    results.check(
-        "imaging_3di" in names,
-        "Subsystem 'imaging_3di' is configured",
-    )
-    results.check(
-        "imaging_hsi" in names,
-        "Subsystem 'imaging_hsi' is configured",
-    )
+    # Which subsystems exist is asserted as behaviour; the names come from
+    # the same YAML files the test validates (discovered above).
+    for expected in ("vision", "robot_first", "imaging_3di", "imaging_hsi"):
+        results.check(
+            expected in names,
+            f"Subsystem '{expected}' is configured",
+        )
     results.check(
         "cloud_database" not in names,
         "Subsystem 'cloud_database' is removed (local storage, manual update)",
+    )
+    results.check(
+        set(names) == set(SUBSYSTEM_YAMLS),
+        "Configured subsystems match the subsystem YAML files",
     )
 
     results.check(
@@ -905,14 +991,18 @@ def test_subsystem_config() -> None:
     )
 
     required_names = runner.orchestrator.required_subsystem_names
-    results.check(
-        "vision" in required_names,
-        "'vision' is a required subsystem",
-    )
-    results.check(
-        "ai_analysis" not in required_names,
-        "'ai_analysis' is not a required subsystem",
-    )
+    for expected in ("vision",):
+        results.check(
+            expected in required_names
+            and SUBSYSTEM_YAMLS[expected].get("required") is True,
+            f"'{expected}' is a required subsystem (per its YAML)",
+        )
+    if "ai_analysis" in SUBSYSTEM_YAMLS:
+        results.check(
+            ("ai_analysis" not in required_names)
+            == (SUBSYSTEM_YAMLS["ai_analysis"].get("required") is not True),
+            "'ai_analysis' required-flag matches its YAML",
+        )
 
     runner.stop()
 
@@ -936,27 +1026,21 @@ def test_object_state_machine_config() -> None:
         "Object workflow has correct name",
     )
     results.check(
-        manager.config.initial_state == "identified_in_box",
-        "Object workflow initial state is 'identified_in_box'",
+        manager.config.initial_state == _OBJ_CFG.initial_state,
+        f"Object workflow initial state is the configured one ('{_OBJ_CFG.initial_state}')",
     )
 
-    expected_states = [
-        "identified_in_box",
-        "waiting_for_disk",
-        "moving_to_disk",
-        "3DI_analysis",
-        "HSI_analysis",
-        "object_going_second_position",
-        "XRF_RAMAN_analysis",
-        "object_going_first_position",
-        "ai_processing",
-        "moving_to_box",
-        "object_analyzed",
-    ]
-    for state in expected_states:
+    # The blueprint must define exactly the states the YAML declares (the
+    # set comparison catches both missing and unexpected states).
+    results.check(
+        set(manager.config.states) == set(_OBJ_CFG.states),
+        f"All {len(_OBJ_CFG.states)} object states are defined in the config",
+    )
+    # The pipeline needs the physical meta on every journey state (R2).
+    for state, cfg in manager.config.states.items():
         results.check(
-            state in manager.config.states,
-            f"State '{state}' is defined in object config",
+            bool((cfg.meta or {}).get("position")),
+            f"State '{state}' declares its physical position (meta.position)",
         )
 
     # Verify event actions are scoped (e.g., "robot_first/pick").
@@ -988,6 +1072,12 @@ def test_object_state_machine_config() -> None:
         "XRF_RAMAN_analysis": ["robot_first/return"],
     }
     for state, expected_events in expected_scoped_events.items():
+        if state not in manager.config.states:
+            results.check(
+                False,
+                f"Transition from '{state}' fires scoped event (state missing from object.yaml)",
+            )
+            continue
         transitions = manager.config.states[state].transitions
         fired_events = set()
         for t in transitions:
@@ -1015,28 +1105,17 @@ def test_object_state_machine_transitions() -> None:
 
     manager.create_object("test_object_001")
     results.check(
-        manager.get_object_state("test_object_001") == "identified_in_box",
-        "Object starts in 'identified_in_box' state",
+        manager.get_object_state("test_object_001") == _OBJ_CFG.initial_state,
+        f"Object starts in the configured initial state ('{_OBJ_CFG.initial_state}')",
     )
 
-    available = manager.get_available_transitions("test_object_001")
+    # The full journey, walked from object.yaml (linear blueprint): a
+    # rename/reorder of the journey is a config change the test follows.
+    transition_sequence = _object_journey()
     results.check(
-        "queued_for_analysis" in available,
-        "Available transition from 'identified_in_box' is 'queued_for_analysis'",
+        len(transition_sequence) > 0,
+        "Object journey has transitions",
     )
-
-    transition_sequence = [
-        ("queued_for_analysis", "waiting_for_disk"),
-        ("object_picked", "moving_to_disk"),
-        ("object_placed_on_disk", "object_going_second_position"),
-        ("platform_rotated_to_second", "3DI_analysis"),
-        ("3di_capture_complete", "HSI_analysis"),
-        ("hsi_capture_complete", "object_going_first_position"),
-        ("platform_rotated_to_first", "ai_processing"),
-        ("ai_complete", "XRF_RAMAN_analysis"),
-        ("measurements_complete", "moving_to_box"),
-        ("object_returned_to_box", "object_analyzed"),
-    ]
 
     for event, expected_state in transition_sequence:
         new_state = manager.fire_transition("test_object_001", event)
@@ -1045,9 +1124,10 @@ def test_object_state_machine_transitions() -> None:
             f"Transition '{event}' -> '{expected_state}' (got '{new_state}')",
         )
 
+    final_states = set(manager.config.final_states)
     results.check(
-        manager.get_object_state("test_object_001") == "object_analyzed",
-        "Object reaches 'object_analyzed' final state",
+        manager.get_object_state("test_object_001") in final_states,
+        f"Object reaches a final state of the journey ({sorted(final_states)})",
     )
 
     final_available = manager.get_available_transitions("test_object_001")
@@ -1104,37 +1184,18 @@ async def test_object_in_orchestrator() -> None:
         "Object created via orchestrator starts in 'identified_in_box'",
     )
 
-    # Fire the queueing transition (analysis order established by vision)
-    new_state = runner.orchestrator.fire_object_transition(
-        "orch_test_001", "queued_for_analysis"
-    )
-    results.check(
-        new_state == "waiting_for_disk",
-        "Object transition via orchestrator: identified_in_box -> waiting_for_disk",
-    )
+    # Fire the first two journey steps individually (the object journey is
+    # walked from object.yaml, so this follows config renames).
+    journey = _object_journey()
+    for event, expected_state in journey[:2]:
+        new_state = runner.orchestrator.fire_object_transition("orch_test_001", event)
+        results.check(
+            new_state == expected_state,
+            f"Object transition via orchestrator: {event} -> {expected_state}",
+        )
 
-    # Fire the pick (the disk slot is free, the robot takes the object)
-    new_state = runner.orchestrator.fire_object_transition(
-        "orch_test_001", "object_picked"
-    )
-    results.check(
-        new_state == "moving_to_disk",
-        "Object transition via orchestrator: waiting_for_disk -> moving_to_disk",
-    )
-
-    # Fire complete sequence
-    transition_sequence = [
-        ("object_placed_on_disk", "object_going_second_position"),
-        ("platform_rotated_to_second", "3DI_analysis"),
-        ("3di_capture_complete", "HSI_analysis"),
-        ("hsi_capture_complete", "object_going_first_position"),
-        ("platform_rotated_to_first", "ai_processing"),
-        ("ai_complete", "XRF_RAMAN_analysis"),
-        ("measurements_complete", "moving_to_box"),
-        ("object_returned_to_box", "object_analyzed"),
-    ]
-
-    for event, expected_state in transition_sequence:
+    # Fire the rest of the journey
+    for event, expected_state in journey[2:]:
         new_state = runner.orchestrator.fire_object_transition("orch_test_001", event)
         results.check(
             new_state == expected_state,
@@ -1143,8 +1204,8 @@ async def test_object_in_orchestrator() -> None:
 
     final_state = runner.orchestrator.object_manager.get_object_state("orch_test_001")
     results.check(
-        final_state == "object_analyzed",
-        "Object reaches 'object_analyzed' via orchestrator",
+        final_state in set(runner.orchestrator.object_manager.config.final_states),
+        f"Object reaches a final state of the journey via orchestrator ('{final_state}')",
     )
 
     status = runner.orchestrator._get_status()

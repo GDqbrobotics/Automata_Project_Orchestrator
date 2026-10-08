@@ -46,6 +46,7 @@ import json
 import logging
 import re
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -56,7 +57,6 @@ import yaml
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 from backend.adapters.subsystem import (
-    NON_WORK_STATES,
     SubsystemAdapter,
     SubsystemAdapterFactory,
     SubsystemState,
@@ -70,10 +70,9 @@ from backend.domain.models import (
     SubsystemConfig,
     SubsystemInfo,
     WorkflowCommand,
-    WorkflowState,
     WorkflowStatus,
 )
-from backend.messaging.mqtt_client import MqttClient, TOPIC_SUBSYSTEM
+from backend.messaging.mqtt_client import MqttClient
 from backend.services.frontend_server import FrontendServer
 from backend.simulation.process_manager import SubsystemProcessManager
 from backend.state.state_machine import StateMachineEngine, StateMachineError
@@ -94,6 +93,87 @@ def _parse_subsystem_prefix(name: str) -> Tuple[str, str]:
         parts = name.split("/", 1)
         return parts[0], parts[1]
     return "", name
+
+
+@dataclass
+class WorkflowNames:
+    """The workflow lifecycle vocabulary, loaded once from workflow.yaml
+    (states + its `metadata:` section).
+
+    Replaces the old WorkflowState enum: the orchestrator compares the raw
+    state name from the engine against these YAML-derived values (R3), so
+    renaming a state or event in workflow.yaml is a config-only change.
+    """
+
+    initial_state: str
+    # operator button -> event (metadata.operator_events)
+    operator_events: Dict[str, str] = field(default_factory=dict)
+    # fired when leaving the stop state (metadata.stop_completion_event)
+    stop_completion_event: str = ""
+    # readiness gate (metadata.readiness)
+    readiness_in_state: str = ""
+    readiness_fire: str = ""
+    # event fired when a *required* subsystem reports error (metadata.error_event)
+    error_event: str = ""
+    # state that represents a workflow error (metadata.error_state)
+    error_state: str = ""
+    # simulation toggles are accepted only in these states (metadata.toggle_allowed_in)
+    toggle_allowed_in: List[str] = field(default_factory=list)
+    # subsystem state woken to `wake_to_state` on start (metadata.wake)
+    wake_from_state: str = ""
+    wake_to_state: str = ""
+    # derived: the state the run is in once the readiness gate fired
+    run_state: str = ""
+    # derived: the stop state (target of the stop event from the run state)
+    stop_state: str = ""
+    # derived: states in which the pipeline suspends dispatch
+    suspend_states: Set[str] = field(default_factory=set)
+
+    @classmethod
+    def from_config(cls, config: Any) -> "WorkflowNames":
+        md = config.metadata or {}
+        op = md.get("operator_events") or {}
+        readiness = md.get("readiness") or {}
+        wake = md.get("wake") or {}
+
+        # run state = target of the readiness event from the readiness state
+        run_state = ""
+        in_state = readiness.get("in_state", "")
+        fire = readiness.get("fire", "")
+        if in_state in config.states and fire:
+            for t in config.states[in_state].transitions:
+                if t.event == fire:
+                    run_state = t.target
+                    break
+
+        # stop state = target of the stop operator event from the run state
+        stop_state = ""
+        stop_event = op.get("stop", "")
+        if run_state and stop_event and run_state in config.states:
+            for t in config.states[run_state].transitions:
+                if t.event == stop_event:
+                    stop_state = t.target
+                    break
+
+        return cls(
+            initial_state=config.initial_state,
+            operator_events=dict(op),
+            stop_completion_event=md.get("stop_completion_event", ""),
+            readiness_in_state=in_state,
+            readiness_fire=fire,
+            error_event=md.get("error_event", ""),
+            error_state=md.get("error_state", ""),
+            toggle_allowed_in=list(md.get("toggle_allowed_in") or []),
+            wake_from_state=wake.get("from_state", ""),
+            wake_to_state=wake.get("to_state", ""),
+            run_state=run_state,
+            stop_state=stop_state,
+            suspend_states={
+                config.initial_state,
+                stop_state,
+                *config.final_states,
+            } - {""},
+        )
 
 
 class WorkflowOrchestrator:
@@ -133,6 +213,8 @@ class WorkflowOrchestrator:
         )
         # Wire up internal event routing for the workflow SM
         self.state_machine.set_on_event_callback(self._on_event)
+        # Lifecycle vocabulary from workflow.yaml (states + metadata, R3)
+        self.workflow_names = WorkflowNames.from_config(self.state_machine.config)
 
         # ─── Subsystem Configuration & Adapters ───
         self.subsystems_config: List[SubsystemConfig] = []
@@ -142,6 +224,7 @@ class WorkflowOrchestrator:
             self.mqtt,
             self.subsystems_config,
             config_dir=_PROJECT_ROOT / "backend" / "config" / "subsystems",
+            global_config=self._global_config,
         )
         self.adapters: Dict[str, SubsystemAdapter] = self.adapter_factory.get_all()
 
@@ -167,7 +250,7 @@ class WorkflowOrchestrator:
 
         # ─── Workflow Status ───
         self._status = WorkflowStatus(
-            state=WorkflowState.IDLE,
+            state=self.workflow_names.initial_state,
             total_objects=0,
             active_subsystems={
                 name: adapter.info
@@ -196,6 +279,16 @@ class WorkflowOrchestrator:
         self.mqtt._on_message = self._on_mqtt_message
         self._subsystem_callbacks: Dict[str, Callable] = {}
 
+        # The response `type`s the orchestrator acts on, declared by the
+        # subsystems' reporting roles (metadata.reports, R5) – e.g. the
+        # box scanner's object list. Anything else is logged only.
+        self._report_types: Set[str] = {
+            rep.get("type")
+            for adapter in self.adapters.values()
+            for rep in (adapter.metadata.get("reports") or [])
+            if rep.get("type")
+        }
+
         # Object internal-event messages fired during the in-progress
         # transition. They are flushed by fire_object_transition() together
         # with the transition record, so the frontend shows the transition
@@ -220,11 +313,21 @@ class WorkflowOrchestrator:
         self._sim_procs: Optional[SubsystemProcessManager] = None
         self._simulated: Set[str] = set()
         if use_simulation:
+            # Subsystems that report an object list counted from the box
+            # scan (metadata.reports, R5) need --num-objects: the manager
+            # passes it only to those (no "if name == vision" special case).
+            reporters = {
+                name
+                for name, adapter in self.adapters.items()
+                for rep in (adapter.metadata.get("reports") or [])
+                if (rep.get("object_ids") or {}).get("count_source") == "num_objects"
+            }
             self._sim_procs = SubsystemProcessManager(
                 # Follow the live MQTT client so the sim processes always
                 # target the broker the orchestrator itself uses.
                 endpoint=lambda: (self.mqtt.broker, self.mqtt.port),
                 num_objects=self._total_objects,
+                reporters=reporters,
             )
             self._simulated = set(
                 self._sim_procs.available(list(self.adapters.keys()))
@@ -281,10 +384,11 @@ class WorkflowOrchestrator:
             return
 
         if scope == "all":
-            if local_event in ("pause", "resume"):
-                # Hardware command: forward to every subsystem over MQTT
-                # without touching the local SMs (they do not model pause;
-                # the subsystem freezes its work and keeps its state).
+            # Raw hardware commands (global.yaml states.hardware_commands,
+            # ordered [pause, resume]): forwarded to every subsystem over
+            # MQTT without touching the local SMs (they do not model
+            # pause; the subsystem freezes its work and keeps its state).
+            if local_event in self._global_config.states_hardware_commands:
                 logger.info("Broadcasting command 'all/%s' to all subsystems", local_event)
                 self._broadcast_command_to_subsystems(local_event)
             else:
@@ -375,7 +479,7 @@ class WorkflowOrchestrator:
         handle them locally (e.g. freezing the ongoing work).
         """
         for name in self.adapters:
-            topic = f"{TOPIC_SUBSYSTEM}/{name}/event"
+            topic = self.adapters[name].event_topic
             payload = {"event": command, "source": "orchestrator"}
             self.mqtt.publish(topic, payload, qos=1)
             self._fire_subsystem_message(name, "sent", topic, payload)
@@ -430,8 +534,26 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     # Operator Command Handlers
     # ------------------------------------------------------------------
+    def _check_readiness(self, source: str) -> None:
+        """The readiness gate (workflow.yaml metadata.readiness), in one
+        place: while the workflow waits in the readiness state, the moment
+        all *required* subsystems report the ready state, the readiness
+        event is fired (starting -> running)."""
+        wf = self.workflow_names
+        if self.state_machine.state != wf.readiness_in_state:
+            return
+        required_adapters = self.adapter_factory.get_required()
+        if all(a.state == SubsystemState.READY for a in required_adapters):
+            logger.info("All required subsystems ready!")
+            if self.fire_event(wf.readiness_fire):
+                self._fire_frontend_event(
+                    BackendEvent.WORKFLOW_STATE_CHANGED.value,
+                    {"new_state": wf.run_state, "source": source},
+                )
+
     def _handle_start(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: start_workflow")
+        wf = self.workflow_names
         # Simulation mode: make sure the simulated subsystem processes
         # that are toggled on are actually running (restart any that died).
         self._ensure_simulated_processes_running()
@@ -439,54 +561,61 @@ class WorkflowOrchestrator:
         # This handles starting from stopped, error, or idle.
         self._reset_workflow_state()
 
-        if not self.fire_event("start_requested"):
+        if not self.fire_event(wf.operator_events.get("start", "start_requested")):
             return  # error already logged by fire_event
 
-        new_state = WorkflowState(self.state_machine.state)
-        self._update_state(new_state)
+        self._update_state(self.state_machine.state)
 
-        # Subsystems that were stopped after a previous run go back to ready
-        # (the local SM transition publishes the 'ready' command over MQTT).
-        for name, adapter in self.adapters.items():
-            sm = adapter.state_machine
-            if sm and sm.current_state == "stopped" and "ready" in sm.get_available_transitions():
-                adapter.fire_transition("ready")
-                self._refresh_subsystem_info(name)
+        # Subsystems left in the wake-from state after a previous run go
+        # back to the wake-to state (the transition event is looked up in
+        # the subsystem SM; the command is published over MQTT).
+        if wf.wake_from_state and wf.wake_to_state:
+            for name, adapter in self.adapters.items():
+                sm = adapter.state_machine
+                if sm is None or sm.current_state != wf.wake_from_state:
+                    continue
+                event = sm.config.event_to(wf.wake_from_state, wf.wake_to_state)
+                if event and event not in adapter.report_events:
+                    adapter.fire_transition(event)
+                    self._refresh_subsystem_info(name)
 
         # If all required subsystems already report ready, enter running now;
         # otherwise the next status report over MQTT will trigger it.
-        required_adapters = self.adapter_factory.get_required()
-        if all(a.state == SubsystemState.READY for a in required_adapters):
-            self.fire_event("subsystem_ready")
+        self._check_readiness("operator")
 
     def _handle_pause(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: pause_workflow")
+        wf = self.workflow_names
         # The workflow SM action 'all/pause' forwards a pause command to
         # every subsystem over MQTT (they freeze their work, keeping state).
-        if not self.fire_event("pause_requested"):
+        if not self.fire_event(wf.operator_events.get("pause", "pause_requested")):
             return  # error already logged by fire_event
-        self._update_state(WorkflowState(self.state_machine.state))
+        self._update_state(self.state_machine.state)
 
     def _handle_resume(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: resume_workflow")
+        wf = self.workflow_names
         # The workflow SM action 'all/resume' forwards a resume command to
         # every subsystem over MQTT.
-        if not self.fire_event("resume_requested"):
+        if not self.fire_event(wf.operator_events.get("resume", "resume_requested")):
             return  # error already logged by fire_event
-        self._update_state(WorkflowState(self.state_machine.state))
+        self._update_state(self.state_machine.state)
 
     def _handle_stop(self, data: Dict[str, Any]) -> None:
         logger.info("Operator: stop_workflow")
+        wf = self.workflow_names
         # The workflow SM action 'all/stop' stops every subsystem over MQTT.
         # running → stopping
-        if not self.fire_event("stop_requested"):
+        if not self.fire_event(wf.operator_events.get("stop", "stop_requested")):
             return  # error already logged by fire_event
         # stopping → stopped (complete the transition immediately when the
         # operator initiates the stop; the pipeline controller only performs
-        # the automatic stop sequence at the end of a successful run)
-        if self.state_machine.state == WorkflowState.STOPPING:
-            self.fire_event("stopped")
-            self._update_state(WorkflowState.STOPPED)
+        # the automatic stop sequence at the end of a successful run).
+        # The stop state is derived in WorkflowNames (target of the stop
+        # operator event fired from the run state).
+        if wf.stop_state and self.state_machine.state == wf.stop_state and wf.stop_completion_event:
+            self.fire_event(wf.stop_completion_event)
+            self._update_state(self.state_machine.state)
 
     def _handle_reset(self, data: Dict[str, Any]) -> None:
         """Handle workflow reset (from error or stopped state back to idle).
@@ -496,16 +625,17 @@ class WorkflowOrchestrator:
         Stops any running simulation first to avoid race conditions.
         """
         logger.info("Operator: reset_workflow")
+        wf = self.workflow_names
         self._reset_workflow_state()
 
-        if not self.fire_event("reset_requested"):
+        if not self.fire_event(wf.operator_events.get("reset", "reset_requested")):
             return  # error already logged by fire_event
 
-        new_state = WorkflowState(self.state_machine.state)
+        new_state = self.state_machine.state
         self._update_state(new_state)
         self._fire_frontend_event(
             BackendEvent.WORKFLOW_STATE_CHANGED.value,
-            {"new_state": new_state.value, "source": "operator"},
+            {"new_state": new_state, "source": "operator"},
         )
         self._fire_frontend_event(
             BackendEvent.OBJECT_REMOVED.value,
@@ -537,8 +667,10 @@ class WorkflowOrchestrator:
     # is the ID the local database uses for the object's record while the
     # machine keeps working with the auto-assigned object_id
     # (docs/PROJECT_CONTEXT.md). The local database is updated manually –
-    # there is no cloud subsystem.
-    ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_\-\. ]{1,64}$")
+    # there is no cloud subsystem. The format rule comes from global.yaml
+    # (orchestration.alias_pattern) and is broadcast to the GUI (F7).
+    def _alias_pattern(self) -> "re.Pattern":
+        return re.compile(self._global_config.alias_pattern)
 
     def _handle_assign_alias(self, data: Dict[str, Any]) -> None:
         """Handle operator alias-ID assignment for an object.
@@ -560,13 +692,14 @@ class WorkflowOrchestrator:
                 {"message": f"Alias assignment: empty alias for '{object_id}'"},
             )
             return
-        if not self.ALIAS_PATTERN.match(alias):
+        if not self._alias_pattern().match(alias):
             self._fire_frontend_event(
                 BackendEvent.ERROR_REPORTED.value,
                 {
                     "message": (
-                        f"Alias '{alias}' invalid: use letters, digits, "
-                        "'_' '-' '.' or spaces (max 64 characters)"
+                        f"Alias '{alias}' invalid: must match "
+                        f"{self._global_config.alias_pattern}"
+                        " (configured in global.yaml)"
                     )
                 },
             )
@@ -638,16 +771,18 @@ class WorkflowOrchestrator:
         adapter.reset_expected()
         adapter.update_state(SubsystemState.OFFLINE)
         self._refresh_subsystem_info(name)
+        new_state = (
+            adapter.state_machine.current_state
+            if adapter.state_machine
+            else adapter.initial_state
+        )
         self._fire_frontend_event(
             BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
             {
                 "subsystem": name,
-                "new_state": (
-                    adapter.state_machine.current_state
-                    if adapter.state_machine
-                    else adapter.initial_state
-                ),
+                "new_state": new_state,
                 "state_description": adapter._get_state_description(),
+                "tone": adapter.tone(new_state),
                 "source": "simulation_toggle",
             },
         )
@@ -675,9 +810,7 @@ class WorkflowOrchestrator:
                 },
             )
             return
-        if self.state_machine.state not in (
-            WorkflowState.IDLE, WorkflowState.STOPPED, WorkflowState.ERROR,
-        ):
+        if self.state_machine.state not in self.workflow_names.toggle_allowed_in:
             self._fire_frontend_event(
                 BackendEvent.ERROR_REPORTED.value,
                 {
@@ -743,8 +876,13 @@ class WorkflowOrchestrator:
         Sent to the frontend (debug mode only) so the subsystem inspector can
         offer a selector of the outgoing topics with sensible default
         payloads. The orchestrator's receive path consumes /status (state
-        reports, incl. heartbeats) and /response (e.g. the vision system's
+        reports, incl. heartbeats) and /response (e.g. the box scanner's
         object list), so those are the topics a real subsystem sends.
+
+        Topics come from each subsystem's configured `mqtt_topic` (R4);
+        the default response payload comes from the subsystem's declared
+        reporting role (metadata.reports, R5). Each descriptor is tagged
+        with its kind so the GUI derives its conveniences from data (F5).
         """
         topics: Dict[str, List[Dict[str, Any]]] = {}
         for name, adapter in self.adapters.items():
@@ -755,7 +893,10 @@ class WorkflowOrchestrator:
             )
             entries: List[Dict[str, Any]] = [
                 {
-                    "topic": f"{TOPIC_SUBSYSTEM}/{name}/status",
+                    "topic": adapter.status_topic,
+                    "kind": "status",
+                    "state_field": "state",
+                    "ready_field": "ready",
                     "description": (
                         "State report (published by the subsystem on every "
                         "state change + heartbeat)"
@@ -763,31 +904,40 @@ class WorkflowOrchestrator:
                     "default_payload": {
                         "state": current,
                         "name": name,
-                        "ready": current == "ready",
+                        "ready": current == adapter.ready_state,
                         "paused": False,
                     },
                 },
                 {
-                    "topic": f"{TOPIC_SUBSYSTEM}/{name}/response",
+                    "topic": adapter.response_topic,
+                    "kind": "response",
                     "description": "Response message",
-                    # The only response the orchestrator acts on is the
-                    # vision object list; every other response is logged.
+                    # A subsystem that declares a reporting role (R5) gets a
+                    # payload for its first report; every other response is
+                    # just logged by the orchestrator.
                     "default_payload": (
-                        {
-                            "type": "objects_detected",
-                            "objects": [
-                                f"object_{i:03d}"
-                                for i in range(1, self._total_objects + 1)
-                            ],
-                            "count": self._total_objects,
-                        }
-                        if name == "vision"
+                        self._report_payload(adapter)
+                        if adapter.metadata.get("reports")
                         else {"type": "ok"}
                     ),
                 },
             ]
             topics[name] = entries
         return topics
+
+    def _report_payload(self, adapter: SubsystemAdapter) -> Dict[str, Any]:
+        """Default payload for a declared report (metadata.reports[0]):
+        the report type + object IDs rendered from the configured format."""
+        rep = (adapter.metadata.get("reports") or [{}])[0]
+        ids_cfg = rep.get("object_ids") or {}
+        fmt = ids_cfg.get("format", self._global_config.simulation_object_id_format)
+        count = (
+            self._total_objects
+            if ids_cfg.get("count_source") == "num_objects"
+            else 0
+        )
+        objects = [fmt.format(i=i) for i in range(1, count + 1)]
+        return {"type": rep.get("type", "ok"), "objects": objects, "count": count}
 
     def _handle_debug_send_subsystem_message(self, data: Dict[str, Any]) -> None:
         """Debug mode: inject an MQTT message on a subsystem's outgoing topic.
@@ -818,8 +968,8 @@ class WorkflowOrchestrator:
             )
             return
         allowed = (
-            f"{TOPIC_SUBSYSTEM}/{name}/status",
-            f"{TOPIC_SUBSYSTEM}/{name}/response",
+            self.adapters[name].status_topic,
+            self.adapters[name].response_topic,
         )
         if topic not in allowed:
             self._fire_frontend_event(
@@ -879,16 +1029,19 @@ class WorkflowOrchestrator:
 
     def _start_workflow_immediately(self) -> None:
         """Start the workflow immediately from idle when all subsystems are ready."""
+        wf = self.workflow_names
         try:
-            new_state = self.state_machine.fire("start_requested", self._status)
-            self._update_state(WorkflowState(new_state))
+            new_state = self.state_machine.fire(
+                wf.operator_events.get("start", "start_requested"), self._status
+            )
+            self._update_state(new_state)
             self._fire_frontend_event(
                 BackendEvent.WORKFLOW_STATE_CHANGED.value,
                 {"new_state": new_state, "source": "subsystems_ready"},
             )
 
-            new_state = self.state_machine.fire("subsystem_ready", self._status)
-            self._update_state(WorkflowState(new_state))
+            new_state = self.state_machine.fire(wf.readiness_fire, self._status)
+            self._update_state(new_state)
             self._fire_frontend_event(
                 BackendEvent.WORKFLOW_STATE_CHANGED.value,
                 {"new_state": new_state, "source": "subsystems_ready"},
@@ -901,18 +1054,27 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     # Object State Machine Management
     # ------------------------------------------------------------------
+    @property
+    def _object_initial(self) -> Tuple[str, str]:
+        """(initial state, its description) from object.yaml (R6)."""
+        cfg = self.object_manager.config
+        state = cfg.initial_state
+        desc = cfg.states.get(state)
+        return state, (desc.description if desc else "")
+
     def create_object(self, object_id: str) -> None:
         """Create a new object state machine instance."""
         with self._lock:
             self.object_manager.create_object(object_id)
         logger.info("Created object state machine: %s", object_id)
 
+        state, description = self._object_initial
         self._fire_frontend_event(
             BackendEvent.OBJECT_ADDED.value,
             {
                 "object_id": object_id,
-                "state": "identified_in_box",
-                "state_description": "Object has been identified in the box",
+                "state": state,
+                "state_description": description,
             },
         )
         self._broadcast_objects()
@@ -964,7 +1126,9 @@ class WorkflowOrchestrator:
                 self._fire_frontend_event(BackendEvent.OBJECT_MESSAGE.value, msg)
             self._broadcast_objects()
 
-            if new_state == "object_analyzed":
+            # Final states are the object.yaml states without outgoing
+            # transitions (R6): no hardcoded 'object_analyzed'.
+            if new_state in self.object_final_states:
                 logger.info("Object '%s' analysis complete", object_id)
                 analyzed = self._count_analyzed_objects()
                 with self._lock:
@@ -979,16 +1143,24 @@ class WorkflowOrchestrator:
 
         return new_state
 
+    @property
+    def object_final_states(self) -> List[str]:
+        """The object journey's final states (object.yaml states without
+        outgoing transitions, R6)."""
+        return self.object_manager.config.final_states
+
     def _count_analyzed_objects(self) -> int:
-        """Count objects that have reached the final 'object_analyzed' state.
+        """Count objects that have reached a final state of the object
+        journey.
 
         Progress must reflect *completed* objects, not the total number of
         known objects (which would make the UI show 100% prematurely).
         """
+        final_states = self.object_final_states
         return sum(
             1
             for oid in self.object_manager.get_object_ids()
-            if self.object_manager.get_object_state(oid) == "object_analyzed"
+            if self.object_manager.get_object_state(oid) in final_states
         )
 
     def _on_object_state_change(
@@ -1006,6 +1178,17 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     # MQTT Message Dispatcher
     # ------------------------------------------------------------------
+    def _configured_topic_owner(self, topic: str) -> Optional[Tuple[str, str]]:
+        """Route an incoming topic to (subsystem, kind) using the
+        *configured* topics of each adapter (R4): a subsystem may live on
+        any topic tree, not just the global prefix."""
+        for name, adapter in self.adapters.items():
+            if topic == adapter.status_topic:
+                return name, "status"
+            if topic == adapter.response_topic:
+                return name, "response"
+        return None
+
     def _on_mqtt_message(self, topic: str, payload: bytes) -> None:
         """Route incoming MQTT messages to appropriate handlers."""
         logger.info("[Orchestrator] MQTT message on topic=%s", topic)
@@ -1017,36 +1200,35 @@ class WorkflowOrchestrator:
 
         logger.info("[Orchestrator] MQTT dispatch %s -> %s", topic_str, data)
 
-        # Record incoming subsystem traffic for the frontend message
-        # inspector (status reports, responses, ...).
-        if topic_str.startswith(f"{TOPIC_SUBSYSTEM}/"):
-            parts = topic_str.split("/")
-            if len(parts) >= 4 and parts[2] in self.adapters:
-                self._fire_subsystem_message(parts[2], "received", topic_str, data)
+        owner = self._configured_topic_owner(topic_str)
+        if owner is not None:
+            name, kind = owner
+            # Record incoming subsystem traffic for the frontend message
+            # inspector (status reports, responses, ...).
+            self._fire_subsystem_message(name, "received", topic_str, data)
 
-        # Match against registered subsystem callbacks
-        for pattern, callback in self._subsystem_callbacks.items():
-            import fnmatch
-            if fnmatch.fnmatchcase(topic_str, pattern):
-                callback(topic_str, data)
+            # Match against registered subsystem callbacks
+            for pattern, callback in self._subsystem_callbacks.items():
+                import fnmatch
+                if fnmatch.fnmatchcase(topic_str, pattern):
+                    callback(topic_str, data)
+                    return
+
+            # Subsystem responses (e.g. the box scanner's object list after
+            # a scan). Only the declared report types are acted on (R5);
+            # every other response is logged.
+            if kind == "response" and isinstance(data, dict):
+                if data.get("type") in self._report_types:
+                    logger.info(
+                        "Report '%s' from subsystem: %s",
+                        data.get("type"), data.get("objects"),
+                    )
+                    self._pipeline.on_objects_detected(data.get("objects") or [])
                 return
 
-        # Subsystem responses (e.g. vision object detection after a box scan)
-        if topic_str.endswith("/response") and isinstance(data, dict):
-            if data.get("type") == "objects_detected":
-                logger.info(
-                    "Objects detected by subsystem: %s", data.get("objects")
-                )
-                self._pipeline.on_objects_detected(data.get("objects") or [])
-            return
-
-        # Default: check for subsystem status updates
-        if "automata/subsystem/" in topic_str and "status" in topic_str:
-            parts = topic_str.split("/")
-            if len(parts) >= 3:
-                subsystem_name = parts[2]
-                if subsystem_name in self.adapters:
-                    self._update_subsystem_status(subsystem_name, data)
+            # Status reports (state sync + pipeline).
+            if kind == "status":
+                self._update_subsystem_status(name, data)
 
     def register_subsystem_callback(
         self,
@@ -1104,10 +1286,12 @@ class WorkflowOrchestrator:
             BackendEvent.SUBSYSTEM_STATUS_UPDATED.value,
             {
                 "subsystem": subsystem_name,
-                # Raw reported state (e.g. 'picking', 'rotating', ...) –
-                # the frontend has a CSS class for every subsystem state.
+                # Raw reported state (e.g. 'picking', 'rotating', ...).
                 "state": state_str or state.value,
                 "state_description": adapter._get_state_description(),
+                # Visual tone from the configured vocabulary (F3): the UI
+                # renders it as-is instead of enumerating state names.
+                "tone": adapter.tone(state_str or state.value),
                 "details": data,
             },
         )
@@ -1116,20 +1300,32 @@ class WorkflowOrchestrator:
         # next commands of the object flow).
         self._pipeline.on_subsystem_status(subsystem_name, state_str, was_state)
 
-        # Check if all required subsystems are ready (for starting → running)
-        if self.state_machine.state == WorkflowState.STARTING:
-            required_adapters = self.adapter_factory.get_required()
-            all_ready = all(
-                a.state == SubsystemState.READY for a in required_adapters
-            )
-            if all_ready:
-                logger.info("All required subsystems ready!")
-                self.state_machine.fire("subsystem_ready", self._status)
-                self._update_state(WorkflowState.RUNNING)
-                self._fire_frontend_event(
-                    BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                    {"new_state": "running", "source": "subsystems_ready"},
-                )
+        # A *required* subsystem reporting the error state drives the
+        # workflow SM over its configured error event (the workflow.yaml
+        # transition already models the move to the error state).
+        self._on_required_subsystem_error(subsystem_name, state_str)
+
+        # Readiness gate (starting → running), single implementation.
+        self._check_readiness("subsystems_ready")
+
+    def _on_required_subsystem_error(self, name: str, state_str: str) -> None:
+        """A *required* subsystem reported the error state: fire the
+        configured error event on the workflow SM, if the current state
+        models it (it does from starting/running)."""
+        adapter = self.adapters.get(name)
+        if adapter is None or not adapter.required:
+            return
+        if state_str != "error":
+            return
+        event = self.workflow_names.error_event
+        if not event or event not in self.state_machine.get_available_transitions():
+            return
+        self._status.error = f"Subsystem '{name}' reported an error"
+        self._fire_frontend_event(
+            BackendEvent.ERROR_REPORTED.value,
+            {"message": f"Subsystem '{name}' reported an error"},
+        )
+        self.fire_event(event)
 
     @staticmethod
     def _map_reported_state(state_str: str) -> SubsystemState:
@@ -1209,7 +1405,7 @@ class WorkflowOrchestrator:
         if adapter is None or adapter.state_machine is None:
             return None
         expected = adapter.expected_state
-        if expected is not None and expected not in NON_WORK_STATES:
+        if expected is not None and expected not in adapter.non_work_states:
             return expected
         return adapter.state_machine.current_state
 
@@ -1258,14 +1454,14 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     # State Management
     # ------------------------------------------------------------------
-    def _update_state(self, new_state: WorkflowState) -> None:
+    def _update_state(self, new_state: str) -> None:
         self._status.state = new_state
         self._fire_frontend_event(
             BackendEvent.WORKFLOW_STATE_CHANGED.value,
-            {"new_state": new_state.value},
+            {"new_state": new_state},
         )
         # Notify the pipeline controller (it starts/stops dispatching)
-        self._pipeline.on_workflow_state(new_state.value)
+        self._pipeline.on_workflow_state(new_state)
         # Broadcast full status including objects for the frontend
         self.frontend.broadcast_with_display_config(self._status)
 
@@ -1333,6 +1529,7 @@ class WorkflowOrchestrator:
             ]
         return self._status
 
+
     def _broadcast_objects(self) -> None:
         """Broadcast the current list of objects to the frontend."""
         with self._lock:
@@ -1340,10 +1537,11 @@ class WorkflowOrchestrator:
             # Keep _status in sync so broadcast_with_display_config sends
             # the correct objects list (not an empty array that would
             # overwrite the frontend's objects with []).
+            initial_state, _ = self._object_initial
             self._status.objects = [
                 ObjectInfo(
                     object_id=obj["object_id"],
-                    state=obj.get("state", "identified_in_box"),
+                    state=obj.get("state") or initial_state,
                     state_description=obj.get("state_description", ""),
                     created=obj.get("created", ""),
                     last_state_change=obj.get("last_state_change", ""),
@@ -1366,7 +1564,7 @@ class WorkflowOrchestrator:
         """Fire an internal event through the workflow state machine."""
         try:
             new_state = self.state_machine.fire(event, self._status)
-            self._update_state(WorkflowState(new_state))
+            self._update_state(new_state)
             return True
         except StateMachineError as exc:
             logger.error("Event '%s' rejected: %s", event, exc)
@@ -1403,13 +1601,18 @@ class WorkflowOrchestrator:
         adapter = self.adapters.get(subsystem_name)
         if not adapter:
             return
-        new_state = adapter.state_machine.current_state if adapter.state_machine else "ready"
+        new_state = (
+            adapter.state_machine.current_state
+            if adapter.state_machine
+            else adapter.initial_state
+        )
         self._fire_frontend_event(
             BackendEvent.SUBSYSTEM_STATE_CHANGED.value,
             {
                 "subsystem": subsystem_name,
                 "new_state": new_state,
                 "state_description": adapter._get_state_description(),
+                "tone": adapter.tone(new_state),
                 "source": "simulation_init",
             },
         )
@@ -1418,21 +1621,11 @@ class WorkflowOrchestrator:
         logger.info("Subsystem '%s' notified as ready for frontend", subsystem_name)
 
     def update_all_subsystems_ready(self) -> None:
-        """Mark all required subsystems as ready."""
+        """Mark all required subsystems as ready (and pass the readiness
+        gate if the workflow is waiting for it)."""
         for adapter in self.adapter_factory.get_required():
             adapter.update_state(SubsystemState.READY)
-        if self.state_machine.state == WorkflowState.STARTING:
-            required_adapters = self.adapter_factory.get_required()
-            all_ready = all(
-                a.state == SubsystemState.READY for a in required_adapters
-            )
-            if all_ready:
-                self.state_machine.fire("subsystem_ready", self._status)
-                self._update_state(WorkflowState.RUNNING)
-                self._fire_frontend_event(
-                    BackendEvent.WORKFLOW_STATE_CHANGED.value,
-                    {"new_state": "running", "source": "all_ready"},
-                )
+        self._check_readiness("all_ready")
 
     # ------------------------------------------------------------------
     # Configuration Loading
@@ -1486,8 +1679,13 @@ class WorkflowOrchestrator:
                 name=item["name"],
                 display_name=item.get("display_name", item["name"]),
                 type=item.get("type", "generic"),
-                mqtt_topic=item.get("mqtt_topic", "automata/subsystem/{name}"),
-                initial_state=item.get("initial_state", "ready"),
+                mqtt_topic=item.get(
+                    "mqtt_topic",
+                    self._global_config.mqtt_topic_prefix + "/{name}",
+                ),
+                initial_state=item.get(
+                    "initial_state", self._global_config.states_ready
+                ),
                 required=item.get("required", True),
                 metadata=item.get("metadata", {}),
                 state_machine_path=str(config_dir / f"{item['name']}.yaml"),
@@ -1513,8 +1711,13 @@ class WorkflowOrchestrator:
                 name=data["name"],
                 display_name=data.get("display_name", data["name"]),
                 type=data.get("type", "generic"),
-                mqtt_topic=data.get("mqtt_topic", "automata/subsystem/{name}"),
-                initial_state=data.get("initial_state", "ready"),
+                mqtt_topic=data.get(
+                    "mqtt_topic",
+                    self._global_config.mqtt_topic_prefix + "/{name}",
+                ),
+                initial_state=data.get(
+                    "initial_state", self._global_config.states_ready
+                ),
                 required=data.get("required", True),
                 metadata=data.get("metadata", {}),
                 state_machine_path=str(yaml_file),
@@ -1542,11 +1745,16 @@ class WorkflowOrchestrator:
             logger.info("  - %s (%s) [required=%s]", cfg.name, cfg.type, cfg.required)
 
         self.mqtt.connect()
+        # Subscribe to every subsystem's *configured* topics (R4): the
+        # per-YAML mqtt_topic is the single routing truth. The global
+        # prefix wildcards stay as a convenience for traffic on the default
+        # tree (the receive path routes only on the configured topics).
         for cfg in self.subsystems_config:
             self.mqtt.subscribe(cfg.status_topic, qos=1)
             self.mqtt.subscribe(cfg.response_topic, qos=1)
-        self.mqtt.subscribe(f"{TOPIC_SUBSYSTEM}/*/status", qos=1)
-        self.mqtt.subscribe(f"{TOPIC_SUBSYSTEM}/*/response", qos=1)
+        prefix = self._global_config.mqtt_topic_prefix
+        self.mqtt.subscribe(f"{prefix}/*/status", qos=1)
+        self.mqtt.subscribe(f"{prefix}/*/response", qos=1)
         self.frontend.start()
 
         self.frontend.set_subsystem_config(
@@ -1571,7 +1779,9 @@ class WorkflowOrchestrator:
         # live subsystem snapshots) instead of the cached last broadcast.
         self.frontend.set_status_callback(lambda: self._status)
         # State machine graph definitions for the frontend inspector modal
-        # (subsystem SMs + object blueprint) — the same YAML the engines run.
+        # (subsystem SMs + object blueprint + workflow SM) — the same YAML
+        # the engines run. The workflow definition carries the operator-
+        # event map so the GUI derives its button matrix from it (F1).
         self.frontend.set_state_machine_definitions(
             {
                 name: adapter.state_machine.config.to_dict()
@@ -1579,13 +1789,19 @@ class WorkflowOrchestrator:
                 if adapter.state_machine is not None
             },
             self.object_manager.config.to_dict(),
+            self.state_machine.config.to_dict(),
         )
-        # Send object workflow display config (state order, colors and
-        # per-workflow-state messages) to the frontend
+        # Send object workflow display config (state order, colors,
+        # per-workflow-state messages, the object journey's final states
+        # for the "done" styling (F4), and the shared vocabulary the UI
+        # must not re-hardcode (ready state, alias pattern — F5/F7))
         self.frontend.set_workflow_display_config(
             self._global_config.object_state_order,
             self._global_config.object_state_colors,
             self._global_config.workflow_state_messages,
+            final_states=self.object_manager.config.final_states,
+            ready_state=self._global_config.states_ready,
+            alias_pattern=self._global_config.alias_pattern,
         )
 
         # Full status broadcast (includes the SM definitions) so clients

@@ -40,6 +40,9 @@ export interface ModalData {
    *  When set (subsystem modals only), the modal shows the manual MQTT
    *  injection panel (user-driven simulation). */
   debugTopics?: DebugTopicDescriptor[];
+  /** Ready state from the configured vocabulary (global.yaml, F5): the
+   *  debug panel's state quick-pick mirrors it into the ready field. */
+  readyState?: string;
 }
 
 function formatTime(ts: string): string {
@@ -92,6 +95,8 @@ export class StateMachineModal {
   private debugTopics: DebugTopicDescriptor[] = [];
   /** States of the currently open subsystem (state quick-pick for /status). */
   private debugStates: string[] = [];
+  /** Ready state (configured vocabulary, F5) for the ready-field mirror. */
+  private readyState = 'ready';
 
   constructor(parent: ParentNode = document.body) {
     this.overlay = document.createElement('div');
@@ -279,6 +284,7 @@ export class StateMachineModal {
   private _setupDebugPanel(d: ModalData): void {
     if (d.kind === 'subsystem' && d.debugTopics && d.debugTopics.length > 0) {
       this.debugTopics = d.debugTopics;
+      this.readyState = d.readyState || 'ready';
       this.debugStates = d.def ? Object.keys(d.def.states) : [];
 
       this.debugTopicSel.innerHTML = '';
@@ -302,9 +308,10 @@ export class StateMachineModal {
       const topic = this._currentDebugTopic();
       this.debugPayloadEl.value = JSON.stringify(topic.default_payload, null, 2);
       // Keep the state quick-pick in sync with the default payload.
+      const stateField = topic.state_field || 'state';
       const defPayload = topic.default_payload as Record<string, unknown>;
-      if (typeof defPayload.state === 'string' && this.debugStates.includes(defPayload.state)) {
-        this.debugStateSel.value = defPayload.state;
+      if (typeof defPayload[stateField] === 'string' && this.debugStates.includes(defPayload[stateField] as string)) {
+        this.debugStateSel.value = defPayload[stateField] as string;
       }
       this.debugStatusEl.textContent = '';
       this.debugStatusEl.className = 'sm-debug-status';
@@ -320,26 +327,35 @@ export class StateMachineModal {
   }
 
   private _updateDebugStateVisibility(): void {
-    // The state quick-pick only makes sense for the /status topic (its
-    // payload carries the reported state) and a known state machine.
-    const isStatus = this.debugTopicSel.value.endsWith('/status');
+    // The state quick-pick only makes sense for the status-kind topic (its
+    // payload carries the reported state, descriptor kind/state_field, F5)
+    // and a known state machine.
+    const isStatus = this._currentDebugTopic().kind === 'status';
     this.debugStateFieldEl.hidden = !isStatus || this.debugStates.length === 0;
   }
 
   private _onDebugTopicChange(): void {
     this._updateDebugStateVisibility();
     this.debugPayloadEl.value = JSON.stringify(this._currentDebugTopic().default_payload, null, 2);
-    const defPayload = this._currentDebugTopic().default_payload as Record<string, unknown>;
-    if (typeof defPayload.state === 'string' && this.debugStates.includes(defPayload.state)) {
-      this.debugStateSel.value = defPayload.state;
+    const topic = this._currentDebugTopic();
+    const stateField = topic.state_field || 'state';
+    const defPayload = topic.default_payload as Record<string, unknown>;
+    if (typeof defPayload[stateField] === 'string' && this.debugStates.includes(defPayload[stateField] as string)) {
+      this.debugStateSel.value = defPayload[stateField] as string;
     }
     this.debugStatusEl.textContent = '';
   }
 
   private _onDebugStateChange(): void {
-    const payload = this._readDebugPayload(this._currentDebugTopic().default_payload);
-    payload.state = this.debugStateSel.value;
-    payload.ready = this.debugStateSel.value === 'ready';
+    // The state field and the ready field come from the topic descriptor
+    // (kind='status', F5); the ready value mirrors the configured ready
+    // state (global.yaml states.ready), not a hardcoded name.
+    const topic = this._currentDebugTopic();
+    const stateField = topic.state_field || 'state';
+    const readyField = topic.ready_field || 'ready';
+    const payload = this._readDebugPayload(topic.default_payload);
+    payload[stateField] = this.debugStateSel.value;
+    payload[readyField] = this.debugStateSel.value === this.readyState;
     this.debugPayloadEl.value = JSON.stringify(payload, null, 2);
   }
 

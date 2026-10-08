@@ -12,6 +12,17 @@ metadata:
   init_duration: 1.5
   work_durations:
     capturing: 3.0
+  # Reporting role (docs/CONFIG_CHANGE_GUIDE.md, R5): when the transition
+  # `after.from -> after.to` happens, the subsystem publishes a response
+  # of `type` on its /response topic. The object IDs are rendered from the
+  # global `simulation.object_id_format`; `count_source: num_objects` means
+  # the box-scan object count (the process manager passes --num-objects to
+  # any sim whose YAML declares such a report).
+  reports:
+    - type: objects_detected
+      after: { from: capturing, to: ready }
+      object_ids:
+        count_source: num_objects
 
 states:
   initializing:

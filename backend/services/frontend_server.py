@@ -16,7 +16,6 @@ from backend.domain.models import (
     EventPayload,
     SubsystemState,
     WorkflowCommand,
-    WorkflowState,
     WorkflowStatus,
 )
 
@@ -246,21 +245,26 @@ class FrontendServer:
         self,
         subsystem_defs: Dict[str, Dict[str, Any]],
         object_def: Optional[Dict[str, Any]] = None,
+        workflow_def: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Set state machine graph definitions to broadcast with status.
 
         The definitions come from the same YAML files that drive the
-        engines (subsystem adapters + object blueprint), so the frontend
-        always renders the actual machine, not a hardcoded copy.
+        engines (subsystem adapters + object blueprint + workflow), so the
+        frontend always renders the actual machine, not a hardcoded copy.
+        The workflow definition carries the operator-event metadata: the
+        GUI derives its operator-button matrix from it (F1).
         """
         self._state_machine_defs = {
             "subsystem_state_machines": subsystem_defs,
             "object_state_machine": object_def,
+            "workflow_state_machine": workflow_def,
         }
         logger.info(
-            "State machine definitions set: %d subsystems, object=%s",
+            "State machine definitions set: %d subsystems, object=%s, workflow=%s",
             len(subsystem_defs),
             "yes" if object_def else "no",
+            "yes" if workflow_def else "no",
         )
 
     def set_workflow_display_config(
@@ -268,17 +272,24 @@ class FrontendServer:
         state_order: List[str],
         state_colors: Dict[str, str],
         state_messages: Optional[Dict[str, str]] = None,
+        final_states: Optional[List[str]] = None,
+        ready_state: str = "ready",
+        alias_pattern: str = r"^[A-Za-z0-9_\-\. ]{1,64}$",
     ) -> None:
-        """Set object workflow display config (state order, colors and
-        per-workflow-state display messages) to broadcast with status updates.
-
-        The messages come from the `workflow_states` section of global.yaml
-        so the UI text stays config-driven.
+        """Set object workflow display config to broadcast with status
+        updates: state order, colors, per-workflow-state display messages
+        (global.yaml `workflow_states`), the object journey's final states
+        (object.yaml — the GUI's "done" styling, F4), and the shared
+        vocabulary the UI must not re-hardcode (ready state for status
+        payloads, alias pattern for the input constraint — F5/F7).
         """
         self._workflow_display_config = {
             "state_order": state_order,
             "state_colors": state_colors,
             "state_messages": state_messages or {},
+            "final_states": final_states or [],
+            "ready_state": ready_state,
+            "alias_pattern": alias_pattern,
         }
         logger.info(
             "Workflow display config set: %d states, %d messages",

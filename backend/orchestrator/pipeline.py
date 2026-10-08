@@ -1,11 +1,11 @@
 """Pipeline controller – orchestrates the object flow through the machine.
 
 This is the orchestration logic of the AUTOMATA workflow
-(docs/PROJECT_CONTEXT.md). It dispatches objects from the box to the two
-disk positions and back, and it is driven exclusively by:
+(docs/PROJECT_CONTEXT.md). It dispatches objects from the box to the disk
+positions and back, and it is driven exclusively by:
 
 * workflow state changes (start / pause / stop),
-* the vision system's object-detection response (objects discovered in the
+* the box scanner's object-detection response (objects discovered in the
   box, with IDs and analysis order),
 * subsystem state reports arriving over MQTT.
 
@@ -16,23 +16,21 @@ hardware: it only issues commands through the subsystem state machines
 specific logic is embedded here – subsystem behaviour lives in the
 subsystem YAML files and in the subsystems themselves.
 
-Physical capacity constraints enforced here (the machine can only hold so
-many objects outside the box at the same time):
+What it knows about the *flow* comes from the object blueprint
+(backend/config/object.yaml, docs/CONFIG_CHANGE_GUIDE.md R2):
 
-* at most 2 objects on the platform – one per disk position,
-* at most 1 object in the robot's hand – robot 1 has one end effector,
-* a platform rotation moves BOTH disks at once, so it is only commanded
-  when every occupied disk holds an object that finished its stage.
+* per-state ``meta`` – where the object physically is (``position``: box /
+  hand / disk name), which subsystem works on it (``actor`` or
+  ``parallel_actors``), and rotation requests/commands;
+* top-level ``metadata`` – the machine layout (``disks``, ``disk_names``,
+  ``hand_slots``) and the ``task_chains`` (the multi-step work of one
+  subsystem per object, e.g. the pick -> place chain).
 
-Stage mapping (docs/PROJECT_CONTEXT.md workflow):
-
-* first disk position:  robot 1 – pick / place / XRF+Raman / return to box
-* second disk position: robot 2 – 3DI scan, then HSI scan (two imaging
-  subsystems, imaging_3di and imaging_hsi; 3DI always comes first)
-* the AI plans the XRF/Raman points between imaging and measurement:
-  it starts in parallel with the rotation back to the first position, and
-  the object waits in the ai_processing state until the AI reports done
-  (only then do the XRF/Raman measurements start)
+What is coded here is only the *physical rules* (parameterised by the
+layout above): a rotation moves every disk at once, so it is only issued
+when every occupied disk holds an object that requested it; and the
+dispatching robot must be free before a rotation that brings an object
+back to the disk where the robot will act on it.
 
 Threading: methods may be called from the MQTT callback thread, the
 WebSocket command thread, or re-entrantly from object-transition events.
@@ -45,60 +43,157 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Subsystem names
-VISION = "vision"
-ROBOT_FIRST = "robot_first"
-ROBOT_SECOND = "robot_second"
-ROTATING_PLATFORM = "rotating_platform"
-IMAGING_3DI = "imaging_3di"
-IMAGING_HSI = "imaging_hsi"
-AI_ANALYSIS = "ai_analysis"
-# Subsystems that work in parallel during the measurement stage on the
-# FIRST disk position (robot 1 + XRF/Raman analyzers). The AI is NOT in the
-# set: it must finish planning the points BEFORE the stage starts (the
-# object waits in ai_processing until the AI reports done).
-MEASUREMENT_SUBSYSTEMS: Tuple[str, ...] = ("xrf", "raman", "robot_first")
-
-# Object states used for pipeline coordination (see object.yaml)
-OBJ_WAITING = "waiting_for_disk"            # in the box, queued
-OBJ_GOING_SECOND = "object_going_second_position"   # on the first disk, waiting for rotation to imaging
-OBJ_3DI = "3DI_analysis"                    # on the second disk, 3DI capture (first imaging stage)
-OBJ_HSI = "HSI_analysis"                    # on the second disk, HSI capture (second imaging stage)
-OBJ_GOING_FIRST = "object_going_first_position"     # on the second disk, waiting for rotation back to measurement
-OBJ_AI_PROCESSING = "ai_processing"         # on the first disk, AI planning the XRF/Raman points
-OBJ_XRF_RAMAN = "XRF_RAMAN_analysis"        # on the first disk, being measured
-OBJ_MOVING_TO_BOX = "moving_to_box"         # on the first disk, waiting for return
-
-# Non-working subsystem states (a report into any other state is a work stage)
-NON_WORK_STATES = {"initializing", "ready", "stopped", "error"}
-
 
 class PipelineController:
-    """Dispatches objects through the two-disk pipeline.
+    """Dispatches objects through the disk pipeline.
 
-    Event-driven: reacts to subsystem status reports (MQTT), to the vision
-    object-detection response, and to workflow state changes.
+    Event-driven: reacts to subsystem status reports (MQTT), to the box
+    scanner's object-detection response, and to workflow state changes.
     """
 
     def __init__(self, orchestrator: object) -> None:
         self._orch = orchestrator
         self._lock = threading.RLock()
 
+        cfg = orchestrator.object_manager.config
+        meta = cfg.metadata
+
+        # ── Machine layout (object.yaml metadata) ────────────────────
+        self._disk_count = int(meta.get("disks", 2))
+        self._disk_names: List[str] = list(
+            meta.get("disk_names")
+            or [f"disk_{i}" for i in range(1, self._disk_count + 1)]
+        )
+        self._hand_slots = int(meta.get("hand_slots", 1))
+
+        # ── Per-state physical facts (object.yaml states.*.meta) ─────
+        self._state_meta: Dict[str, Dict[str, Any]] = {
+            s: (c.meta or {}) for s, c in cfg.states.items()
+        }
+        # The object journey is linear: every state has at most one
+        # outgoing transition – its event is how the object leaves the
+        # state (fired when the state's actor reports completion).
+        self._leave_event: Dict[str, str] = {}
+        self._leave_target: Dict[str, str] = {}
+        for s, c in cfg.states.items():
+            if c.transitions:
+                self._leave_event[s] = c.transitions[0].event
+                self._leave_target[s] = c.transitions[0].target
+
+        # ── Task chains (multi-step work of one subsystem per object) ─
+        self._task_chains: Dict[str, List[Dict[str, Any]]] = (
+            meta.get("task_chains") or {}
+        )
+        self._chain_by_object_event: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        self._chain_by_op: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for subsystem, entries in self._task_chains.items():
+            for entry in entries:
+                if entry.get("object_event"):
+                    self._chain_by_object_event[entry["object_event"]] = (
+                        subsystem,
+                        entry,
+                    )
+                if entry.get("op"):
+                    self._chain_by_op[(subsystem, entry["op"])] = entry
+        self._chain_subsystem: Optional[str] = next(iter(self._task_chains), None)
+
+        # Dispatch: the box state whose outgoing transition starts a chain
+        # op (and commands the robot through the transition actions), the
+        # event that leaves it, and the disk the object lands on once the
+        # op's done_event fires.
+        self._dispatch_state: Optional[str] = None
+        self._dispatch_event: Optional[str] = None
+        for s in self._states_with_position("box"):
+            ev = self._leave_event.get(s)
+            if ev in self._chain_by_object_event:
+                self._dispatch_state = s
+                self._dispatch_event = ev
+                break
+        self._entry_disk: Optional[int] = None
+        if self._dispatch_state is not None:
+            _sub, entry = self._chain_by_object_event[self._dispatch_event]
+            for s, ev in self._leave_event.items():
+                if ev == entry.get("done_event"):
+                    pos = self._state_meta.get(
+                        self._leave_target.get(s, ""), {}
+                    ).get("position")
+                    if pos in self._disk_names:
+                        self._entry_disk = self._disk_names.index(pos)
+                    break
+
+        # ── Rotation: the platform is the subsystem that can issue the
+        # rotate_command events declared in the state metas ───────────
+        rotate_commands = {
+            m.get("rotate_command")
+            for m in self._state_meta.values()
+            if m.get("rotate_command")
+        }
+        self._platform: Optional[str] = None
+        if rotate_commands:
+            for name, adapter in orchestrator.adapters.items():
+                sm = adapter.state_machine
+                if sm is None:
+                    continue
+                events = {
+                    t.event
+                    for c in sm.config.states.values()
+                    for t in c.transitions
+                }
+                if rotate_commands.issubset(events):
+                    self._platform = name
+                    break
+
+        # Rotation requests are the meta.rotate_request values; the
+        # workflow/ scope events with any other name stay logged no-ops.
+        self._rotate_requests: Set[str] = {
+            m.get("rotate_request")
+            for m in self._state_meta.values()
+            if m.get("rotate_request")
+        }
+
+        # ── Box scan: the subsystem that reports the object list (R5) ─
+        ready = orchestrator._global_config.states_ready
+        self._reporter: Optional[str] = None
+        self._scan_command: Optional[str] = None
+        for name, adapter in orchestrator.adapters.items():
+            for rep in adapter.metadata.get("reports") or []:
+                if (rep.get("object_ids") or {}).get("count_source") != "num_objects":
+                    continue
+                after = rep.get("after") or {}
+                sm = adapter.state_machine
+                if sm is None or not after.get("from"):
+                    continue
+                event = sm.config.event_to(ready, after["from"])
+                if event:
+                    self._reporter = name
+                    self._scan_command = event
+                    break
+            if self._reporter is not None:
+                break
+
+        # ── Single-actor states per subsystem (for completion lookup) ─
+        self._actor_states: Dict[str, List[str]] = {}
+        for s, m in self._state_meta.items():
+            actor = m.get("actor")
+            if actor and not m.get("actor_op"):
+                self._actor_states.setdefault(actor, []).append(s)
+
+        # The object event that leaves the initial state (queuing).
+        self._queue_event = self._leave_event.get(cfg.initial_state)
+
+        # ── Phases / bookkeeping ──────────────────────────────────────
         # Phases: idle (no active run) -> scanning (box scan in progress)
         #        -> pipeline (objects flowing) -> suspended (run over/stopped)
         self._phase = "idle"
         self._order: List[str] = []
         self._queue_pos = 0
-        self._disk_first: Optional[str] = None     # object on the imaging position
-        self._disk_second: Optional[str] = None    # object on the measurement position
-        self._robot_task: Optional[Tuple[str, str]] = None  # (op, object_id)
-        self._imaging_object: Optional[str] = None
-        # Object waiting in ai_processing for the AI's point planning
-        self._ai_object: Optional[str] = None
+        self._disks: List[Optional[str]] = [None] * self._disk_count
+        # (object_id, completion action) of the dispatching robot's task
+        self._robot_task: Optional[Tuple[str, Dict[str, Any]]] = None
         self._measuring_object: Optional[str] = None
         self._measuring_pending: Set[str] = set()
         self._rotation_requested = False
@@ -119,6 +214,9 @@ class PipelineController:
         # command is in flight, else the last reported state.
         return self._orch.subsystem_effective_state(name)
 
+    def _ready_state(self) -> str:
+        return self._orch._global_config.states_ready
+
     def _fire_object(self, object_id: str, event: str) -> bool:
         new_state = self._orch.fire_object_transition(object_id, event)
         if new_state is None:
@@ -126,27 +224,70 @@ class PipelineController:
             return False
         return True
 
+    def _fire_object_event(self, object_id: str, event: str) -> bool:
+        """Fire an object transition and settle the state it enters
+        (measurement tracking, task chains, stage skipping)."""
+        if not self._fire_object(object_id, event):
+            return False
+        self._settle(object_id)
+        return True
+
     def _command(self, name: str, event: str) -> None:
         """Issue a command through the subsystem SM (boundary layer)."""
         self._orch.fire_subsystem_transition(name, event)
+
+    def _states_with_position(self, position: str) -> List[str]:
+        return [s for s, m in self._state_meta.items() if m.get("position") == position]
+
+    def _release_disk(self, idx: int, object_id: str) -> None:
+        if idx < len(self._disks) and self._disks[idx] == object_id:
+            self._disks[idx] = None
+
+    def _chain_completion(self, subsystem: str, op: str) -> Dict[str, Any]:
+        """The action to take when the subsystem's `op` work completes:
+        issue `next_command` first (if any), then fire `done_event` on the
+        object (releasing its disk slot, if any)."""
+        entry = self._chain_by_op.get((subsystem, op)) or {}
+        done: Dict[str, Any] = {"kind": "event", "event": entry.get("done_event")}
+        if entry.get("releases"):
+            done["releases"] = entry["releases"]
+        if entry.get("next_command"):
+            return {
+                "kind": "command",
+                "event": entry["next_command"],
+                "next": done,
+            }
+        return done
+
+    def _object_in_state(self, state: str) -> Optional[str]:
+        seen: Set[str] = set()
+        candidates = list(self._order) + [d for d in self._disks if d]
+        for oid in candidates:
+            if oid in seen:
+                continue
+            seen.add(oid)
+            if self._obj_state(oid) == state:
+                return oid
+        return None
 
     # ------------------------------------------------------------------
     # Public API (called by the orchestrator)
     # ------------------------------------------------------------------
     def on_workflow_state(self, state: str) -> None:
         with self._lock:
-            if state == "running":
+            wf = self._orch.workflow_names
+            if state == wf.run_state:
                 if self._phase == "idle":
                     self._phase = "scanning"
                     logger.info("Pipeline: workflow running – requesting box scan")
                     self._advance()
-            elif state in ("stopping", "stopped", "error", "idle"):
+            elif state in wf.suspend_states:
                 if self._phase in ("scanning", "pipeline"):
                     self._phase = "suspended"
                     logger.info("Pipeline: workflow '%s' – dispatch suspended", state)
 
     def on_objects_detected(self, object_ids: List[str]) -> None:
-        """Vision reported the objects in the box (IDs + analysis order)."""
+        """The box scanner reported the objects in the box (IDs + order)."""
         with self._lock:
             if self._phase != "scanning":
                 logger.warning(
@@ -154,20 +295,21 @@ class PipelineController:
                 )
                 return
             if not object_ids:
-                logger.warning("Pipeline: vision reported no objects – ending run")
+                logger.warning("Pipeline: box scan reported no objects – ending run")
                 self._phase = "suspended"
                 self._finish_workflow()
                 return
             logger.info(
-                "Pipeline: vision identified %d objects: %s",
+                "Pipeline: box scan identified %d objects: %s",
                 len(object_ids), ", ".join(object_ids),
             )
             self._orch.set_total_objects(len(object_ids))
             for object_id in object_ids:
                 self._orch.create_object(object_id)
                 # Analysis order established: the object queues up in the box
-                # (identified_in_box -> waiting_for_disk).
-                self._fire_object(object_id, "queued_for_analysis")
+                # (initial state -> first waiting state).
+                if self._queue_event:
+                    self._fire_object_event(object_id, self._queue_event)
             self._order = list(object_ids)
             self._queue_pos = 0
             self._phase = "pipeline"
@@ -180,7 +322,7 @@ class PipelineController:
         path) – only set flags here, never fire transitions.
         """
         with self._lock:
-            if event in ("rotation_requested_second", "rotation_requested_first"):
+            if event in self._rotate_requests:
                 self._rotation_requested = True
                 logger.debug("Pipeline: rotation requested (by %s)", object_id)
             else:
@@ -194,10 +336,11 @@ class PipelineController:
         with self._lock:
             if self._phase not in ("scanning", "pipeline"):
                 return
+            non_work = self._orch._global_config.non_work_states
             completed = (
-                state == "ready"
+                state == self._ready_state()
                 and was_state is not None
-                and was_state not in NON_WORK_STATES
+                and was_state not in non_work
             )
             if completed:
                 self._on_subsystem_completed(name, was_state)
@@ -209,11 +352,8 @@ class PipelineController:
             self._phase = "idle"
             self._order = []
             self._queue_pos = 0
-            self._disk_first = None
-            self._disk_second = None
+            self._disks = [None] * self._disk_count
             self._robot_task = None
-            self._imaging_object = None
-            self._ai_object = None
             self._measuring_object = None
             self._measuring_pending = set()
             self._rotation_requested = False
@@ -223,174 +363,227 @@ class PipelineController:
     # Reactions to subsystem completions
     # ------------------------------------------------------------------
     def _on_subsystem_completed(self, name: str, was_state: str) -> None:
-        if name == ROBOT_FIRST and self._robot_task:
-            op, object_id = self._robot_task
-            if op == "pick" and was_state == "picking":
-                # The object is in the robot's hand: place it on the disk.
-                self._command(ROBOT_FIRST, "place")
-                self._robot_task = ("place", object_id)
-            elif op == "place" and was_state == "placing":
-                # The object is on the first disk: it waits there for the
-                # rotation to the second (imaging) position.
+        # 1. Task chain (multi-step work, e.g. pick -> place): the reported
+        #    work state completes the current op – issue the follow-up
+        #    command, or fire the done_event (and release the disk).
+        if name in self._task_chains and self._robot_task is not None:
+            object_id, action = self._robot_task
+            if action.get("kind") == "command":
+                self._command(name, action["event"])
+                self._robot_task = (object_id, action["next"])
+            else:
                 self._robot_task = None
-                self._fire_object(object_id, "object_placed_on_disk")
-            elif op == "return" and was_state == "returning":
-                # The object is back in the box.
-                self._robot_task = None
-                if self._disk_first == object_id:
-                    self._disk_first = None
-                self._fire_object(object_id, "object_returned_to_box")
-            # (robot 1's XRF/Raman completion has no pick/place/return task
-            #  in flight and is counted as a measurement completion below)
+                releases = action.get("releases")
+                if releases in self._disk_names:
+                    self._release_disk(self._disk_names.index(releases), object_id)
+                self._fire_object_event(object_id, action["event"])
             return
 
-        if name == IMAGING_3DI and was_state == "capturing" and self._imaging_object:
-            # 3DI capture done: the object moves to the HSI stage (same
-            #    position, same robot); the object transition commands the
-            #    HSI capture and robot 2's HSI scan. _imaging_object stays
-            #    set: the object is still on the imaging position.
-            if self._obj_state(self._imaging_object) == OBJ_3DI:
-                self._fire_object(self._imaging_object, "3di_capture_complete")
-            return
-
-        if name == IMAGING_HSI and was_state == "capturing" and self._imaging_object:
-            object_id = self._imaging_object
-            self._imaging_object = None
-            if self._obj_state(object_id) == OBJ_HSI:
-                # -> object_going_first_position; the object transition
-                #    starts the AI (point planning) and requests the
-                #    rotation back. Robot 2's scan completion is not
-                #    tracked: the imaging interfaces own the data the AI
-                #    needs.
-                self._fire_object(object_id, "hsi_capture_complete")
-            return
-
-        if name == AI_ANALYSIS and was_state == "analyzing" and self._ai_object:
-            # The AI finished extracting the interest points for the object
-            # waiting in ai_processing: the XRF/Raman stage starts now
-            # (the object transition commands robot 1 + the analyzers).
-            object_id = self._ai_object
-            self._ai_object = None
-            logger.info(
-                "Pipeline: AI planning done for %s – starting measurements",
-                object_id,
-            )
-            if self._fire_object(object_id, "ai_complete"):
-                self._start_measurement_tracking(object_id)
-            return
-
-        if name in MEASUREMENT_SUBSYSTEMS and self._measuring_object:
-            self._measuring_pending.discard(name)
-            if not self._measuring_pending:
-                self._complete_measurements(self._measuring_object)
-            return
-
-        if name == ROTATING_PLATFORM and was_state == "rotating" and self._rotating:
+        # 2. Rotation finished (the platform reported ready after rotating).
+        if name == self._platform and self._rotating:
             self._finish_rotation()
+            return
 
-    def _complete_measurements(self, object_id: str) -> None:
-        """All measurement subsystems are done: send robot 1 back to the box.
+        # 3. Measurement stage: one of the parallel actors is done; the
+        #    stage ends when every parallel actor that entered its work
+        #    state has reported back.
+        if self._measuring_object is not None:
+            state = self._obj_state(self._measuring_object)
+            meta = self._state_meta.get(state or "", {})
+            parallel = meta.get("parallel_actors") or []
+            if name in parallel:
+                self._measuring_pending.discard(name)
+                if not self._measuring_pending:
+                    self._complete_measurements(self._measuring_object, parallel)
+                return
 
-        The measurements_complete transition moves the object to
-        moving_to_box and commands robot 1 (robot_first/return); the task
-        is tracked here so the robot's completion releases the first disk
-        slot (robot 1 has no task in flight while measuring).
-        """
-        self._measuring_object = None
-        self._robot_task = ("return", object_id)
-        self._fire_object(object_id, "measurements_complete")
+        # 4. Single-actor stage: the actor is done – the object leaves the
+        #    state over its outgoing transition.
+        for state in self._actor_states.get(name, []):
+            object_id = self._object_in_state(state)
+            if object_id is not None and self._obj_state(object_id) == state:
+                event = self._leave_event.get(state)
+                if event:
+                    self._fire_object_event(object_id, event)
+                return
 
-    def _start_measurement_tracking(self, object_id: str) -> None:
-        """Start tracking the parallel measurement subsystems for an object
-        that just entered the XRF/Raman stage (first position).
+    def _start_measurement_tracking(self, object_id: str, actors: List[str]) -> None:
+        """Start tracking the parallel actors for an object that just
+        entered a parallel-actor state (e.g. the measurement stage).
 
         The stage ends when every subsystem that actually entered its
         working state reports ready (guards against a command that did not
         land because a subsystem was not in the expected state).
         """
         self._measuring_object = object_id
+        non_work = self._orch._global_config.non_work_states
         self._measuring_pending = {
-            m for m in MEASUREMENT_SUBSYSTEMS
-            if (s := self._sm_state(m)) not in (None, *NON_WORK_STATES)
+            a for a in actors if self._sm_state(a) not in (None, *non_work)
         }
         if not self._measuring_pending:
             logger.warning(
                 "Pipeline: no measurement subsystem active – "
                 "completing measurements immediately"
             )
-            self._complete_measurements(object_id)
+            self._complete_measurements(object_id, actors)
+
+    def _complete_measurements(self, object_id: str, actors: List[str]) -> None:
+        """All parallel actors are done: leave the state. The outgoing
+        transition commands the next work (e.g. the robot's return); the
+        task-chain bookkeeping picks it up when the object arrives."""
+        self._measuring_object = None
+        self._measuring_pending = set()
+        state = self._obj_state(object_id)
+        event = self._leave_event.get(state or "")
+        if event:
+            self._fire_object_event(object_id, event)
+
+    def _settle(self, object_id: str) -> None:
+        """Settle the state an object just entered.
+
+        - parallel-actor state: start the completion tracking;
+        - task-chain actor state (meta.actor_op): the op's command was
+          fired by the transition that entered the state – track it;
+        - single-actor state: if the actor is not working (its command
+          never landed, or it already finished), complete the stage
+          immediately so the pipeline does not stall – then settle the
+          next state.
+        """
+        state = self._obj_state(object_id)
+        if state is None:
+            return
+        meta = self._state_meta.get(state, {})
+
+        parallel = meta.get("parallel_actors")
+        if parallel:
+            self._start_measurement_tracking(object_id, list(parallel))
+            return
+
+        actor = meta.get("actor")
+        if actor is None:
+            return
+
+        op = meta.get("actor_op")
+        if op and self._chain_by_op.get((actor, op)):
+            self._robot_task = (object_id, self._chain_completion(actor, op))
+            return
+
+        non_work = self._orch._global_config.non_work_states
+        if self._sm_state(actor) in (None, *non_work):
+            event = self._leave_event.get(state)
+            if event:
+                logger.warning(
+                    "Pipeline: %s not working in %s – completing stage immediately",
+                    actor, state,
+                )
+                self._fire_object_event(object_id, event)  # recurses
 
     def _finish_rotation(self) -> None:
-        """Apply the coupled disk swap and start the stages on both sides.
+        """Apply the coupled disk rotation and start the arriving stages.
 
-        After the swap, the object that was on the first disk is on the
-        second (imaging) position, and the object that was on the second
-        disk is back on the first (XRF/Raman measurement) position.
+        After the rotation, every object that was waiting on its disk
+        leaves its waiting state over its outgoing transition (which
+        commands the stages at the new position).
         """
-        first, second = self._disk_first, self._disk_second
+        for object_id in self._disks:
+            if object_id is None:
+                continue
+            state = self._obj_state(object_id)
+            meta = self._state_meta.get(state or "", {})
+            if not meta.get("rotate_request"):
+                continue
+            event = self._leave_event.get(state or "")
+            if event and self._obj_state(object_id) == state:
+                self._fire_object_event(object_id, event)
 
-        if first is not None and self._obj_state(first) == OBJ_GOING_SECOND:
-            # -> 3DI_analysis: the object transition commands the 3DI
-            #    imaging subsystem and robot 2's 3D scan (second position);
-            #    the HSI stage follows in the same position once the 3DI
-            #    capture is done (imaging_3di completion fires
-            #    3di_capture_complete).
-            if self._fire_object(first, "platform_rotated_to_second"):
-                self._imaging_object = first
-                if self._sm_state(IMAGING_3DI) != "capturing":
-                    # 3DI subsystem unavailable: skip the stage so the
-                    # pipeline does not stall (the 3di_capture_complete
-                    # transition then commands the HSI capture).
-                    logger.warning(
-                        "Pipeline: 3DI not capturing – completing stage immediately"
-                    )
-                    if self._fire_object(first, "3di_capture_complete"):
-                        if self._sm_state(IMAGING_HSI) != "capturing":
-                            logger.warning(
-                                "Pipeline: HSI not capturing – completing stage immediately"
-                            )
-                            self._fire_object(first, "hsi_capture_complete")
-                            self._imaging_object = None
-
-        if second is not None and self._obj_state(second) == OBJ_GOING_FIRST:
-            # -> ai_processing: the object waits on the first position for
-            #    the AI to finish planning the XRF/Raman points (the AI was
-            #    started when the imaging completed, in parallel with this
-            #    rotation). When the AI reports done, the object transition
-            #    commands robot 1 + the analyzers.
-            if self._fire_object(second, "platform_rotated_to_first"):
-                self._ai_object = second
-                if self._sm_state(AI_ANALYSIS) in (None, *NON_WORK_STATES):
-                    # AI not working (already finished during the rotation,
-                    # or its plan command never landed): skip the wait so
-                    # the pipeline does not stall.
-                    logger.info(
-                        "Pipeline: AI already done for %s – starting measurements immediately",
-                        second,
-                    )
-                    self._ai_object = None
-                    if self._fire_object(second, "ai_complete"):
-                        self._start_measurement_tracking(second)
-
-        self._disk_first, self._disk_second = second, first
+        # A rotation moves every disk to the next position (disk i -> i+1;
+        # with two disks that is the coupled swap).
+        self._disks = self._disks[1:] + self._disks[:1]
         self._rotating = False
         logger.info(
-            "Pipeline: platform rotation done (first=%s, second=%s)",
-            self._disk_first, self._disk_second,
+            "Pipeline: platform rotation done (disks=%s)", self._disks,
         )
+
+    # ------------------------------------------------------------------
+    # Physical gates
+    # ------------------------------------------------------------------
+    def _disks_stable(self) -> bool:
+        """A rotation moves EVERY disk at once, so every occupied disk must
+        hold an object that requested the rotation (finished its stage)."""
+        for idx, object_id in enumerate(self._disks):
+            if object_id is None:
+                continue
+            state = self._obj_state(object_id)
+            meta = self._state_meta.get(state or "", {})
+            if meta.get("position") != self._disk_names[idx]:
+                return False
+            if not meta.get("rotate_request"):
+                return False
+        return True
+
+    def _subsystem_needed_on(
+        self, subsystem: str, start_state: str, disk_name: str
+    ) -> bool:
+        """Walk the object journey forward from `start_state` (it is linear
+        in object.yaml); while the object stays on `disk_name`, does
+        `subsystem` act on it (single or parallel actor)?"""
+        state = start_state
+        seen: Set[str] = set()
+        while state and state not in seen:
+            seen.add(state)
+            meta = self._state_meta.get(state, {})
+            if meta.get("position") != disk_name:
+                return False
+            actors = set(meta.get("parallel_actors") or [])
+            if meta.get("actor"):
+                actors.add(meta["actor"])
+            if subsystem in actors:
+                return True
+            state = self._leave_target.get(state)
+        return False
+
+    def _robot_needed_soon(self) -> bool:
+        """Is a disk object about to be rotated back to a position where the
+        dispatching robot must act on it (the measurement stage)?
+
+        Used as a gate for both the rotation (combined with the robot's
+        availability) and the robot dispatch (unconditional: the moment the
+        rotation lands, the robot is needed, so no new pick may start in
+        the meantime – a pick in flight would hold the robot when the
+        measurement stage starts and its command would be lost).
+        """
+        if self._chain_subsystem is None or self._disk_count < 2:
+            return False
+        for idx, object_id in enumerate(self._disks):
+            if object_id is None:
+                continue
+            state = self._obj_state(object_id)
+            meta = self._state_meta.get(state or "", {})
+            if not meta.get("rotate_request"):
+                continue
+            start = self._leave_target.get(state or "")
+            if start is None:
+                continue
+            dest = self._disk_names[(idx + 1) % self._disk_count]
+            if self._subsystem_needed_on(self._chain_subsystem, start, dest):
+                return True
+        return False
+
+    def _pending_rotation_command(self) -> Optional[str]:
+        """The rotate_command of the first disk whose object requested the
+        rotation (the request from the entry side takes precedence)."""
+        for object_id in self._disks:
+            if object_id is None:
+                continue
+            meta = self._state_meta.get(self._obj_state(object_id) or "", {})
+            command = meta.get("rotate_command")
+            if command:
+                return command
+        return None
 
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
-    def _disks_stable(self) -> bool:
-        """A rotation moves BOTH disks at once, so every occupied disk must
-        hold an object that has finished its stage."""
-        if self._disk_first is not None and self._obj_state(self._disk_first) != OBJ_GOING_SECOND:
-            return False
-        if self._disk_second is not None and self._obj_state(self._disk_second) != OBJ_GOING_FIRST:
-            return False
-        return True
-
     def _advance(self) -> None:
         """Issue the next possible commands.
 
@@ -398,79 +591,86 @@ class PipelineController:
         controller lock (and not the orchestrator lock).
         """
         if self._phase == "scanning":
-            if self._sm_state(VISION) == "ready":
-                logger.info("Pipeline: commanding vision box scan")
-                self._command(VISION, "capture")
+            if (
+                self._reporter is not None
+                and self._scan_command is not None
+                and self._sm_state(self._reporter) == self._ready_state()
+            ):
+                logger.info(
+                    "Pipeline: commanding box scan (%s/%s)",
+                    self._reporter, self._scan_command,
+                )
+                self._command(self._reporter, self._scan_command)
             return
         if self._phase != "pipeline":
             return
 
-        # Robot 1 performs the XRF/Raman stage: an object waiting on the
-        # second disk to come back (OBJ_GOING_FIRST) needs robot 1 the
-        # moment the rotation lands it on the first position, so robot 1
-        # must be free then (gate 1) and no new pick may be started in the
-        # meantime (gate 2).
-        second_waiting_for_measurement = (
-            self._disk_second is not None
-            and self._obj_state(self._disk_second) == OBJ_GOING_FIRST
-        )
+        robot_needed_soon = self._robot_needed_soon()
 
-        # 1. Pending platform rotation (both disks must be stable)
+        # 1. Pending platform rotation (every disk must be stable, and if an
+        #    object comes back to the measurement position the dispatching
+        #    robot must be ready and task-free – it is needed the moment the
+        #    rotation lands).
         if (
             self._rotation_requested
             and not self._rotating
-            and self._sm_state(ROTATING_PLATFORM) == "ready"
+            and self._platform is not None
+            and self._sm_state(self._platform) == self._ready_state()
             and self._disks_stable()
             and not (
-                second_waiting_for_measurement
+                robot_needed_soon
                 and (
-                    self._sm_state(ROBOT_FIRST) != "ready"
+                    self._sm_state(self._chain_subsystem) != self._ready_state()
                     or self._robot_task is not None
                 )
             )
         ):
-            target = (
-                "second"
-                if self._disk_first is not None
-                and self._obj_state(self._disk_first) == OBJ_GOING_SECOND
-                else "first"
-            )
-            logger.info("Pipeline: commanding platform rotation to %s position", target)
-            self._command(ROTATING_PLATFORM, f"rotate_to_{target}")
-            self._rotation_requested = False
-            self._rotating = True
+            command = self._pending_rotation_command()
+            if command:
+                logger.info("Pipeline: commanding platform rotation (%s)", command)
+                self._command(self._platform, command)
+                self._rotation_requested = False
+                self._rotating = True
 
-        # 2. Robot 1 dispatch: the next object leaves the box only when the
-        #    first disk position is free (2 disk slots, 1 end effector),
-        #    and never while the second-disk object is coming back for
-        #    XRF/Raman (robot 1 is needed there as soon as it lands).
+        # 2. Robot dispatch: the next object leaves the box only when the
+        #    entry disk position is free and the robot is free – and never
+        #    while a disk object is coming back to the robot's position
+        #    (the rotation gate above keeps the robot free for it, but a
+        #    pick started in the meantime would hold the robot when the
+        #    measurement stage starts and its command would be lost).
         if (
             self._robot_task is None
-            and self._sm_state(ROBOT_FIRST) == "ready"
-            and self._disk_first is None
-            and not second_waiting_for_measurement
+            and self._hand_slots > 0
+            and self._chain_subsystem is not None
+            and self._sm_state(self._chain_subsystem) == self._ready_state()
+            and self._entry_disk is not None
+            and self._disks[self._entry_disk] is None
+            and not robot_needed_soon
             and self._queue_pos < len(self._order)
         ):
             object_id = self._order[self._queue_pos]
-            if self._obj_state(object_id) == OBJ_WAITING:
+            if self._obj_state(object_id) == self._dispatch_state:
                 logger.info("Pipeline: dispatching %s to the platform", object_id)
-                self._disk_first = object_id
+                self._disks[self._entry_disk] = object_id
                 self._queue_pos += 1
-                if self._fire_object(object_id, "object_picked"):
-                    self._robot_task = ("pick", object_id)
+                if self._dispatch_event and self._fire_object_event(
+                    object_id, self._dispatch_event
+                ):
+                    subsystem, entry = self._chain_by_object_event[self._dispatch_event]
+                    self._robot_task = (
+                        object_id,
+                        self._chain_completion(subsystem, entry["op"]),
+                    )
                 else:
-                    self._disk_first = None
+                    self._disks[self._entry_disk] = None
                     self._queue_pos -= 1
 
-        # 3. Run finished?
+        # 3. Run finished? (every object back in the box)
         if (
             self._queue_pos >= len(self._order)
-            and self._disk_first is None
-            and self._disk_second is None
+            and all(d is None for d in self._disks)
             and self._robot_task is None
             and not self._rotating
-            and self._imaging_object is None
-            and self._ai_object is None
             and self._measuring_object is None
         ):
             self._phase = "suspended"
@@ -479,6 +679,12 @@ class PipelineController:
     def _finish_workflow(self) -> None:
         """Complete the run: running -> stopping -> stopped (objects remain
         visible in the GUI for the operator to review)."""
-        logger.info("Pipeline: %d object(s) processed – stopping the workflow", len(self._order))
-        self._orch.fire_event("stop_requested")
-        self._orch.fire_event("stopped")
+        wf = self._orch.workflow_names
+        logger.info(
+            "Pipeline: %d object(s) processed – stopping the workflow",
+            len(self._order),
+        )
+        self._orch.fire_event(wf.operator_events.get("stop", "stop_requested"))
+        self._orch.fire_event(
+            wf.stop_completion_event or "stopped"
+        )

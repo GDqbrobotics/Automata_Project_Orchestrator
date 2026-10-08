@@ -11,36 +11,19 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 
-class WorkflowState(str, enum.Enum):
-    IDLE = "idle"
-    STARTING = "starting"
-    RUNNING = "running"
-    PAUSED = "paused"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
-    ERROR = "error"
-
-
 class SubsystemState(str, enum.Enum):
+    """Adapter-internal subsystem state.
+
+    READY/STOPPED/ERROR/OFFLINE mirror the shared vocabulary
+    (global.yaml `states:`); BUSY is the catch-all for work stages (any
+    reported state outside the non-work set).
+    """
+
     READY = "ready"
     BUSY = "busy"
     OFFLINE = "offline"
     ERROR = "error"
     STOPPED = "stopped"
-
-
-class ObjectState(str, enum.Enum):
-    IDENTIFIED = "identified_in_box"
-    WAITING_FOR_DISK = "waiting_for_disk"
-    MOVING_TO_DISK = "moving_to_disk"
-    THREE_DI_ANALYSIS = "3DI_analysis"
-    HSI_ANALYSIS = "HSI_analysis"
-    GOING_SECOND_POSITION = "object_going_second_position"
-    XRF_RAMAN_ANALYSIS = "XRF_RAMAN_analysis"
-    GOING_FIRST_POSITION = "object_going_first_position"
-    AI_PROCESSING = "ai_processing"
-    MOVING_TO_BOX = "moving_to_box"
-    ANALYZED = "object_analyzed"
 
 
 class WorkflowCommand(str, enum.Enum):
@@ -86,8 +69,9 @@ class BackendEvent(str, enum.Enum):
     OBJECT_MESSAGE = "object_message"          # internal messages of one object's SM
     MESSAGES_CLEARED = "messages_cleared"      # history reset (workflow reset)
     # A subsystem was commanded into a state but, after the configured
-    # timeout, has not reported that (or any other) state: its real state
-    # lags the expectation (see adapters/subsystem.py STATE_EXPECT_TIMEOUT).
+    # timeout (global.yaml orchestration.state_expect_timeout), has not
+    # reported that (or any other) state: its real state lags the
+    # expectation (see adapters/subsystem.py).
     SUBSYSTEM_STATE_MISMATCH = "subsystem_state_mismatch"
 
 
@@ -102,6 +86,8 @@ class SubsystemConfig:
     name: str
     display_name: str
     type: str = "generic"
+    # Per-subsystem topic template (`{name}` is substituted). May differ
+    # from the global `mqtt.topic_prefix` (docs/CONFIG_CHANGE_GUIDE.md, R4).
     mqtt_topic: str = "automata/subsystem/{name}"
     initial_state: str = "ready"
     required: bool = True
@@ -136,15 +122,38 @@ class SubsystemConfig:
 class GlobalConfig:
     """Global configuration loaded from global.yaml.
 
-    Contains all default values: broker, ports, simulation defaults,
-    object workflow display settings, and workflow state messages.
+    Contains all default values: broker, ports, the shared subsystem
+    vocabulary (states/events that backend code used to hardcode), the
+    MQTT topic tree, orchestration rules, simulation defaults, object
+    workflow display settings, and workflow state messages.
     """
 
     mqtt_broker: str = "localhost"
     mqtt_port: int = 1883
+    mqtt_topic_prefix: str = "automata/subsystem"
     frontend_host: str = "0.0.0.0"
     frontend_port: int = 8080
+    frontend_dev_port: int = 3000
+    # Shared subsystem vocabulary (global.yaml `states:`)
+    states_non_work: List[str] = field(
+        default_factory=lambda: ["initializing", "ready", "stopped", "error"]
+    )
+    states_report_events: List[str] = field(
+        default_factory=lambda: ["complete", "init_complete"]
+    )
+    states_ready: str = "ready"
+    # Ordered: [pause, resume]
+    states_hardware_commands: List[str] = field(
+        default_factory=lambda: ["pause", "resume"]
+    )
+    # Orchestration rules (global.yaml `orchestration:`)
+    state_expect_timeout: float = 10.0
+    alias_pattern: str = r"^[A-Za-z0-9_\-\. ]{1,64}$"
     simulation_default_num_objects: int = 3
+    simulation_heartbeat_interval: float = 2.0
+    simulation_default_init_duration: float = 1.5
+    simulation_default_work_duration: float = 2.0
+    simulation_object_id_format: str = "object_{i:03d}"
     object_state_order: List[str] = field(default_factory=list)
     object_state_colors: Dict[str, str] = field(default_factory=dict)
     workflow_state_messages: Dict[str, str] = field(default_factory=dict)
@@ -158,22 +167,82 @@ class GlobalConfig:
 
         mqtt_cfg = data.get("mqtt", {})
         frontend_cfg = data.get("frontend", {})
+        states_cfg = data.get("states", {})
+        orch_cfg = data.get("orchestration", {})
         sim_cfg = data.get("simulation", {})
         obj_cfg = data.get("object_workflow", {})
         wf_cfg = data.get("workflow_states", {})
 
-        return cls(
-            mqtt_broker=mqtt_cfg.get("broker", "localhost"),
-            mqtt_port=mqtt_cfg.get("port", 1883),
-            frontend_host=frontend_cfg.get("host", "0.0.0.0"),
-            frontend_port=frontend_cfg.get("port", 8080),
-            simulation_default_num_objects=sim_cfg.get(
-                "default_num_objects", 3
-            ),
-            object_state_order=obj_cfg.get("state_order", []),
-            object_state_colors=obj_cfg.get("state_colors", {}),
-            workflow_state_messages=wf_cfg,
+        cfg = cls()
+        cfg.mqtt_broker = mqtt_cfg.get("broker", cfg.mqtt_broker)
+        cfg.mqtt_port = mqtt_cfg.get("port", cfg.mqtt_port)
+        cfg.mqtt_topic_prefix = mqtt_cfg.get("topic_prefix", cfg.mqtt_topic_prefix)
+        cfg.frontend_host = frontend_cfg.get("host", cfg.frontend_host)
+        cfg.frontend_port = frontend_cfg.get("port", cfg.frontend_port)
+        cfg.frontend_dev_port = frontend_cfg.get("dev_port", cfg.frontend_dev_port)
+        cfg.states_non_work = states_cfg.get("non_work", cfg.states_non_work)
+        cfg.states_report_events = states_cfg.get(
+            "report_events", cfg.states_report_events
         )
+        cfg.states_ready = states_cfg.get("ready", cfg.states_ready)
+        cfg.states_hardware_commands = states_cfg.get(
+            "hardware_commands", cfg.states_hardware_commands
+        )
+        cfg.state_expect_timeout = float(
+            orch_cfg.get("state_expect_timeout", cfg.state_expect_timeout)
+        )
+        cfg.alias_pattern = orch_cfg.get("alias_pattern", cfg.alias_pattern)
+        cfg.simulation_default_num_objects = sim_cfg.get(
+            "default_num_objects", cfg.simulation_default_num_objects
+        )
+        cfg.simulation_heartbeat_interval = float(
+            sim_cfg.get("heartbeat_interval", cfg.simulation_heartbeat_interval)
+        )
+        cfg.simulation_default_init_duration = float(
+            sim_cfg.get(
+                "default_init_duration", cfg.simulation_default_init_duration
+            )
+        )
+        cfg.simulation_default_work_duration = float(
+            sim_cfg.get(
+                "default_work_duration", cfg.simulation_default_work_duration
+            )
+        )
+        cfg.simulation_object_id_format = sim_cfg.get(
+            "object_id_format", cfg.simulation_object_id_format
+        )
+        cfg.object_state_order = obj_cfg.get("state_order", [])
+        cfg.object_state_colors = obj_cfg.get("state_colors", {})
+        cfg.workflow_state_messages = wf_cfg
+        return cfg
+
+    # ------------------------------------------------------------------
+    # Shared vocabulary helpers
+    # ------------------------------------------------------------------
+    @property
+    def non_work_states(self) -> frozenset:
+        return frozenset(self.states_non_work)
+
+    @property
+    def report_events(self) -> frozenset:
+        return frozenset(self.states_report_events)
+
+    def tone_for(self, state: Optional[str]) -> str:
+        """Map a raw subsystem state to the GUI's visual tone vocabulary
+        (F3): error/offline/ready, other non-work states -> idle, work
+        stages -> busy. Computed once here so the frontend never has to
+        enumerate state names."""
+        if state is None:
+            return "offline"
+        if state == "error":
+            return "error"
+        if state == "offline":
+            return "offline"
+        if state == self.states_ready:
+            return "ready"
+        if state in self.non_work_states:
+            return "idle"
+        return "busy"
 
 
 @dataclass
@@ -183,8 +252,11 @@ class SubsystemInfo:
     name: str
     display_name: str = ""
     type: str = "generic"
-    current_state: str = "ready"
+    current_state: str = ""
     state_description: str = ""
+    # Visual tone (ready/busy/error/idle/offline/warning) computed by the
+    # orchestrator from the configured vocabulary; the UI renders it as-is.
+    tone: str = ""
     required: bool = True
     topic_prefix: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -196,6 +268,7 @@ class SubsystemInfo:
             "type": self.type,
             "state": self.current_state,
             "state_description": self.state_description,
+            "tone": self.tone,
             "required": self.required,
             "metadata": self.metadata,
         }
@@ -226,7 +299,9 @@ class ObjectInfo:
     """Runtime info about an analyzed object."""
 
     object_id: str = ""
-    state: str = "identified_in_box"
+    # The orchestrator always fills this from object.yaml (the initial
+    # state / the live state) – no hardcoded default (R6).
+    state: str = ""
     state_description: str = ""
     created: str = ""
     last_state_change: str = ""
@@ -250,7 +325,9 @@ class ObjectInfo:
 
 @dataclass
 class WorkflowStatus:
-    state: WorkflowState
+    # The raw state name from the workflow SM engine (workflow.yaml is the
+    # source of truth; there is no Python enum duplicate – R3).
+    state: str = ""
     total_objects: int = 0
     progress: int = 0
     current_object: Optional[str] = None
@@ -261,7 +338,7 @@ class WorkflowStatus:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "state": self.state.value,
+            "state": self.state,
             "total_objects": self.total_objects,
             "progress": self.progress,
             "current_object": self.current_object,

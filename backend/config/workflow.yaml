@@ -1,6 +1,41 @@
 name: automata_gui_workflow
 initial_state: idle
 
+# Lifecycle rules the orchestrator applies on top of the transitions
+# above (single source of truth, was hardcoded in orchestrator/workflow.py
+# and mirrored by the GUI's button matrix). See docs/CONFIG_CHANGE_GUIDE.md.
+metadata:
+  # Operator buttons -> workflow events. The GUI derives its enable
+  # matrix from the transitions below: button B is enabled in state S
+  # when S has a transition whose event maps to B here.
+  operator_events:
+    start: start_requested
+    pause: pause_requested
+    resume: resume_requested
+    stop: stop_requested
+    reset: reset_requested
+  # Fired when leaving `stopping` to complete an operator-initiated stop.
+  stop_completion_event: stopped
+  # Readiness gate: while the workflow waits in `in_state`, the moment all
+  # *required* subsystems report the ready state, `fire` is raised.
+  readiness:
+    in_state: starting
+    fire: subsystem_ready
+  # Fired on the workflow SM when a *required* subsystem reports the
+  # error state (the transitions above already model the move to error).
+  error_event: subsystem_error
+  # The state that represents a workflow error: the GUI shows the concrete
+  # error detail (instead of the static message) while in it.
+  error_state: error
+  # Subsystem simulation toggles are accepted only in these states (the
+  # same states where the operator can press Start).
+  toggle_allowed_in: [idle, stopped, error]
+  # Subsystems reporting `from_state` are moved to `to_state` when the
+  # operator starts the workflow (wake-up after a previous run).
+  wake:
+    from_state: stopped
+    to_state: ready
+
 states:
   idle:
     description: Waiting for operator input

@@ -212,10 +212,6 @@ body {
   background: rgba(245, 166, 35, 0.13); color: var(--warning);
   border-color: rgba(245, 166, 35, 0.45);
 }
-.state-badge.completing {
-  background: rgba(167, 139, 250, 0.15); color: var(--purple);
-  border-color: rgba(167, 139, 250, 0.45);
-}
 .state-badge.error {
   background: rgba(240, 84, 79, 0.14); color: #ff8a86;
   border-color: rgba(240, 84, 79, 0.5);

@@ -39,9 +39,10 @@ fires a transition, the orchestrator publishes the command to
 reports on `automata/subsystem/<name>/status`. The orchestrator's local
 subsystem SM does **not** advance on command (real subsystems lag) — it is
 a *mirror* of the state the subsystem reports, and if a subsystem never
-reports the state it was commanded into within 10 s a discrepancy warning
-is raised (see [docs/STATE_MACHINE.md](docs/STATE_MACHINE.md), principles
-11–12).
+reports the state it was commanded into within the configured window
+(`orchestration.state_expect_timeout` in `global.yaml`, default 10 s) a
+discrepancy warning is raised (see
+[docs/STATE_MACHINE.md](docs/STATE_MACHINE.md), principles 11–12).
 
 On top of the state machines, a **pipeline controller** keeps track of the
 physical flow: the rotating platform has two disk positions and robot 1
@@ -177,25 +178,40 @@ duration, a state or an event means editing a file, not touching Python
 code. The state-machine engine validates every transition at runtime and
 rejects anything the configuration does not define.
 
-- **`global.yaml`** — global defaults: broker address and ports, simulation
-  defaults, the display order and colors of the object states, and the
-  human-readable message shown for each workflow state.
-- **`workflow.yaml`** — the workflow state machine (run lifecycle).
+- **`global.yaml`** — global defaults: broker address and ports, the MQTT
+  topic prefix, the shared subsystem vocabulary (which states are
+  non-work, the ready state, the completion events, the pause/resume
+  hardware commands), the orchestration rules (state-expect timeout,
+  alias pattern), simulation defaults, the display order and colors of
+  the object states, and the human-readable message shown for each
+  workflow state.
+- **`workflow.yaml`** — the workflow state machine (run lifecycle), plus a
+  `metadata:` section with the lifecycle vocabulary: which operator
+  buttons fire which events, the readiness gate, the error event/state,
+  the stop-completion event and the wake transition.
 - **`object.yaml`** — the blueprint of one object's journey; every sample
-  gets its own instance of it.
+  gets its own instance of it. Its `metadata:` section describes the
+  machine layout (disks, hand slots) and the multi-step task chains; each
+  state's `meta:` says where the object physically is and which subsystem
+  works on it — the pipeline controller is driven by these declarations.
 - **`subsystems/<name>.yaml`** — one file per subsystem: metadata (display
   name, whether it is required for the run to start, simulated work
-  durations) and the subsystem's state machine.
+  durations, its reporting role if any) and the subsystem's state
+  machine.
 
-**Adding a subsystem** is mostly a configuration exercise: create a new
-YAML in `backend/config/subsystems/` with the subsystem's name and state
-machine, and the orchestrator discovers it automatically (its card, its
-MQTT topics, its place in the GUI). To have it simulated as well, copy one
-of the existing one-line scripts as `backend/simulation/<name>_sim.py` —
-the orchestrator discovers the simulator by the script's presence and the
-subsystem becomes toggleable in the GUI (simulation mode) — and add the
-name to the `ALL_SUBSYSTEMS` list in `backend/adapters/subsystem.py`
-(used by the test suite).
+The GUI is driven by the same files: the operator-button matrix, the
+workflow/object state-machine graphs and the display vocabulary are
+*broadcast to the frontend* from the YAML at startup, so a rename in the
+config shows up in the UI without any code change.
+
+**Adding a subsystem** is a configuration exercise: create a new YAML in
+`backend/config/subsystems/` with the subsystem's name and state machine,
+and the orchestrator discovers it automatically (its card, its MQTT
+topics, its place in the GUI). To have it simulated as well, add a
+one-line script `backend/simulation/<name>_sim.py` that calls the generic
+simulator's `main()` — the orchestrator discovers the simulator by the
+script's presence (and derives the subsystem name from it) and the
+subsystem becomes toggleable in the GUI (simulation mode).
 
 ## Testing
 

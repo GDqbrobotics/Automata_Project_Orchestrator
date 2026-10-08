@@ -1,21 +1,68 @@
 # Global configuration for the AUTOMATA GUI Orchestrator
 # All default values live here. Override via CLI args or environment.
+#
+# This file is the single source of truth for the shared *vocabulary*
+# (which subsystem state means what, the MQTT topic tree, timing defaults)
+# that backend code used to hardcode. See docs/CONFIG_CHANGE_GUIDE.md.
 
 mqtt:
   broker: localhost
   port: 1883
+  # Root of the MQTT topic tree:
+  #   <topic_prefix>/<name>/{event,command,status,response}
+  # A subsystem YAML may override its own tree via its `mqtt_topic` field
+  # (the orchestrator subscribes/publishes on the configured topics).
+  topic_prefix: automata/subsystem
 
 frontend:
   host: 0.0.0.0
   port: 8080
+  # Frontend dev-server port (vite, see frontend/vite.config.ts) – used by
+  # launch_gui.py to refuse stacking a second instance.
+  dev_port: 3000
+
+# Shared subsystem vocabulary (single source of truth, was duplicated in
+# adapters/subsystem.py, orchestrator/pipeline.py and
+# simulation/subsystem_sim.py).
+states:
+  # Subsystem states that are NOT work stages: a report into any other
+  # state means the subsystem is actively performing a work stage.
+  non_work: [initializing, ready, stopped, error]
+  # Events that flow subsystem -> orchestrator (completion reports); they
+  # must never be re-published as MQTT commands.
+  report_events: [complete, init_complete]
+  # The "idle, can accept work" state.
+  ready: ready
+  # Raw hardware commands forwarded over MQTT under the `all/` scope
+  # (they bypass the local subsystem SMs, which do not model pause).
+  # Order is significant: [pause, resume].
+  hardware_commands: [pause, resume]
+
+orchestration:
+  # Seconds a subsystem has to confirm a commanded state before a
+  # discrepancy warning is raised (STATE_MACHINE.md principle 12).
+  state_expect_timeout: 10
+  # Format rule for operator alias IDs (local database). The GUI derives
+  # the input's max length and client-side validation from this pattern.
+  alias_pattern: '^[A-Za-z0-9_\-\. ]{1,64}$'
 
 simulation:
   default_num_objects: 3
+  # Status re-publication period of the simulated subsystems (seconds).
+  heartbeat_interval: 2.0
+  # Time in the initial state before the simulated subsystem reports the
+  # ready state (seconds); used when a YAML has no `init_duration`.
+  default_init_duration: 1.5
+  # Fallback duration for work states without a `work_durations` entry
+  # (seconds).
+  default_work_duration: 2.0
+  # Object IDs reported after a box scan (simulated vision + debug panel).
+  object_id_format: 'object_{i:03d}'
 
 object_workflow:
   # State display order and colors for the frontend.
   # Color names map to the CSS classes .object-state.state-<color>
-  # defined in frontend/index.html.
+  # defined in frontend/src/styles/app.css.
   state_order:
     - identified_in_box
     - waiting_for_disk

@@ -1,9 +1,7 @@
 """Domain models package."""
 
 from backend.domain.models import (
-    WorkflowState,
     SubsystemState,
-    ObjectState,
     WorkflowCommand,
     Command,
     BackendEvent,
@@ -16,9 +14,7 @@ from backend.domain.models import (
 )
 
 __all__ = [
-    "WorkflowState",
     "SubsystemState",
-    "ObjectState",
     "WorkflowCommand",
     "Command",
     "BackendEvent",

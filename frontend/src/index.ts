@@ -26,6 +26,18 @@ const submitAlias = (): void => {
   const objectId = select?.value || '';
   const alias = (input?.value || '').trim();
   if (!objectId || !alias) return;
+  // Validate against the backend's constraint (global.yaml alias_pattern, F7)
+  const error = app.validateAlias(alias);
+  if (error) {
+    input?.reportValidity?.();
+    if (input) {
+      input.setCustomValidity(error);
+      // Clear the message once the operator edits the value again.
+      input.addEventListener('input', () => input.setCustomValidity(''), { once: true });
+    }
+    console.warn('Alias rejected:', error);
+    return;
+  }
   app.assignAlias(objectId, alias);
   if (input) input.value = '';
 };

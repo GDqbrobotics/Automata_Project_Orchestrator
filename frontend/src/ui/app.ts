@@ -1,10 +1,15 @@
-import type { FrontendMessage, WorkflowCommand, WorkflowStateType } from '../contracts.js';
+import type {
+  FrontendMessage,
+  SubsystemStatus,
+  WorkflowCommand,
+  WorkflowStateType,
+} from '../contracts.js';
 import { FrontendClient } from '../api/client.js';
-import { createInitialState, reduceState } from '../state/store.js';
+import { createInitialState, reduceState, type UiState } from '../state/store.js';
 import { StateMachineModal } from './state-machine-modal.js';
 import type { ModalData, ModalKind } from './state-machine-modal.js';
 import { buildStateStyles, getTotalSteps } from '../config/object-styles.js';
-import { getButtonRules } from '../config/button-rules.js';
+import { deriveButtonRules } from '../config/operator-buttons.js';
 import { getStateMessage } from '../config/state-messages.js';
 
 interface AppConfig {
@@ -25,30 +30,27 @@ function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 /**
- * Map a raw subsystem state to a semantic tone class.
+ * Semantic tone class for a subsystem card.
  *
- * The backend can report any state name defined in the subsystem YAMLs, so
- * instead of enumerating every state in CSS we collapse them into a small
- * set of tones: ready / busy / warning / error / idle / offline.
+ * The backend computes the tone from the configured vocabulary
+ * (global.yaml `states:` — which states are ready / non-work / error), so
+ * the UI renders it as-is instead of enumerating state names (F3). A
+ * missing info means the subsystem has not reported yet: offline.
  */
-function subsystemTone(state: string | null | undefined): string {
-  switch (state) {
-    case 'ready':
-      return 'ready';
-    case 'error':
-      return 'error';
-    case 'offline':
-      return 'offline';
-    case 'paused':
-    case 'tool_changing':
-      return 'warning';
-    case 'stopped':
-    case 'initializing':
-    case 'reset':
-      return 'idle';
-    default:
-      return 'busy';
-  }
+function subsystemTone(info: SubsystemStatus | undefined): string {
+  if (!info) return 'offline';
+  return info.tone || 'busy';
+}
+
+/**
+ * The workflow's error state, from the broadcast definition
+ * (workflow.yaml metadata.error_state) — the state that shows the concrete
+ * error detail in the workflow message (F5).
+ */
+function workflowErrorState(s: UiState): string | null {
+  const meta = s.workflowStateMachine?.metadata;
+  const err = meta?.error_state;
+  return typeof err === 'string' && err ? err : null;
 }
 
 export class App {
@@ -101,6 +103,21 @@ export class App {
   }
 
   /**
+   * Validate an alias against the backend's constraint (global.yaml
+   * alias_pattern, broadcast in the display config — F7).
+   * @returns an error message, or null when the alias is valid.
+   */
+  validateAlias(alias: string): string | null {
+    try {
+      if (new RegExp(this.state.aliasPattern).test(alias)) return null;
+    } catch {
+      // Malformed pattern from config: fall back to a non-empty check.
+      return alias.trim() ? null : 'Alias must not be empty';
+    }
+    return `Invalid alias: must match ${this.state.aliasPattern}`;
+  }
+
+  /**
    * Simulation mode (--simulation): toggle whether one subsystem is served
    * by its simulated process or by the real hardware. The backend rejects
    * it when it is not running with --simulation, or when the workflow is
@@ -134,6 +151,7 @@ export class App {
     this.updateProgress();
     this.updateObjectsGrid();
     this.updateAliasSelect();
+    this.updateAliasInputConstraint();
     this.updateSubsystemGrid();
     this.updateSimulationBadge();
     this.updateActionButtons();
@@ -188,6 +206,9 @@ export class App {
         debugTopics: this.state.debug?.enabled
           ? this.state.debug.topics[id] || undefined
           : undefined,
+        // Ready state from the configured vocabulary (F5): the debug panel's
+        // state quick-pick mirrors the ready flag in the status payload.
+        readyState: this.state.readyState,
       };
     }
     const obj = this.state.objects.find((o) => o.object_id === id);
@@ -221,16 +242,16 @@ export class App {
   private updateWorkflowMessage(): void {
     const elMsg = document.getElementById('workflowMessage');
     if (!elMsg) return;
-    // Error state: always show the concrete error detail
-    if (this.state.workflowState === 'error') {
-      elMsg.textContent = getStateMessage('error', this.state.error || undefined);
-      return;
-    }
-    // Prefer messages sent by the backend (from global.yaml),
-    // fall back to the frontend defaults from config/state-messages.ts
-    const backendMsg = this.state.workflowStateMessages[this.state.workflowState];
-    elMsg.textContent =
-      backendMsg || getStateMessage(this.state.workflowState, this.state.error || undefined);
+    // Error state (workflow.yaml metadata.error_state): always show the
+    // concrete error detail; otherwise the message from global.yaml
+    // (workflow_states, sent in the display config).
+    const errorState = workflowErrorState(this.state);
+    elMsg.textContent = getStateMessage(
+      this.state.workflowState,
+      this.state.workflowStateMessages,
+      errorState !== null && this.state.workflowState === errorState,
+      this.state.error,
+    );
   }
 
   private updateProgress(): void {
@@ -271,6 +292,9 @@ export class App {
         : undefined;
     const stateStyles = buildStateStyles(stateOrder, stateColors);
     const totalSteps = getTotalSteps(stateOrder);
+    // The "done" styling follows the object journey's final states
+    // (object.yaml, F4) instead of a hardcoded color class.
+    const finalStates = this.state.objectFinalStates;
 
     for (const obj of objects) {
       const style = stateStyles[obj.state] || { colorClass: 'gray', stepIndex: 0 };
@@ -279,7 +303,11 @@ export class App {
         totalSteps > 0 ? Math.round(((stepIndex + 1) / totalSteps) * 100) : 0;
 
       const card = el('div', 'object-card');
-      if (style.colorClass === 'analyzed') card.classList.add('is-done');
+      const done =
+        finalStates.length > 0
+          ? finalStates.includes(obj.state)
+          : style.colorClass === 'analyzed';
+      if (done) card.classList.add('is-done');
       card.title = 'Click to view state machine and internal messages';
 
       const top = el('div', 'object-top');
@@ -328,10 +356,12 @@ export class App {
     const countEl = document.getElementById('subsystemsCount');
     if (countEl) countEl.textContent = `${allNames.length}`;
 
-    // Simulation mode: per-card SIM/REAL toggle (see simulation chip below)
+    // Simulation mode: per-card SIM/REAL toggle (see simulation chip below).
+    // The toggle is allowed exactly while Start is — derived from the
+    // broadcast workflow definition (F1), not a hardcoded state table.
     const simInfo = this.state.simulation;
     const toggleAllowed = simInfo?.enabled
-      ? getButtonRules(this.state.workflowState).start
+      ? deriveButtonRules(this.state.workflowStateMachine, this.state.workflowState).start
       : false;
 
     if (allNames.length === 0) {
@@ -343,7 +373,7 @@ export class App {
       const config = this.state.subsystemsConfig.find((cfg) => cfg.name === name);
       const info = this.state.subsystems[name];
       const state = info?.state || 'offline';
-      const tone = subsystemTone(info ? state : 'offline');
+      const tone = subsystemTone(info);
       const displayName = config?.display_name || name;
       const description = info?.state_description || '';
 
@@ -420,6 +450,18 @@ export class App {
       'Launched with --simulation: click the SIM/REAL chip on each subsystem card to decide which subsystems run as simulated processes (only before starting the workflow)';
   }
 
+  /**
+   * Mirror the backend's alias constraint (global.yaml alias_pattern, F7)
+   * on the input: the length limit is derived from the pattern's quantifier
+   * ({1,64} -> maxLength 64).
+   */
+  private updateAliasInputConstraint(): void {
+    const input = document.getElementById('aliasInput') as HTMLInputElement | null;
+    if (!input) return;
+    const m = this.state.aliasPattern.match(/\{\d+,(\d+)\}/);
+    if (m) input.maxLength = parseInt(m[1], 10);
+  }
+
   /** Keep the alias-assignment object selector in sync with tracked objects. */
   private updateAliasSelect(): void {
     const select = document.getElementById('aliasObjectSelect') as HTMLSelectElement | null;
@@ -448,7 +490,12 @@ export class App {
   }
 
   private updateActionButtons(): void {
-    const rules = getButtonRules(this.state.workflowState);
+    // Operator button matrix derived from the broadcast workflow definition
+    // (workflow.yaml states + metadata.operator_events, F1).
+    const rules = deriveButtonRules(
+      this.state.workflowStateMachine,
+      this.state.workflowState,
+    );
     const startBtn = document.getElementById('btnStart') as HTMLButtonElement | null;
     const pauseBtn = document.getElementById('btnPause') as HTMLButtonElement | null;
     const resumeBtn = document.getElementById('btnResume') as HTMLButtonElement | null;

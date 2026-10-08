@@ -1,9 +1,53 @@
 name: object_analysis_workflow
 initial_state: identified_in_box
 
+# Physical facts of the machine the pipeline controller needs. The states,
+# transitions and events below stay the single source of truth for the
+# object flow; this metadata only adds the *where* and *who* of each stage
+# (docs/CONFIG_CHANGE_GUIDE.md, R2):
+#
+#   meta.position         where the object physically is:
+#                         `box` (in the box), `hand` (in the robot's end
+#                         effector) or a disk name (from `disk_names`)
+#   meta.actor            the single subsystem working on the object in
+#                         this state (its completion advances the object
+#                         over the state's outgoing transition)
+#   meta.parallel_actors  subsystems that must ALL complete for the state
+#                         to end (the measurement stage)
+#   meta.rotate_request   the `workflow/`-scoped event this state requests
+#                         (consumed by the pipeline controller, which
+#                         decides when a rotation is physically safe)
+#   meta.rotate_command   the rotating_platform command that fulfils the
+#                         request (issued by the pipeline controller)
+#   meta.actor_op         the task-chain op (below) the actor performs in
+#                         this state (its command was fired by the
+#                         transition that entered the state)
+metadata:
+  # Rotating platform disk slots (a rotation moves BOTH disks at once).
+  disks: 2
+  disk_names: [disk_first, disk_second]
+  # End effectors of the dispatching robot (objects in transit).
+  hand_slots: 1
+  # Multi-step robot work per object: when the op's work completes the
+  # pipeline issues `next_command` on the robot (if any) and, once the
+  # op/chain is done, fires `done_event` on the object (releasing the
+  # `releases` disk slot, if any). `object_event` names the object
+  # transition whose actions start the op (the transition also commands
+  # the robot); `op` names the op for states carrying `actor_op`.
+  task_chains:
+    robot_first:
+      - op: pick
+        object_event: object_picked
+        next_command: place
+        done_event: object_placed_on_disk
+      - op: return
+        done_event: object_returned_to_box
+        releases: disk_first
+
 states:
   identified_in_box:
     description: Object has been identified in the box by the vision system
+    meta: { position: box }
     transitions:
       - event: queued_for_analysis
         target: waiting_for_disk
@@ -12,6 +56,7 @@ states:
 
   waiting_for_disk:
     description: Object is in the box, waiting for a free disk slot and the robot (the platform holds at most 2 objects, the robot carries at most 1)
+    meta: { position: box }
     transitions:
       - event: object_picked
         target: moving_to_disk
@@ -21,6 +66,7 @@ states:
 
   moving_to_disk:
     description: Object is being moved from the box to the rotating platform disk
+    meta: { position: hand }
     transitions:
       - event: object_placed_on_disk
         target: object_going_second_position
@@ -34,6 +80,10 @@ states:
 
   object_going_second_position:
     description: Object waits on the first disk for a platform rotation to the second imaging position (3DI, then HSI, are performed by robot 2)
+    meta:
+      position: disk_first
+      rotate_request: rotation_requested_second
+      rotate_command: rotate_to_second
     transitions:
       - event: platform_rotated_to_second
         target: 3DI_analysis
@@ -45,6 +95,7 @@ states:
 
   3DI_analysis:
     description: 3D imaging capture is being performed on the object (second position, first imaging stage)
+    meta: { position: disk_second, actor: imaging_3di }
     transitions:
       - event: 3di_capture_complete
         target: HSI_analysis
@@ -56,6 +107,7 @@ states:
 
   HSI_analysis:
     description: Hyperspectral imaging capture is being performed on the object (second position, second imaging stage)
+    meta: { position: disk_second, actor: imaging_hsi }
     transitions:
       - event: hsi_capture_complete
         target: object_going_first_position
@@ -73,6 +125,10 @@ states:
 
   object_going_first_position:
     description: Object waits on the second disk for a platform rotation back to the first measurement position (XRF/Raman is performed by robot 1)
+    meta:
+      position: disk_second
+      rotate_request: rotation_requested_first
+      rotate_command: rotate_to_first
     transitions:
       - event: platform_rotated_to_first
         target: ai_processing
@@ -81,6 +137,7 @@ states:
 
   ai_processing:
     description: Object is on the first position while the AI processes its imaging data to extract the interest points for the XRF/Raman measurements
+    meta: { position: disk_first, actor: ai_analysis }
     transitions:
       - event: ai_complete
         target: XRF_RAMAN_analysis
@@ -94,6 +151,7 @@ states:
 
   XRF_RAMAN_analysis:
     description: XRF and Raman puntual measurements are being performed at AI-extracted points (first position)
+    meta: { position: disk_first, parallel_actors: [robot_first, xrf, raman] }
     transitions:
       - event: measurements_complete
         target: moving_to_box
@@ -103,6 +161,7 @@ states:
 
   moving_to_box:
     description: Object is being moved from the disk back to its original position in the box
+    meta: { position: disk_first, actor: robot_first, actor_op: return }
     transitions:
       - event: object_returned_to_box
         target: object_analyzed
@@ -113,3 +172,4 @@ states:
 
   object_analyzed:
     description: Object analysis is complete – data is stored locally (the local database is updated manually)
+    meta: { position: box }

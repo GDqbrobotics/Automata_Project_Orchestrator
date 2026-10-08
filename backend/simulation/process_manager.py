@@ -66,6 +66,7 @@ class SubsystemProcessManager:
         endpoint: Callable[[], Tuple[str, int]],
         num_objects: int = 0,
         sim_dir: Optional[Path] = None,
+        reporters: Optional[set] = None,
     ) -> None:
         # Endpoint is resolved lazily (callable -> (broker_host, broker_port))
         # so the sim processes always follow the orchestrator's live MQTT
@@ -73,6 +74,10 @@ class SubsystemProcessManager:
         # orchestrator was constructed (tests, custom setups).
         self._endpoint = endpoint
         self._num_objects = num_objects
+        # Subsystems whose YAML declares a report counted from the box scan
+        # (metadata.reports, count_source: num_objects) receive
+        # --num-objects; everything else does not need it (R5).
+        self._reporters: set = set(reporters or ())
         self._sim_dir = Path(sim_dir) if sim_dir else Path(__file__).resolve().parent
         self._procs: Dict[str, subprocess.Popen] = {}
         self._lock = threading.RLock()
@@ -112,7 +117,7 @@ class SubsystemProcessManager:
                 "--broker", broker_host,
                 "--port", str(broker_port),
             ]
-            if name == "vision":
+            if name in self._reporters:
                 cmd.extend(["--num-objects", str(self._num_objects)])
             logger.info("[sim] starting simulated subsystem '%s'", name)
             proc = subprocess.Popen(

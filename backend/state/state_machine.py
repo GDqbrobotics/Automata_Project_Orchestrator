@@ -47,6 +47,10 @@ class StateConfig:
     name: str
     description: str = ""
     transitions: List[TransitionConfig] = field(default_factory=list)
+    # Per-state physical/role metadata (object.yaml `meta:`): where the
+    # object is, which subsystem works on it, rotation requests, ...
+    # The engine treats it as opaque; consumers (pipeline controller) read it.
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,6 +59,11 @@ class StateMachineConfig:
     name: str = ""
     initial_state: str = "idle"
     states: Dict[str, StateConfig] = field(default_factory=dict)
+    # Top-level `metadata:` section (workflow lifecycle rules in
+    # workflow.yaml, machine layout / task chains in object.yaml, sim
+    # timings and reporting roles in subsystem YAMLs). Opaque to the
+    # engine; consumers read the keys they know.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, config_path: str | Path) -> "StateMachineConfig":
@@ -74,13 +83,39 @@ class StateMachineConfig:
                 name=state_name,
                 description=state_data.get("description", ""),
                 transitions=transitions,
+                meta=state_data.get("meta", {}) or {},
             )
 
         return cls(
             name=data.get("name", ""),
             initial_state=data.get("initial_state", "idle"),
             states=states,
+            metadata=data.get("metadata", {}) or {},
         )
+
+    @property
+    def final_states(self) -> List[str]:
+        """States with no outgoing transitions (the journey's endpoints).
+
+        Used to derive the object workflow's final state(s) instead of
+        hardcoding 'object_analyzed' (docs/CONFIG_CHANGE_GUIDE.md, R6).
+        """
+        return [s for s, c in self.states.items() if not c.transitions]
+
+    def event_to(self, source: str, target: str) -> Optional[str]:
+        """Return the event that leads from `source` to `target`.
+
+        Like the engine's current-state helper, but for an explicit source
+        state (the sim uses it to derive its self-init / completion events
+        from the configured `ready` state instead of hardcoding them).
+        """
+        state = self.states.get(source)
+        if state is None:
+            return None
+        for t in state.transitions:
+            if t.target == target:
+                return t.event
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the state machine definition (for the frontend).
@@ -102,6 +137,9 @@ class StateMachineConfig:
                 }
                 for state_name, state in self.states.items()
             },
+            # The GUI derives the operator button matrix from the workflow
+            # SM definition + this metadata (docs/CONFIG_CHANGE_GUIDE.md, F1).
+            "metadata": self.metadata,
         }
 
 

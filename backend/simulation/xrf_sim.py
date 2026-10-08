@@ -19,4 +19,4 @@ if str(_PROJECT_ROOT) not in sys.path:
 from backend.simulation.subsystem_sim import main  # noqa: E402
 
 if __name__ == "__main__":
-    main("xrf", default_num_objects=0)
+    main()
