@@ -241,8 +241,12 @@ metadata:
 
 | Hook | When it runs |
 |---|---|
-| `startup` | orchestrator start; workflow start (a subsystem left `stopped` gets its interface back before the wake transition); SIM→REAL toggle — **skipped while a simulated process serves the subsystem** |
-| `shutdown` | the subsystem reports entering the `stopped` state (fire-and-forget, never blocks the MQTT receive path); orchestrator shutdown (waited, 5 s timeout) |
+| `startup` | **when the workflow starts** (`start_requested` — before the wake transitions are sent). Launching the GUI does *not* power the subsystems. Also on a SIM→REAL toggle. Skipped while a simulated process serves the subsystem, and skipped while the interface is already up (subsystems left `stopped` with a shut-down interface are relaunched here too) |
+| `shutdown` | when the workflow **reaches its stop state** (the operator Stop button or the automatic end-of-run stop; fire-and-forget) and at orchestrator shutdown, i.e. when the GUI closes (waited, 5 s timeout) |
+
+A subsystem *reporting* the `stopped` state only marks its interface down
+(no script) so the bookkeeping stays honest; the script itself belongs to
+the workflow stop and the GUI shutdown.
 
 **Rules:**
 - `enabled: false` (or no `interface` section at all) → the orchestrator never touches the interface (backwards compatible).

@@ -1305,13 +1305,15 @@ def _wait_for_condition(check, timeout_s: float, interval_s: float = 0.2) -> boo
     return check()
 
 
-def test_interface_scripts() -> None:
+async def test_interface_scripts() -> None:
     """Test: the orchestrator launches and stops a subsystem's real interface.
 
     The subsystem YAML declares headless shell commands under
-    metadata.interface (R11): startup runs when the interface is needed
-    (here: at orchestrator start), shutdown runs when the subsystem
-    reports entering the stopped state.
+    metadata.interface (R11). The lifecycle follows the *workflow*, not
+    the GUI process: launching the orchestrator starts nothing, the
+    startup script runs when the operator starts the workflow, and the
+    shutdown script runs when the workflow reaches its stop state (the
+    Stop button) — plus at orchestrator shutdown.
     """
     logger.info("--- TEST 16: Real-interface scripts (metadata.interface) ---")
 
@@ -1342,42 +1344,41 @@ def test_interface_scripts() -> None:
         runner = OrchestratorRunner(config_path, subsystems_dir, use_simulation=False)
         runner.start()
         try:
+            # Launching the GUI must NOT power the subsystems.
+            time.sleep(2.0)
+            results.check(
+                not marker.exists(),
+                "GUI launch starts no interface (no startup marker yet)",
+            )
+
+            # Operator starts the workflow: the interface startup script runs.
+            ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+            await ws_client.connect()
+            await ws_client.send_command("start_workflow")
+            await ws_client.receive()
             results.check(
                 _wait_for_condition(
                     lambda: marker.exists() and "up" in marker.read_text(), 10.0
                 ),
-                "Startup script ran when the orchestrator started (marker has 'up')",
-            )
-            results.check(
-                "up" in marker.read_text() and "down" not in marker.read_text(),
-                "Shutdown script did not run yet",
+                "Startup script ran when the workflow started (marker has 'up')",
             )
 
-            # Report the subsystem as stopped (the transition a workflow
-            # stop produces): the shutdown script must run exactly once.
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 10)
-            client.loop_start()
-            client.publish(
-                f"{TOPIC_SUBSYSTEM}/raman/status",
-                json.dumps({"state": "stopped", "name": "raman"}),
-                qos=1,
-            )
-            time.sleep(0.5)
-            client.loop_stop()
-            client.disconnect()
-
+            # Operator presses Stop: the workflow reaches its stop state and
+            # the shutdown script runs (once).
+            await ws_client.send_command("stop_workflow")
+            await ws_client.receive()
             results.check(
                 _wait_for_condition(
                     lambda: marker.exists() and "down" in marker.read_text(), 10.0
                 ),
-                "Shutdown script ran when the subsystem reported stopped",
+                "Shutdown script ran when the workflow stopped (Stop button)",
             )
             content = marker.read_text()
             results.check(
                 content.count("up") == 1 and content.count("down") == 1,
                 f"Startup/shutdown each ran exactly once (marker: {content!r})",
             )
+            await ws_client.ws.close()
         finally:
             runner.stop()
 
@@ -2262,7 +2263,7 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         time.sleep(1)
         test_config_service()
         time.sleep(1)
-        test_interface_scripts()
+        await test_interface_scripts()
         time.sleep(1)
         await test_debug_mode()
         time.sleep(1)

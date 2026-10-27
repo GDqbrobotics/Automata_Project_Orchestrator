@@ -2,7 +2,7 @@
 name: rotating_platform
 display_name: Rotating Platform
 type: platform
-mqtt_topic: "automata/subsystem/{name}"
+mqtt_topic: automata/subsystem/{name}
 initial_state: initializing
 required: true
 metadata:
@@ -13,6 +13,8 @@ metadata:
   work_durations:
     rotating: 2.0
 
+  interface:
+    enabled: false
 states:
   initializing:
     description: "Subsystem is initializing"

@@ -154,6 +154,11 @@ over an already-running instance (port conflict) is intentional.
 
 ### Using the GUI
 
+The dashboard is a single dark, operator-focused screen: a control deck
+(workflow state, run progress, transport-style buttons), object and
+subsystem card grids, and a monospace event log — all styled from one set
+of design tokens (`frontend/src/styles/app.css`).
+
 - **Control deck** — Start, Pause, Resume, Stop and Reset the workflow.
 - **Subsystem cards** — the live state of every subsystem. Clicking a card
   opens its *inspector*: a graphical view of that subsystem's state machine
@@ -189,11 +194,11 @@ over an already-running instance (port conflict) is intentional.
 - **Real-interface scripts** — a subsystem YAML can declare
   `metadata.interface` (enable + startup/shutdown command, editable in the
   wizard's Basics tab). The orchestrator runs the startup command
-  **headless** when the subsystem's interface is needed (launch, run start
-  after a stop, SIM→REAL toggle) and the shutdown command when the
-  subsystem reports `stopped`; from then on the subsystem state is known
-  through MQTT only. Output lands in `backend/interface_logs/<name>.log`
-  and every launch/stop shows up in the event log.
+  **headless when the workflow starts** (not when the GUI is launched) so
+  the subsystems can boot and report over MQTT, and the shutdown command
+  when the workflow stops (Stop button or end of a run) or when the GUI
+  closes. Output lands in `backend/interface_logs/<name>.log` and every
+  launch/stop shows up in the event log.
 
 ## Configuration
 

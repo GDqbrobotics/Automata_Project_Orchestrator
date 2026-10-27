@@ -551,10 +551,15 @@ export class App {
     if (!log) return;
     log.innerHTML = '';
 
+    if (this.state.logs.length === 0) {
+      log.appendChild(el('div', 'log-empty', 'No events yet'));
+      return;
+    }
+
     for (const entry of this.state.logs) {
       const row = el('div', 'log-entry');
       row.appendChild(el('span', 'log-time', entry.time));
-      row.appendChild(el('span', 'log-source', `[${entry.source}]`));
+      row.appendChild(el('span', 'log-source', entry.source));
       row.appendChild(el('span', `log-msg ${entry.level}`, entry.message));
       log.appendChild(row);
     }

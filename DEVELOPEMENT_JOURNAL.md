@@ -22,7 +22,32 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - The orchestrator's local **subsystem SM is a mirror, not a predictor**: issuing a command does NOT advance it (real subsystems lag); it only follows the state the subsystem reports over MQTT. An expected-state **discrepancy check** warns if a subsystem never reports the state it was commanded into (window: `orchestration.state_expect_timeout` in `global.yaml`, default 10 s).
 - **The YAML is the single source of truth** (docs/CONFIG_CHANGE_GUIDE.md, implemented 2026-10-08): no state/event names, subsystem names, topics, durations or button rules are hardcoded in Python or TypeScript. The GUI derives its operator-button matrix, state-machine graphs, tones and display vocabulary from the same YAML, broadcast at startup; a rename in `backend/config/` is a config-only change.
 
-## Latest changes (2026-10-27 — subsystem real-interface scripts)
+## Latest changes (2026-10-27 — UI polish pass)
+
+A CSS-only aesthetic pass over the operator dashboard (no behavior
+changes; all class names and the YAML-driven derivation rules stay).
+
+- Refreshed design tokens: refined dark palette with an elevation ladder
+  (`surface` → `surface-4`), soft shadows, one focus ring, Inter/system
+  font stack, tabular numerals, `prefers-reduced-motion` support.
+- Top bar is now an elevated toolbar (brand tile + uppercase subtitle);
+  panel headers got an accent tick and right-aligned count chips; buttons
+  use inline SVG icons and gradient/raised styling; the event log renders
+  the source as a chip (no more `[brackets]`) with an empty-state hint.
+- **Fixed a pre-existing layout bug**: `.panel { display: flex }` was
+  defined *after* `.control-panel { display: grid }` with equal
+  specificity, so the control deck's three-column grid never applied and
+  state/progress/actions always stacked vertically. The deck now uses
+  `.panel.control-panel` (and the ≤1100px override matches) — the deck
+  finally renders as designed.
+- Modal/wizard polish: stronger backdrop blur, deeper shadows, hover and
+  focus rings on inputs. Object-card top row wraps so long IDs stay
+  readable next to long state names.
+- Verified with headless-Chrome screenshots at 1680/1280/900 px widths,
+  idle and mid-run, including the inspector modal and the wizard.
+  Backend suite still **203/203** (backend untouched); `npm run build` clean.
+
+## Earlier changes (2026-10-27 — subsystem real-interface scripts)
 
 A real subsystem cannot initialize until its interface (ROS node, device
 daemon, …) runs. The subsystem YAML can now declare the commands that
@@ -32,15 +57,15 @@ start and stop that interface (`metadata.interface`, R11 in
 `backend/interface_logs/<name>.log` — because from that moment the
 subsystem state is known through MQTT only (`backend/services/interface_manager.py`).
 
-- `startup` runs when the interface is needed: at orchestrator start,
-  at workflow start (a subsystem left `stopped` gets its interface back
-  before the wake transition) and on a SIM→REAL toggle; always skipped
-  while a simulated process serves the subsystem.
-- `shutdown` runs when the subsystem reports entering `stopped`
-  (fire-and-forget so the MQTT receive path never blocks) and, waited on
-  with a 5 s timeout, at orchestrator shutdown; a still-alive tracked
-  startup process is terminated best-effort so no orphan interface
-  survives.
+- The lifecycle follows the **workflow, not the GUI process**: `startup`
+  runs when the operator starts the workflow (a subsystem left `stopped`
+  gets its interface back before the wake transition) and on a SIM→REAL
+  toggle — launching the GUI starts nothing; `shutdown` runs when the
+  workflow reaches its stop state (the Stop button or the automatic
+  end-of-run stop, fire-and-forget) and, waited on with a 5 s timeout,
+  when the GUI closes. A subsystem reporting `stopped` only marks its
+  interface down (no script). A still-alive tracked startup process is
+  terminated best-effort so no orphan interface survives.
 - Values are shell command lines (a launcher that spawns a daemon and
   exits is as valid as a long-running process); scripts must be
   idempotent; relative paths resolve against the project root; validation

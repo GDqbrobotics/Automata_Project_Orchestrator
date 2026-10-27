@@ -187,11 +187,42 @@ class InterfaceProcessManager:
             logger.info("[interface] interface of %s is down (ran shutdown: %s)", name, ran)
         return ran
 
-    def stop_all(self, configs: Dict[str, InterfaceConfig]) -> None:
-        """Shut down every interface the manager believes to be up."""
+    def mark_down(self, name: str) -> None:
+        """Mark the interface down *without* running any script.
+
+        Used when a subsystem itself reports the stopped state: the
+        shutdown script belongs to the workflow stop (Stop button, end of
+        run) and to the orchestrator shutdown — this only keeps the
+        up/down bookkeeping honest so the next workflow start relaunches
+        the interface if needed. A tracked startup process that is still
+        alive is terminated best-effort.
+        """
+        was_up = self._up.get(name)
+        self._up[name] = False
+        proc = self._procs.pop(name, None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                logger.info(
+                    "[interface] terminated startup process of %s (pid %s)",
+                    name,
+                    proc.pid,
+                )
+            except Exception:  # noqa: BLE001 — already gone / not ours anymore
+                pass
+        if was_up:
+            logger.info("[interface] interface of %s marked down (reported stopped)", name)
+
+    def stop_all(self, configs: Dict[str, InterfaceConfig], wait: bool = False) -> None:
+        """Shut down every interface the manager believes to be up.
+
+        ``wait=False`` (workflow stop) is fire-and-forget so the command
+        never blocks the caller; ``wait=True`` (orchestrator shutdown)
+        waits briefly for each stop script.
+        """
         for name in sorted(self._up):
             if self._up.get(name):
-                self.shutdown(name, configs.get(name) or InterfaceConfig(), wait=True)
+                self.shutdown(name, configs.get(name) or InterfaceConfig(), wait=wait)
 
     # -- internals -----------------------------------------------------
 

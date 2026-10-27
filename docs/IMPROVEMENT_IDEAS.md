@@ -216,3 +216,16 @@ entries (e.g. warm-up on `ready`, teardown on `error`), add an optional
 `on_enter` script to the state editor instead of special-casing states in
 Python — but keep the interface pair in `metadata.interface`, where the
 orchestrator's proactive launch semantics live.
+
+## 18. Theme variants from the design tokens (low effort, low priority)
+
+After the UI polish pass the whole dashboard is styled from the `:root`
+token block in `frontend/src/styles/app.css` (palette, elevation, radii,
+fonts) — every component derives from it.
+
+**Idea:** a second token set (light / high-contrast operator mode for
+bright lab environments, or a colorblind-safe status palette) is now a
+matter of swapping the `:root` block — e.g. a `data-theme` attribute on
+`<body>` plus a small picker persisted in `localStorage`. No component
+CSS would need to change; the only caution is keeping the backend-driven
+tones (F3) legible in both themes.

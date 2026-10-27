@@ -619,9 +619,12 @@ class WorkflowOrchestrator:
         # Simulation mode: make sure the simulated subsystem processes
         # that are toggled on are actually running (restart any that died).
         self._ensure_simulated_processes_running()
-        # Real interfaces: (re)start any that are down — e.g. they were
-        # shut down when the subsystems stopped after the last run — so
-        # a stopped subsystem can wake and report again (R11).
+        # Real interfaces (R11): this is where the interface startup
+        # scripts run — when the *workflow* starts, not when the GUI is
+        # launched. Subsystems whose interface is already up are skipped;
+        # the ones that need to boot (still initializing, or stopped with
+        # their interface shut down after the previous run) get it launched
+        # headless, so they can initialize and report over MQTT.
         self._ensure_interfaces_running()
         # Always clear previous state before starting a new workflow.
         # This handles starting from stopped, error, or idle.
@@ -827,6 +830,20 @@ class WorkflowOrchestrator:
             if name in self._simulated:
                 continue
             self._interfaces.ensure_started(name, self._interface_config(name))
+
+    def _shutdown_interfaces(self, wait: bool) -> None:
+        """Run the shutdown script of every interface that is up (R11).
+
+        Triggered when the workflow reaches its stop state (the operator
+        Stop button or the automatic end-of-run stop) and when the
+        orchestrator shuts down (GUI closed)."""
+        self._interfaces.stop_all(
+            {
+                name: InterfaceConfig.from_metadata(adapter.metadata)
+                for name, adapter in self.adapters.items()
+            },
+            wait=wait,
+        )
 
     def _interface_config(self, name: str) -> InterfaceConfig:
         adapter = self.adapters.get(name)
@@ -1602,20 +1619,19 @@ class WorkflowOrchestrator:
         # re-sent to the frontend on every status broadcast).
         self._refresh_subsystem_info(subsystem_name)
 
-        # A subsystem entering the stopped state shuts its real interface
-        # down (metadata.interface.shutdown, R11): the next run starts it
-        # again before the wake transition. Simulated subsystems have no
-        # interface to manage. Fire-and-forget: this runs on the MQTT
-        # receive path and must never block message handling.
+        # A subsystem reporting the stopped state only marks its interface
+        # down — the shutdown script itself runs when the workflow reaches
+        # its stop state (Stop button / end of run) or the GUI closes
+        # (R11). Marking down keeps the manager honest: the next workflow
+        # start relaunches the interface of a subsystem left stopped.
+        # Simulated subsystems have no interface to manage.
         if (
             state_str == SubsystemState.STOPPED.value
             and was_state is not None
             and was_state != SubsystemState.STOPPED.value
             and subsystem_name not in self._simulated
         ):
-            self._interfaces.shutdown(
-                subsystem_name, self._interface_config(subsystem_name), wait=False
-            )
+            self._interfaces.mark_down(subsystem_name)
 
         self._fire_frontend_event(
             BackendEvent.SUBSYSTEM_STATUS_UPDATED.value,
@@ -1797,6 +1813,13 @@ class WorkflowOrchestrator:
         )
         # Notify the pipeline controller (it starts/stops dispatching)
         self._pipeline.on_workflow_state(new_state)
+        # Real interfaces (R11): reaching the workflow's stop state — the
+        # operator Stop button or the automatic end-of-run stop — shuts the
+        # interfaces down again (fire-and-forget: this runs on whichever
+        # thread drove the transition). The orchestrator shutdown path
+        # (stop()) shuts them down waited-on instead.
+        if new_state == self.workflow_names.stop_state:
+            self._shutdown_interfaces(wait=False)
         # Broadcast full status including objects for the frontend
         self.frontend.broadcast_with_display_config(self._status)
 
@@ -2110,9 +2133,10 @@ class WorkflowOrchestrator:
                 "Simulation mode: %d of %d subsystems simulated",
                 len(self._simulated), len(self.adapters),
             )
-        # Real interfaces (metadata.interface, R11): start them headless
-        # so the subsystems can boot and report their state over MQTT.
-        self._ensure_interfaces_running()
+        # NOTE (R11): the real interfaces are deliberately NOT started here.
+        # Launching the GUI must not power the subsystems; their interface
+        # scripts run when the workflow starts (see _handle_start) and stop
+        # when the workflow reaches its stop state or the GUI closes.
         # (Re)connecting clients get a FRESH full status (built from the
         # live subsystem snapshots) instead of the cached last broadcast.
         self.frontend.set_status_callback(lambda: self._status)
@@ -2153,15 +2177,9 @@ class WorkflowOrchestrator:
         if self._sim_procs is not None:
             self._sim_procs.stop_all()
         # Shut the managed real interfaces down (metadata.interface, R11):
-        # the shutdown script runs (waited on) when configured, otherwise
-        # a still-alive startup process is terminated, so a stopped
+        # the GUI closing stops them too — waited on here, so a stopped
         # orchestrator leaves no orphan interface behind.
-        self._interfaces.stop_all(
-            {
-                name: InterfaceConfig.from_metadata(adapter.metadata)
-                for name, adapter in self.adapters.items()
-            }
-        )
+        self._shutdown_interfaces(wait=True)
         # Cancel any pending expected-state timers so they do not fire
         # (and warn) after the orchestrator has shut down.
         self._clear_all_subsystem_expected()

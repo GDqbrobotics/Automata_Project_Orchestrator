@@ -3,6 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#0a0d13" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2 22 12 12 22 2 12Z' fill='none' stroke='%235b8def' stroke-width='2.4'/%3E%3Ccircle cx='12' cy='12' r='3.4' fill='%235b8def'/%3E%3C/svg%3E" />
   <title>AUTOMATA – GUI Orchestrator</title>
 </head>
 <body>
@@ -12,7 +15,7 @@
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="22" height="22">
+          <svg viewBox="0 0 24 24" width="20" height="20">
             <path d="M12 2 22 12 12 22 2 12Z" fill="none" stroke="currentColor" stroke-width="2" />
             <circle cx="12" cy="12" r="3.2" fill="currentColor" />
           </svg>
@@ -29,7 +32,12 @@
           hidden
           title="Configuration wizard (debug mode): edit workflow, subsystems and MQTT message formats"
         >
-          <span aria-hidden="true">⚙</span> Configuration wizard
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14">
+            <path d="M4 8h8M17.5 8H20M4 16h3M12.5 16H20" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+            <circle cx="14.5" cy="8" r="2.4" fill="none" stroke="currentColor" stroke-width="2" />
+            <circle cx="9.5" cy="16" r="2.4" fill="none" stroke="currentColor" stroke-width="2" />
+          </svg>
+          Configuration wizard
         </button>
         <div class="connection-indicator" role="status">
           <span class="connection-dot" id="connectionDot"></span>
@@ -40,12 +48,12 @@
 
     <!-- ── Control deck ────────────────────────────────────────────── -->
     <section class="panel control-panel" aria-label="Workflow control">
-      <div class="control-state">
+      <div class="control-state" data-label="Workflow state">
         <div class="state-badge idle" id="stateBadge">idle</div>
         <p class="workflow-message" id="workflowMessage">Waiting for operator input</p>
       </div>
 
-      <div class="control-progress">
+      <div class="control-progress" data-label="Run progress">
         <div class="progress-head">
           <span class="progress-label" id="progressLabel">Progress: 0 / 0</span>
           <span class="progress-pct" id="progressPct">0%</span>
@@ -57,14 +65,32 @@
 
       <div class="control-actions">
         <div class="actions">
-          <button class="btn btn-primary" id="btnStart">▶ Start</button>
-          <button class="btn btn-warning" id="btnPause" disabled>⏸ Pause</button>
-          <button class="btn btn-success" id="btnResume" disabled>⏵ Resume</button>
-          <button class="btn btn-danger" id="btnStop">⏹ Stop</button>
+          <button class="btn btn-primary" id="btnStart">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="13" height="13"><path d="M8 5.2v13.6L19 12z" fill="currentColor"/></svg>
+            Start
+          </button>
+          <button class="btn btn-warning" id="btnPause" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="13" height="13"><path d="M8 5h3.2v14H8zM12.8 5H16v14h-3.2z" fill="currentColor"/></svg>
+            Pause
+          </button>
+          <button class="btn btn-success" id="btnResume" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="13" height="13"><path d="M8 5.2v13.6L19 12z" fill="currentColor"/></svg>
+            Resume
+          </button>
+          <button class="btn btn-danger" id="btnStop">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="13" height="13"><rect x="6.4" y="6.4" width="11.2" height="11.2" rx="1.6" fill="currentColor"/></svg>
+            Stop
+          </button>
         </div>
         <div class="actions actions-aux">
-          <button class="btn btn-ghost" id="btnReset" disabled>↺ Reset</button>
-          <button class="btn btn-ghost" id="btnStatus">⟳ Refresh status</button>
+          <button class="btn btn-ghost" id="btnReset" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="12" height="12"><path d="M3.5 12a8.5 8.5 0 1 0 2.7-6.2M3.5 4.2v4.6h4.6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Reset
+          </button>
+          <button class="btn btn-ghost" id="btnStatus">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="12" height="12"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6M20.5 3.6v4.8h-4.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Refresh status
+          </button>
         </div>
       </div>
 
