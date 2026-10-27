@@ -41,6 +41,12 @@ const submitAlias = (): void => {
   app.assignAlias(objectId, alias);
   if (input) input.value = '';
 };
+// Configuration wizard (debug mode only; the button is revealed by the
+// backend's debug flag broadcast with the workflow status).
+document.getElementById('btnConfigWizard')?.addEventListener('click', () => {
+  app.openConfigWizard();
+});
+
 document.getElementById('aliasBtn')?.addEventListener('click', submitAlias);
 document.getElementById('aliasInput')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') submitAlias();

@@ -55,6 +55,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import yaml  # noqa: E402
 
 from backend.domain.models import GlobalConfig  # noqa: E402
+from backend.messaging.message_format import MessageFormatSet  # noqa: E402
 from backend.messaging.mqtt_client import MqttClient, TOPIC_SUBSYSTEM  # noqa: E402
 from backend.state.state_machine import StateMachineConfig  # noqa: E402
 from backend.state.state_machine import StateMachineEngine, StateMachineError  # noqa: E402
@@ -115,6 +116,10 @@ class SubsystemSimulator:
 
         # Reporting role (R5): responses published on /response.
         self._reports: List[Dict] = list(metadata.get("reports") or [])
+
+        # MQTT payload formats (mqtt_formats.yaml, R10): the simulator must
+        # speak exactly the shape the orchestrator parses/builds.
+        self._format = MessageFormatSet.load(yaml_path.parent).for_subsystem(name)
 
         self.work_durations: Dict[str, float] = {
             str(k): float(v) for k, v in (metadata.get("work_durations") or {}).items()
@@ -203,7 +208,7 @@ class SubsystemSimulator:
             data = json.loads(payload.decode())
         except (json.JSONDecodeError, AttributeError):
             return
-        event = data.get("event")
+        event = self._format.command.extract_event(data)
         if not event:
             return
         logger.info("[%s] command '%s' received", self.name, event)
@@ -285,11 +290,9 @@ class SubsystemSimulator:
             )
             self.mqtt.publish(
                 self._response_topic,
-                {
-                    "type": rep.get("type", "ok"),
-                    "objects": object_ids,
-                    "count": len(object_ids),
-                },
+                self._format.response.build(
+                    rep.get("type", "ok"), object_ids, len(object_ids)
+                ),
                 qos=1,
             )
 
@@ -364,12 +367,12 @@ class SubsystemSimulator:
     def _publish_status(self) -> None:
         self.mqtt.publish(
             self._status_topic,
-            {
-                "state": self.sm.current_state,
-                "name": self.name,
-                "ready": self.sm.current_state == self._ready_state,
-                "paused": self._paused,
-            },
+            self._format.status.build(
+                state=self.sm.current_state,
+                name=self.name,
+                ready=self.sm.current_state == self._ready_state,
+                paused=self._paused,
+            ),
             qos=1,
         )
 

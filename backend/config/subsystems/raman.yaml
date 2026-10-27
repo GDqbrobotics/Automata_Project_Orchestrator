@@ -14,64 +14,55 @@ metadata:
 
 states:
   initializing:
-    description: "Spectrometer is initializing"
+    description: Spectrometer is initializing
     transitions:
       - event: init_complete
         target: ready
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
   ready:
-    description: "Spectrometer is ready and idle"
+    description: Spectrometer is ready and idle
     transitions:
       - event: measure
         target: measuring
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
   measuring:
-    description: "Spectrometer is performing Raman measurement"
+    description: Spectrometer is performing Raman measurement
     transitions:
       - event: complete
         target: ready
         actions:
           - log_event
-
       - event: stop
         target: stopped
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
   stopped:
-    description: "Spectrometer has stopped"
+    description: Spectrometer has stopped
     transitions:
       - event: ready
         target: ready
         actions:
           - log_event
-
       - event: measure
         target: measuring
         actions:
           - log_event
-
   error:
-    description: "Spectrometer is in error state"
+    description: Spectrometer is in error state
     transitions:
       - event: reset
         target: ready

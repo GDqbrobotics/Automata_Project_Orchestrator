@@ -1,0 +1,56 @@
+# MQTT message payload formats (docs/CONFIG_CHANGE_GUIDE.md, R10)
+#
+# Every payload the orchestrator exchanges with a subsystem is built and
+# parsed through this file — the field mapping layer between the internal
+# event model and what the real hardware actually speaks. Changing a field
+# name here (or adding a per-subsystem override under `subsystems:`) is a
+# configuration-only change: the adapter (publisher), the orchestrator
+# receive path and the simulated subsystem all use the same format, so they
+# can never drift apart.
+#
+# Field names may be dotted paths into nested payloads, e.g. a status
+# report shaped as {"data": {"state": "ready"}} uses `state_field: data.state`.
+#
+# The wizard (debug mode) edits this file through structured forms; the
+# whole document can also be edited by hand like any other config file.
+
+default:
+  # orchestrator -> subsystem: /event (state-machine command)
+  command:
+    event_field: event
+    source_field: source
+    source_value: orchestrator
+    timestamp_field: timestamp
+    include_timestamp: true
+    # Extra constant fields some subsystems expect, e.g. {protocol: v2}
+    static_fields: {}
+  # orchestrator -> subsystem: /event (raw pause/resume hardware commands)
+  hardware_command:
+    event_field: event
+    source_field: source
+    source_value: orchestrator
+    include_timestamp: false
+    static_fields: {}
+  # subsystem -> orchestrator: /status (state report + heartbeat)
+  status:
+    state_field: state
+    ready_field: ready
+    paused_field: paused
+    name_field: name
+  # subsystem -> orchestrator: /response (reports, e.g. object list)
+  response:
+    type_field: type
+    objects_field: objects
+    count_field: count
+
+# Per-subsystem overrides, deep-merged over `default`. Example: a component
+# that reports {"data": {"state": "ready"}} and acknowledges commands with
+# {"cmd": "..."} would use:
+#
+#   subsystems:
+#     some_subsystem:
+#       command:
+#         event_field: cmd
+#       status:
+#         state_field: data.state
+subsystems: {}

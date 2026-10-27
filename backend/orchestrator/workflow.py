@@ -63,16 +63,16 @@ from backend.adapters.subsystem import (
 )
 from backend.domain.models import (
     BackendEvent,
-    Command,
     EventPayload,
     GlobalConfig,
     ObjectInfo,
     SubsystemConfig,
-    SubsystemInfo,
     WorkflowCommand,
     WorkflowStatus,
 )
+from backend.messaging.message_format import MessageFormatSet
 from backend.messaging.mqtt_client import MqttClient
+from backend.services.config_service import ConfigError, ConfigService
 from backend.services.frontend_server import FrontendServer
 from backend.simulation.process_manager import SubsystemProcessManager
 from backend.state.state_machine import StateMachineEngine, StateMachineError
@@ -220,11 +220,18 @@ class WorkflowOrchestrator:
         self.subsystems_config: List[SubsystemConfig] = []
         self._load_subsystems_config(subsystems_config_path)
 
+        # MQTT payload formats (mqtt_formats.yaml, R10): every command the
+        # adapters publish and every report the orchestrator parses goes
+        # through this single field-mapping layer.
+        self.message_formats = MessageFormatSet.load(
+            _PROJECT_ROOT / "backend" / "config"
+        )
         self.adapter_factory = SubsystemAdapterFactory(
             self.mqtt,
             self.subsystems_config,
             config_dir=_PROJECT_ROOT / "backend" / "config" / "subsystems",
             global_config=self._global_config,
+            message_formats=self.message_formats,
         )
         self.adapters: Dict[str, SubsystemAdapter] = self.adapter_factory.get_all()
 
@@ -348,6 +355,47 @@ class WorkflowOrchestrator:
         self.frontend.set_command_handler(
             WorkflowCommand.DEBUG_SEND_SUBSYSTEM_MESSAGE,
             self._handle_debug_send_subsystem_message,
+        )
+        # Configuration wizard (debug mode only): guided editing of the
+        # YAML files under backend/config while the workflow is not running.
+        self.frontend.set_command_handler(
+            WorkflowCommand.GET_CONFIG, self._handle_get_config,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.VALIDATE_CONFIG, self._handle_validate_config,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.PATCH_CONFIG, self._handle_patch_config,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.SAVE_CONFIG, self._handle_save_config,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.CREATE_SUBSYSTEM, self._handle_create_subsystem,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.DELETE_SUBSYSTEM, self._handle_delete_subsystem,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.WRITE_SIMULATOR, self._handle_write_simulator,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.RENDER_MESSAGE_FORMATS,
+            self._handle_render_message_formats,
+        )
+        self.frontend.set_command_handler(
+            WorkflowCommand.RENDER_STATE_MACHINE,
+            self._handle_render_state_machine,
+        )
+
+        # ─── Configuration Wizard ───
+        # Transport-agnostic service behind the commands above: snapshot,
+        # validation, comment-preserving patches, save, add/remove
+        # subsystem and MQTT-format rendering (backend/services/config_service.py).
+        self.config_service = ConfigService(
+            config_dir=_PROJECT_ROOT / "backend" / "config",
+            simulation_dir=_PROJECT_ROOT / "backend" / "simulation",
+            root_dir=_PROJECT_ROOT,
         )
 
         # ─── Debug Mode ───
@@ -478,9 +526,10 @@ class WorkflowOrchestrator:
         (pause/resume): the subsystems receive them on their /event topic and
         handle them locally (e.g. freezing the ongoing work).
         """
-        for name in self.adapters:
-            topic = self.adapters[name].event_topic
-            payload = {"event": command, "source": "orchestrator"}
+        for name, adapter in self.adapters.items():
+            topic = adapter.event_topic
+            # Built through the subsystem's hardware-command format (R10).
+            payload = adapter.message_format.hardware_command.build(command)
             self.mqtt.publish(topic, payload, qos=1)
             self._fire_subsystem_message(name, "sent", topic, payload)
 
@@ -891,22 +940,24 @@ class WorkflowOrchestrator:
                 if adapter.state_machine
                 else adapter.initial_state
             )
+            # Topic descriptors carry the configured field names (R10) so
+            # the GUI's state quick-pick edits the same fields the
+            # orchestrator parses.
+            status_fmt = adapter.message_format.status
+            response_fmt = adapter.message_format.response
             entries: List[Dict[str, Any]] = [
                 {
                     "topic": adapter.status_topic,
                     "kind": "status",
-                    "state_field": "state",
-                    "ready_field": "ready",
+                    "state_field": status_fmt.state_field,
+                    "ready_field": status_fmt.ready_field,
                     "description": (
                         "State report (published by the subsystem on every "
                         "state change + heartbeat)"
                     ),
-                    "default_payload": {
-                        "state": current,
-                        "name": name,
-                        "ready": current == adapter.ready_state,
-                        "paused": False,
-                    },
+                    "default_payload": status_fmt.build(
+                        current, name, current == adapter.ready_state, False
+                    ),
                 },
                 {
                     "topic": adapter.response_topic,
@@ -918,7 +969,7 @@ class WorkflowOrchestrator:
                     "default_payload": (
                         self._report_payload(adapter)
                         if adapter.metadata.get("reports")
-                        else {"type": "ok"}
+                        else response_fmt.build("ok")
                     ),
                 },
             ]
@@ -937,7 +988,10 @@ class WorkflowOrchestrator:
             else 0
         )
         objects = [fmt.format(i=i) for i in range(1, count + 1)]
-        return {"type": rep.get("type", "ok"), "objects": objects, "count": count}
+        # Built through the subsystem's response format (R10).
+        return adapter.message_format.response.build(
+            rep.get("type", "ok"), objects, count
+        )
 
     def _handle_debug_send_subsystem_message(self, data: Dict[str, Any]) -> None:
         """Debug mode: inject an MQTT message on a subsystem's outgoing topic.
@@ -996,6 +1050,212 @@ class WorkflowOrchestrator:
         # orchestrator would never process its injected message.
         self.mqtt.publish(topic, payload, qos=1)
         self._on_mqtt_message(topic, json.dumps(payload).encode())
+
+    # ------------------------------------------------------------------
+    # Configuration wizard (--debug): guided editing of backend/config
+    # ------------------------------------------------------------------
+    def _config_editing_blocked(self) -> Optional[str]:
+        """The message to refuse a wizard operation with (None = allowed).
+
+        Writes are only possible in debug mode and while the workflow is
+        not running: a live run must never race a configuration change
+        (state machines, subsystems and formats are loaded at startup; the
+        wizard always ends with a restart notice).
+        """
+        if not self._debug_mode:
+            return (
+                "Configuration wizard is only available in debug mode "
+                "(start with --debug)"
+            )
+        if self.state_machine.state not in self.workflow_names.toggle_allowed_in:
+            return "Configuration can only be changed before starting the workflow"
+        return None
+
+    def _wizard_error(self, message: str) -> None:
+        self._fire_frontend_event(
+            BackendEvent.ERROR_REPORTED.value, {"message": message}
+        )
+
+    def _handle_get_config(self, data: Dict[str, Any]) -> None:
+        """Wizard step 0: send the editable config snapshot (files + formats)."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        snapshot = self.config_service.snapshot()
+        snapshot["editable"] = True
+        snapshot["debug"] = True
+        self._fire_frontend_event(BackendEvent.CONFIG_SNAPSHOT.value, snapshot)
+
+    def _handle_validate_config(self, data: Dict[str, Any]) -> None:
+        """Wizard: validate a candidate file without writing it."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        path = str(data.get("path") or "")
+        content = data.get("content")
+        if not path or not isinstance(content, str):
+            self._wizard_error("Validation: 'path' and 'content' are required")
+            return
+        errors = self.config_service.validate_content(path, content)
+        self._fire_frontend_event(
+            BackendEvent.CONFIG_VALIDATED.value,
+            {"path": path, "valid": not errors, "errors": errors},
+        )
+
+    def _handle_patch_config(self, data: Dict[str, Any]) -> None:
+        """Wizard: apply structured edits to a buffer (no disk write)."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        path = str(data.get("path") or "")
+        content = data.get("content")
+        patches = data.get("patches") or []
+        if not path or not isinstance(content, str):
+            self._wizard_error("Patch: 'path' and 'content' are required")
+            return
+        try:
+            result = self.config_service.patch_content(path, content, patches)
+        except ConfigError as exc:
+            self._wizard_error(f"Patch failed: {exc}")
+            return
+        self._fire_frontend_event(BackendEvent.CONFIG_PATCHED.value, result)
+
+    def _handle_save_config(self, data: Dict[str, Any]) -> None:
+        """Wizard: validate and write one edited config file."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        path = str(data.get("path") or "")
+        content = data.get("content")
+        if not path or not isinstance(content, str):
+            self._wizard_error("Save: 'path' and 'content' are required")
+            return
+        try:
+            result = self.config_service.save(path, content)
+        except ConfigError as exc:
+            self._wizard_error(f"Save failed for '{path}': {exc}")
+            return
+        result["restart_required"] = True
+        self._fire_frontend_event(BackendEvent.CONFIG_SAVED.value, result)
+        logger.info("[wizard] saved %s", path)
+
+    def _handle_create_subsystem(self, data: Dict[str, Any]) -> None:
+        """Wizard: stage a new subsystem YAML from a guided spec."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        spec = data.get("spec")
+        if not isinstance(spec, dict):
+            self._wizard_error("Create subsystem: missing 'spec'")
+            return
+        try:
+            result = self.config_service.create_subsystem(spec)
+        except ConfigError as exc:
+            self._wizard_error(f"Create subsystem failed: {exc}")
+            return
+        result["created"] = True
+        result["restart_required"] = True
+        self._fire_frontend_event(BackendEvent.CONFIG_PATCHED.value, result)
+
+    def _handle_delete_subsystem(self, data: Dict[str, Any]) -> None:
+        """Wizard: delete a subsystem YAML (and optionally its simulator)."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        name = str(data.get("name") or "").strip()
+        if not name:
+            self._wizard_error("Delete subsystem: missing 'name'")
+            return
+        # A deleted subsystem must not keep publishing from a simulated
+        # process; the orchestrator's in-memory view is rebuilt on restart.
+        if self._sim_procs is not None and self._sim_procs.is_running(name):
+            self._sim_procs.stop(name)
+            self._simulated.discard(name)
+        try:
+            result = self.config_service.delete_subsystem(
+                name,
+                delete_simulator=bool(data.get("delete_simulator", True)),
+            )
+        except ConfigError as exc:
+            self._wizard_error(f"Delete subsystem failed: {exc}")
+            return
+        result["restart_required"] = True
+        self._fire_frontend_event(BackendEvent.SUBSYSTEM_DELETED.value, result)
+        logger.info("[wizard] deleted subsystem %s", name)
+
+    def _handle_write_simulator(self, data: Dict[str, Any]) -> None:
+        """Wizard: write the one-line simulator script of a new subsystem."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        name = str(data.get("name") or "").strip()
+        if not name:
+            self._wizard_error("Simulator: missing 'name'")
+            return
+        try:
+            result = self.config_service.write_simulator(name)
+        except ConfigError as exc:
+            self._wizard_error(f"Simulator creation failed: {exc}")
+            return
+        result["restart_required"] = True
+        self._fire_frontend_event(BackendEvent.CONFIG_SAVED.value, result)
+
+    def _handle_render_state_machine(self, data: Dict[str, Any]) -> None:
+        """Wizard: rebuild a file's `states:` block from the structured editor.
+
+        Payload: {command, path, content, states, initial_state?}. The raw
+        text (header comments included) is preserved; only the state machine
+        is re-serialized. Nothing is written: the wizard keeps the result as
+        its unsaved buffer and saves it in the review step.
+        """
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        path = str(data.get("path") or "")
+        content = data.get("content")
+        states = data.get("states")
+        initial_state = data.get("initial_state")
+        if not path or not isinstance(content, str) or not isinstance(states, dict):
+            self._wizard_error(
+                "State machine: 'path', 'content' and 'states' are required"
+            )
+            return
+        if initial_state is not None and not isinstance(initial_state, str):
+            self._wizard_error("State machine: 'initial_state' must be a string")
+            return
+        try:
+            result = self.config_service.render_state_machine(
+                path, content, states, initial_state
+            )
+        except ConfigError as exc:
+            self._wizard_error(f"State machine failed: {exc}")
+            return
+        self._fire_frontend_event(BackendEvent.CONFIG_PATCHED.value, result)
+
+    def _handle_render_message_formats(self, data: Dict[str, Any]) -> None:
+        """Wizard: rebuild mqtt_formats.yaml from the structured form."""
+        blocked = self._config_editing_blocked()
+        if blocked:
+            self._wizard_error(blocked)
+            return
+        formats = data.get("formats")
+        if not isinstance(formats, dict):
+            self._wizard_error("Message formats: missing 'formats'")
+            return
+        try:
+            result = self.config_service.render_message_formats(formats)
+        except ConfigError as exc:
+            self._wizard_error(f"Message formats failed: {exc}")
+            return
+        self._fire_frontend_event(BackendEvent.CONFIG_PATCHED.value, result)
 
     # ------------------------------------------------------------------
     # Workflow Helpers
@@ -1215,15 +1475,23 @@ class WorkflowOrchestrator:
                     return
 
             # Subsystem responses (e.g. the box scanner's object list after
-            # a scan). Only the declared report types are acted on (R5);
-            # every other response is logged.
+            # a scan). The payload is decoded through the subsystem's
+            # configured response format (R10); only the declared report
+            # types are acted on (R5), every other response is logged.
             if kind == "response" and isinstance(data, dict):
-                if data.get("type") in self._report_types:
+                adapter = self.adapters.get(name)
+                response_fmt = (
+                    adapter.message_format.response
+                    if adapter is not None
+                    else MessageFormatSet().default.response
+                )
+                report_type, report_objects, _ = response_fmt.extract(data)
+                if report_type in self._report_types:
                     logger.info(
                         "Report '%s' from subsystem: %s",
-                        data.get("type"), data.get("objects"),
+                        report_type, report_objects,
                     )
-                    self._pipeline.on_objects_detected(data.get("objects") or [])
+                    self._pipeline.on_objects_detected(report_objects)
                 return
 
             # Status reports (state sync + pipeline).
@@ -1262,7 +1530,11 @@ class WorkflowOrchestrator:
         if subsystem_name not in self.adapters:
             return
         adapter = self.adapters[subsystem_name]
-        state_str = str(data.get("state", "")).lower()
+        # The reported state field comes from the subsystem's status format
+        # (mqtt_formats.yaml, R10).
+        state_str = str(
+            adapter.message_format.status.extract_state(data) or ""
+        ).lower()
         try:
             state = SubsystemState(state_str)
         except ValueError:

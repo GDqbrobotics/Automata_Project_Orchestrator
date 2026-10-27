@@ -8,6 +8,7 @@ import { FrontendClient } from '../api/client.js';
 import { createInitialState, reduceState, type UiState } from '../state/store.js';
 import { StateMachineModal } from './state-machine-modal.js';
 import type { ModalData, ModalKind } from './state-machine-modal.js';
+import { ConfigWizard } from './config-wizard.js';
 import { buildStateStyles, getTotalSteps } from '../config/object-styles.js';
 import { deriveButtonRules } from '../config/operator-buttons.js';
 import { getStateMessage } from '../config/state-messages.js';
@@ -59,11 +60,17 @@ export class App {
   private onStateChange?: (state: WorkflowStateType) => void;
   private detailModal: StateMachineModal;
   private detailRef: { kind: ModalKind; id: string } | null = null;
+  private configWizard: ConfigWizard;
 
   constructor(config: AppConfig = {}) {
     this.client = new FrontendClient(config.wsUrl || 'ws://localhost:8080');
     this.onStateChange = config.onStateChange;
     this.detailModal = new StateMachineModal();
+    // Configuration wizard: debug mode only. It owns its own DOM/state and
+    // receives the backend's config_* messages directly (below).
+    this.configWizard = new ConfigWizard(document.body, (command, data) =>
+      this.client.send(command, data),
+    );
   }
 
   start(): void {
@@ -87,6 +94,9 @@ export class App {
 
     this.state = reduceState(this.state, msg);
     this.render();
+    // The wizard handles the config_* events itself so its unsaved buffers
+    // survive the live status broadcasts that re-render the rest of the UI.
+    this.configWizard.onBackendMessage(msg);
 
     if (this.onStateChange) {
       this.onStateChange(this.state.workflowState);
@@ -95,6 +105,16 @@ export class App {
 
   sendCommand(cmd: WorkflowCommand): void {
     this.client.send(cmd);
+  }
+
+  /**
+   * Open the configuration wizard (debug mode only).
+   * It is gated on the debug flag broadcast by the backend (--debug), the
+   * same flag that reveals its top-bar button.
+   */
+  openConfigWizard(): void {
+    if (!this.state.debug?.enabled) return;
+    this.configWizard.open();
   }
 
   /** Assign (or replace) the operator alias ID of an object. */
@@ -146,6 +166,7 @@ export class App {
 
   // UI rendering
   private render(): void {
+    this.updateWizardButton();
     this.updateStateBadge();
     this.updateWorkflowMessage();
     this.updateProgress();
@@ -231,6 +252,15 @@ export class App {
   // ------------------------------------------------------------------
   // Panel updates
   // ------------------------------------------------------------------
+
+  /** Show the wizard button only when the backend runs with --debug. */
+  private updateWizardButton(): void {
+    const btn = document.getElementById('btnConfigWizard') as HTMLButtonElement | null;
+    if (!btn) return;
+    const enabled = Boolean(this.state.debug?.enabled);
+    btn.hidden = !enabled;
+    btn.disabled = !enabled;
+  }
 
   private updateStateBadge(): void {
     const badge = document.getElementById('stateBadge');

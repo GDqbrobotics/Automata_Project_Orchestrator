@@ -8,7 +8,10 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 
 - Launch everything: `python launch_gui.py --simulation --num-objects 3` (UI on http://localhost:3000; starts mosquitto + backend + frontend — in simulation mode the *backend* starts the `backend/simulation/*_sim.py` processes itself)
 - Per-subsystem simulation toggle: in simulation mode each subsystem card has a **SIM/REAL** chip (before starting the workflow) to decide which subsystems are simulated and which are real
-- Debug mode: `python launch_gui.py --debug` — subsystem inspector windows gain a panel to manually send the MQTT messages a real subsystem would publish (user-driven simulation)
+- Debug mode: `python launch_gui.py --debug` — subsystem inspector windows gain a panel to manually send the MQTT messages a real subsystem would publish (user-driven simulation), and the top bar reveals the **configuration wizard**
+- MQTT payload formats are configurable: `backend/config/mqtt_formats.yaml` maps every message kind to payload fields, with per-subsystem overrides (R10, `backend/messaging/message_format.py`); the adapters, the orchestrator receive path and the simulated subsystems all build/parse through it
+- Configuration wizard (debug mode only): 4 steps — workflow/global/object YAML, subsystem edit/add/remove, MQTT formats, review & save; backend `backend/services/config_service.py` validates, comment-preservingly patches and atomically writes, so the browser never touches files
+- Validation: `timeout 500 python backend/simulation_test.py` — 151 tests + 28 new checks (C14 message formats, C15 config service, wizard checks in C12); frontend `npm run build` clean
 - Validate: `timeout 500 python backend/simulation_test.py` — **always wrap in a timeout** (a bug can make it hang forever)
 - All state machines are YAML-driven: `backend/config/workflow.yaml`, `object.yaml`, `subsystems/*.yaml`, `global.yaml`. Simulated subsystems load the *same* YAML as the orchestrator. Work durations live in the subsystem YAML metadata (`work_durations`).
 - The object flow is driven by `backend/orchestrator/pipeline.py` (PipelineController) from MQTT status reports — identical code path for simulated and real subsystems.
@@ -18,7 +21,73 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - The orchestrator's local **subsystem SM is a mirror, not a predictor**: issuing a command does NOT advance it (real subsystems lag); it only follows the state the subsystem reports over MQTT. An expected-state **discrepancy check** warns if a subsystem never reports the state it was commanded into (window: `orchestration.state_expect_timeout` in `global.yaml`, default 10 s).
 - **The YAML is the single source of truth** (docs/CONFIG_CHANGE_GUIDE.md, implemented 2026-10-08): no state/event names, subsystem names, topics, durations or button rules are hardcoded in Python or TypeScript. The GUI derives its operator-button matrix, state-machine graphs, tones and display vocabulary from the same YAML, broadcast at startup; a rename in `backend/config/` is a config-only change.
 
-## Latest changes (2026-10-08 — continuous two-object flow: the platform stays full)
+## Latest changes (2026-10-27 — configuration wizard + configurable MQTT formats)
+
+Two additions, both debug-friendly and fully config-driven.
+
+**1. MQTT message formats are now configurable (R10).** New field-mapping
+layer `backend/config/mqtt_formats.yaml` + `backend/messaging/message_format.py`.
+Each message kind (`command`, `hardware_command`, `status`, `response`) maps
+the logical values to payload fields; per-subsystem overrides are deep-merged
+over `default:`, and dotted field names reach nested payloads (`data.state`).
+Integrated in `SubsystemAdapter.fire_transition`/`send_command`,
+`WorkflowOrchestrator._broadcast_command_to_subsystems`/`_update_subsystem_status`/
+`_on_mqtt_message`/`_build_debug_topics`/`_report_payload` and in
+`backend/simulation/subsystem_sim.py`, so orchestrator and sim can never
+drift. Defaults reproduce the previous payloads exactly (151/151 pre-existing
+tests pass unchanged).
+
+**2. Configuration wizard (debug mode).** `⚙` in the top bar (revealed by
+`--debug`, gated server-side on debug + workflow-not-running). Four steps:
+workflow metadata/global settings/object blueprint (structured forms that
+apply comment-preserving line patches + raw YAML editor), subsystems
+(basics, a **structured state-machine editor**, addition from a commented
+template, staged removal with reference check), MQTT formats (structured
+fields + per-subsystem overrides), review & save (validate all, sequential
+save, then create simulators / delete staged files). New commands
+`get_config`, `validate_config`, `patch_config`, `save_config`,
+`create_subsystem`, `delete_subsystem`, `write_simulator`,
+`render_message_formats`, `render_state_machine`; new events
+`config_snapshot`, `config_patched`, `config_validated`, `config_saved`,
+`subsystem_deleted`. The browser holds no filesystem access:
+`backend/services/config_service.py` validates (YAML + structural checks),
+patches by line (comments preserved) and writes atomically. A restart is
+always requested after saving.
+
+**2b. State-machine editor (subsystems).** Inside the wizard's Subsystems
+step, a third tab edits the machine as structured data: states (add / remove
+/ description / initial), transitions (event, target) and their actions
+(`log_event`, a fired scoped/internal event, or a raw preserved action).
+`ConfigService.render_state_machine` validates the whole candidate document
+and re-serializes **only the `states:` block** with an indenting dumper;
+the file header (name, metadata and their comments) survives unchanged.
+Pending drafts are rendered automatically at save time (`render_sm` ops in
+the frontend save queue) and everything stays client-side until the Review
+step writes it. The same editor is available for `workflow.yaml` and
+`object.yaml` (Workflow step); for object states it also edits the physical
+`meta` (position, actor, parallel actors, rotate request/command, actor op).
+
+**2c. Completion contract validation (why a run can hang).** Splitting a
+subsystem stage (e.g. `robot_first.measuring_xrf_raman` → `measuring_xrf` +
+`measuring_raman`) only works if **every work state transitions back to the
+ready state**: the pipeline (and the generic simulator) treats a work →
+ready status report as completion, so a work state with no way back stalls
+the object forever. Subsystem transitions also cannot fire internal events
+(`event:` actions are ignored — the engine callback is not wired on either
+the sim or the mirror), so the wizard now rejects them with an explanation.
+`ConfigService` gained the cross-file object validation: actors must be
+configured subsystems with a completion path, positions must match the
+layout, rotate commands must exist, and task chains must reference real
+object events/subsystem commands (see `docs/STATE_MACHINE.md` principle 13
+and R2's completion contract). `simulation_test.py` covers the split journey
+and the new refusals.
+
+- Docs: `docs/CONFIG_CHANGE_GUIDE.md` (R10 + wizard section), `README.md`,
+  `docs/IMPROVEMENT_IDEAS.md` (out-of-scope ideas report).
+- Validation: `timeout 500 python backend/simulation_test.py` → pass
+  (+28 new checks), `cd frontend && npm run build` clean.
+
+## Earlier changes (2026-10-08 — continuous two-object flow: the platform stays full)
 
 The next object now enters the platform as soon as the entry position frees up, instead of waiting for the current object to be completely measured and returned. Apart from the very start and the very end, **two objects are on the rotating platform at all times**: one being measured on the first position, the other being imaged on the second (the newcomer's imaging overlaps the returning object's measurement). The 3-object test run drops from ~69 s to ~58 s; steady-state throughput gains the measurement+return duration (~13 s) per object.
 

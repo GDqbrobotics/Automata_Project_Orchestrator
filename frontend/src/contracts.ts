@@ -9,7 +9,17 @@ export type WorkflowCommand =
   | 'reset_workflow'
   | 'assign_alias'
   | 'toggle_subsystem_simulation'
-  | 'debug_send_subsystem_message';
+  | 'debug_send_subsystem_message'
+  // Configuration wizard (debug mode only)
+  | 'get_config'
+  | 'validate_config'
+  | 'patch_config'
+  | 'save_config'
+  | 'create_subsystem'
+  | 'delete_subsystem'
+  | 'write_simulator'
+  | 'render_message_formats'
+  | 'render_state_machine';
 
 export type WorkflowEvent =
   | 'workflow_state_changed'
@@ -25,7 +35,13 @@ export type WorkflowEvent =
   | 'subsystem_message'
   | 'object_message'
   | 'messages_cleared'
-  | 'subsystem_state_mismatch';
+  | 'subsystem_state_mismatch'
+  // Configuration wizard (debug mode only)
+  | 'config_snapshot'
+  | 'config_patched'
+  | 'config_validated'
+  | 'config_saved'
+  | 'subsystem_deleted';
 
 /**
  * A workflow state name. workflow.yaml is the single source of truth (R3):
@@ -164,6 +180,80 @@ export interface ObjectMessage {
   /** kind=event: where the fired event went (subsystem / pipeline / broadcast). */
   target?: string;
   timestamp: string;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration wizard (debug mode)
+// ---------------------------------------------------------------------------
+
+/** One structured edit applied to a config buffer (dotted key path). */
+export interface ConfigPatch {
+  path: Array<string | number>;
+  value: unknown;
+}
+
+/** One editable config file as sent in the wizard snapshot. */
+export interface ConfigFileSnapshot {
+  /** Path relative to the repo root, e.g. 'backend/config/workflow.yaml'. */
+  path: string;
+  label: string;
+  /** 'global' | 'workflow' | 'object' | 'subsystem' | 'message_formats'. */
+  category: string;
+  /** Raw YAML text (authoritative; the wizard edits this). */
+  content: string;
+  /** Parsed YAML (null when the file does not parse). */
+  parsed: Record<string, unknown> | null;
+  /** Subsystems only: the configured subsystem name. */
+  name?: string;
+  /** Subsystems only: whether <name>_sim.py exists. */
+  sim_exists?: boolean;
+  /** Current validation errors of this file ([] = valid). */
+  errors?: string[];
+}
+
+/** A structured override of one MQTT message kind. */
+export interface MqttCommandFormat {
+  event_field?: string;
+  source_field?: string;
+  source_value?: string;
+  timestamp_field?: string;
+  include_timestamp?: boolean;
+  static_fields?: Record<string, unknown>;
+}
+
+export interface MqttStatusFormat {
+  state_field?: string;
+  ready_field?: string;
+  paused_field?: string;
+  name_field?: string;
+}
+
+export interface MqttResponseFormat {
+  type_field?: string;
+  objects_field?: string;
+  count_field?: string;
+}
+
+/** The four message formats of one subsystem (all fields optional = inherit). */
+export interface MqttFormatGroup {
+  command?: MqttCommandFormat;
+  hardware_command?: MqttCommandFormat;
+  status?: MqttStatusFormat;
+  response?: MqttResponseFormat;
+}
+
+/** Parsed `mqtt_formats.yaml`: a default + per-subsystem overrides. */
+export interface MessageFormatsDocument {
+  default: MqttFormatGroup;
+  subsystems: Record<string, MqttFormatGroup>;
+}
+
+/** Details of the `config_snapshot` backend event. */
+export interface ConfigSnapshotDetails {
+  files: ConfigFileSnapshot[];
+  message_formats: MessageFormatsDocument;
+  editable: boolean;
+  debug: boolean;
 }
 
 export interface FrontendMessage {

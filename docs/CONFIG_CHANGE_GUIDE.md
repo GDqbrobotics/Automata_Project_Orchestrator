@@ -47,7 +47,7 @@ The object journey is a **linear state machine** (one outgoing transition per st
 |-------|---------|---------|
 | `position` | Where the object physically is: `box`, `hand`, or disk name | `position: disk_first` |
 | `actor` | Single subsystem working on the object (its completion advances the object) | `actor: imaging_3di` |
-| `parallel_actors` | Subsystems that MUST ALL complete for the state to end | `parallel_actors: [robot_first, xrf, raman]` |
+| `parallel_actors` | Subsystems that MUST ALL complete for the state to end | `parallel_actors: [robot_first, xrf]` |
 | `rotate_request` | Internal `workflow/` event requesting platform rotation | `rotate_request: rotation_requested_second` |
 | `rotate_command` | The `rotating_platform` command that fulfils the request | `rotate_command: rotate_to_second` |
 | `actor_op` | Task-chain op name (for states where robot does multi-step work) | `actor_op: return` |
@@ -72,10 +72,33 @@ metadata:
 
 **Rules:**
 - Every state in the journey must declare `meta.position`
-- States with `actor` must have a transition whose event matches the actor's completion event (`complete` by convention)
+- States with `actor` / `parallel_actors` must reference configured subsystems
+  whose state machine can actually complete (see “Completion contract”)
 - States with `parallel_actors` — the pipeline tracks each actor; state ends when ALL report ready
+- The event on an object state's outgoing transition is an **internal label**
+  (e.g. `xrf_measurement_complete`), not something a subsystem sends: the
+  pipeline fires it when the actor(s) complete
+- The transition **into** a stage carries the commands that start it (e.g.
+  `ai_complete` fires `robot_first/measure_xrf` + `xrf/measure`); that is how
+  a sequential split like XRF → Raman is wired
 - `rotate_request`/`rotate_command` pairs must match `rotating_platform.yaml` events
 - `task_chains` ops must correspond to states with `actor_op` set
+
+### Completion contract (why a run can hang)
+
+A subsystem completes a stage by reporting its **ready state** over MQTT
+after a work state — there is no "measurement complete" event a subsystem
+can fire (`event:` actions on subsystem transitions are ignored and now
+rejected by validation). Therefore:
+
+- every subsystem **work state** must have a transition back to the ready
+  state, or the workflow waits for that subsystem forever;
+- an object state with `actor` / `parallel_actors` ends only when the
+  actor(s) report ready — the object transition event is just the label.
+
+Both rules are cross-checked by `ConfigService._validate_object` before the
+wizard saves anything, and the full split journey is exercised by
+`simulation_test.py`.
 
 ### Final States
 
@@ -148,6 +171,54 @@ metadata:
 
 ---
 
+## R10 — MQTT Message Formats (`mqtt_formats.yaml`)
+
+Every MQTT payload exchanged with a subsystem is built and parsed through
+`backend/config/mqtt_formats.yaml` — the field-mapping layer (`backend/messaging/message_format.py`). A real subsystem that already speaks a fixed payload shape is integrated by editing this file, **no Python changes**:
+
+```yaml
+default:
+  command:                       # orchestrator → subsystem /event
+    event_field: event
+    source_field: source
+    source_value: orchestrator
+    timestamp_field: timestamp
+    include_timestamp: true
+    static_fields: {}            # extra constant fields (dotted paths allowed)
+  hardware_command:              # orchestrator → subsystem /event (pause/resume)
+    event_field: event
+    source_field: source
+    source_value: orchestrator
+    include_timestamp: false
+  status:                        # subsystem → orchestrator /status
+    state_field: state
+    ready_field: ready
+    paused_field: paused
+    name_field: name
+  response:                      # subsystem → orchestrator /response
+    type_field: type
+    objects_field: objects
+    count_field: count
+
+subsystems:                      # per-subsystem overrides, deep-merged over default
+  some_subsystem:
+    command:
+      event_field: cmd
+    status:
+      state_field: data.state   # dotted paths reach nested fields
+```
+
+**Rules:**
+- One source for both the orchestrator and the simulated subsystems (`backend/simulation/subsystem_sim.py`): the adapter (publisher), the orchestrator receive path, the debug topic descriptors and the sims all read the same format, so changing a field name cannot make them drift apart.
+- `command` is used by `SubsystemAdapter.fire_transition` / `send_command`; `hardware_command` by the raw pause/resume broadcast; `status` by `_update_subsystem_status`; `response` by the reporting-role consumption (R5) and debug defaults.
+- Dotted field names (`data.state`) read/write nested payloads; missing paths extract as `None`.
+- The file may declare an empty/partial `default:` — unspecified fields fall back to the built-in defaults.
+- `static_fields` are merged first (formats win over context data).
+
+**Frontend impact:** the debug topic descriptors carry the configured `state_field` / `ready_field` (F5), so the inspector's state quick-pick edits exactly the fields the orchestrator parses.
+
+---
+
 ## R6 — Object Journey Final States (Derived, Not Hardcoded)
 
 The object workflow's final state(s) are **states with no outgoing transitions** in `object.yaml`. Code uses `StateMachineConfig.final_states` property.
@@ -174,8 +245,13 @@ metadata:
   work_durations:
     picking: 2.0
     placing: 2.0
-    measuring_xrf_raman: 6.0
+    measuring_xrf: 3.0
+    measuring_raman: 3.0
 ```
+
+Every work state named here must have a transition back to the ready
+state ("Completion contract", R2), otherwise the simulator warns and the
+workflow waits for it forever.
 
 ---
 
@@ -206,12 +282,60 @@ metadata:
 
 ---
 
+## Configuration Wizard (debug mode)
+
+The GUI shows a **Configuration wizard** button when launched with
+`python launch_gui.py --debug` (the same flag that enables the MQTT
+injection panel). It guides the operator through the edits that would
+otherwise mean hand-editing YAML, and writes only through the backend
+(`backend/services/config_service.py`):
+
+| Step | What it edits |
+|---|---|
+| ① Workflow | `workflow.yaml` metadata (operator events, readiness gate, error state), `global.yaml` settings, `object.yaml` summary; the structured **state-machine editor** for `workflow.yaml` and `object.yaml` (object states also edit their physical `meta`); raw YAML editor for all three |
+| ② Subsystems | existing subsystem files (basics form, structured **state-machine editor**, raw YAML), **create** from a commented template, **stage removal** with a reference check against the other configs |
+| ③ MQTT formats | `mqtt_formats.yaml` structured fields per message kind + per-subsystem overrides |
+| ④ Review | validate everything and save all modified/new/deleted files in one pass |
+
+Rules the wizard enforces (same as this guide):
+
+- **Debug mode only, workflow not running** — write commands are rejected
+  otherwise (the operator could break a live run).
+- The raw YAML text is the source of truth; the structured forms are applied
+  server-side as **comment-preserving line patches** (`patch_config`), so the
+  rest of the file (documentation comments included) is never reformatted.
+- Every file is **validated before it is written** (YAML parse + structural
+  checks: `initial_state`, transition targets, report `after` transitions,
+  message-format kinds). Invalid content never lands on disk.
+- Adding a subsystem stages the YAML (and optionally the `<name>_sim.py`
+  script); deleting one stops its simulated process and reports which other
+  files still reference it.
+- The **state-machine editor** (Workflow step for `workflow.yaml` /
+  `object.yaml`, Subsystems → State machine for a subsystem) edits states
+  (add / remove / description / initial), transitions (event, target) and
+  the messages they carry (actions: `log_event`, fired event, raw action)
+  as structured data. For object states it also edits the physical `meta`
+  (position, actor, parallel actors, rotate request/command, actor op);
+  activating it is validated against the configured subsystems
+  (unknown actors and actors that cannot complete are refused). `render_state_machine` re-serializes **only the
+  ``states:`` block**: the file header (name, metadata and their comments)
+  is preserved, and the candidate document is validated as a whole
+  (transition targets, state names, `initial_state`, report `after`
+  transitions) before anything is returned. Pending drafts are applied and
+  saved automatically by the Review step.
+- **A restart is required** after saving: state machines, adapters and MQTT
+  formats are loaded at startup.
+
+---
+
 ## Adding a New Subsystem (Checklist)
 
 1. **Create** `backend/config/subsystems/my_subsystem.yaml` with:
    - `name`, `display_name`, `type`, `mqtt_topic`, `initial_state`, `required`
    - `states:` with transitions (at minimum: `initializing` → `ready` via `init_complete`)
    - `metadata:` with `init_duration`, `work_durations`, optionally `reports`
+
+   *(or use the GUI wizard in debug mode: Subsystems → New subsystem)*
 
 2. **Create** `backend/simulation/my_subsystem_sim.py`:
    ```python
@@ -220,13 +344,16 @@ metadata:
        main()
    ```
 
-3. **Restart** orchestrator — the subsystem card, MQTT topics, and simulation toggle appear automatically.
+3. *(Optional)* If the real subsystem speaks a different payload shape, add
+   a per-subsystem override under `subsystems:` in `mqtt_formats.yaml` (R10).
 
-4. **Update** `object.yaml` if the new subsystem participates in the object journey:
+4. **Restart** orchestrator — the subsystem card, MQTT topics, and simulation toggle appear automatically.
+
+5. **Update** `object.yaml` if the new subsystem participates in the object journey:
    - Add `actor: my_subsystem` or `parallel_actors: [..., my_subsystem]` to relevant states
    - Add scoped events to transitions (e.g., `event: my_subsystem/do_work`)
 
-5. **Run** `timeout 500 python backend/simulation_test.py` — new config-consistency checks will validate the addition.
+6. **Run** `timeout 500 python backend/simulation_test.py` — new config-consistency checks will validate the addition.
 
 ---
 
@@ -238,6 +365,7 @@ metadata:
 | Add/rename transition event | Subsystem YAML + any YAML referencing the event (object.yaml, workflow.yaml) | Yes |
 | Change simulation duration | Subsystem YAML `metadata.work_durations` | **No** (hot-reload in sim) |
 | Change MQTT topic | Subsystem YAML `mqtt_topic` | Yes |
+| Change MQTT payload fields | `mqtt_formats.yaml` (default or per-subsystem override, R10) | Yes |
 | Change required flag | Subsystem YAML `required` | Yes |
 | Add reporting role | Subsystem YAML `metadata.reports` | Yes |
 
@@ -249,7 +377,7 @@ metadata:
 |--------|-----------------|-------------------|
 | Add intermediate state | `object.yaml` (states + transitions + meta) | Yes |
 | Reorder journey | `object.yaml` transitions | Yes |
-| Change actor for a state | `object.yaml` state `meta.actor` | Yes |
+| Change actor for a state | `object.yaml` state `meta.actor` (wizard: Workflow → object → State machine → meta) | Yes |
 | Add parallel actor | `object.yaml` state `meta.parallel_actors` | Yes |
 | Change rotation request/command | `object.yaml` state `meta.rotate_request/command` + `rotating_platform.yaml` | Yes |
 | Update display order/colors | `global.yaml` `object_workflow.state_order/colors` | **No** (frontend hot-reload) |
@@ -324,6 +452,12 @@ states: {state_name: {description, meta{position, actor?, parallel_actors[], rot
 name, display_name, type, mqtt_topic, initial_state, required
 metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}}]}
 states: {state_name: {description, transitions[{event, target, actions[]}]}}
+```
+
+### mqtt_formats.yaml
+```yaml
+default: {command{}, hardware_command{}, status{}, response{}}
+subsystems: {name: {command?, hardware_command?, status?, response?}}
 ```
 
 ---

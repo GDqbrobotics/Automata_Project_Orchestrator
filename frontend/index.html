@@ -19,9 +19,22 @@
         </span>
         <h1>AUTOMATA <span>GUI Orchestrator</span></h1>
       </div>
-      <div class="connection-indicator" role="status">
-        <span class="connection-dot" id="connectionDot"></span>
-        <span class="connection-text" id="connectionText">Disconnected</span>
+      <div class="topbar-right">
+        <!-- Configuration wizard: revealed by the backend's debug flag
+             (launch_gui.py --debug). Guided editing of workflow,
+             subsystems and MQTT message formats. -->
+        <button
+          class="btn wizard-btn"
+          id="btnConfigWizard"
+          hidden
+          title="Configuration wizard (debug mode): edit workflow, subsystems and MQTT message formats"
+        >
+          <span aria-hidden="true">⚙</span> Configuration wizard
+        </button>
+        <div class="connection-indicator" role="status">
+          <span class="connection-dot" id="connectionDot"></span>
+          <span class="connection-text" id="connectionText">Disconnected</span>
+        </div>
       </div>
     </header>
 

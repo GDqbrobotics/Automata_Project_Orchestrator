@@ -140,20 +140,30 @@ states:
     meta: { position: disk_first, actor: ai_analysis }
     transitions:
       - event: ai_complete
-        target: XRF_RAMAN_analysis
+        target: XRF_analysis
         actions:
           - log_event
           # The AI finished its analysis: the target points are known, so
           # the puntual measurements start (robot 1 + the two analyzers).
-          - event: robot_first/measure_xrf_raman
+          - event: robot_first/measure_xrf
           - event: xrf/measure
+
+  XRF_analysis:
+    description: XRF andpuntual measurements are being performed at AI-extracted points (first position)
+    meta: { position: disk_first, parallel_actors: [robot_first, xrf] }
+    transitions:
+      - event: xrf_measurement_complete
+        target: RAMAN_analysis
+        actions:
+          - log_event
+          - event: robot_first/measure_raman
           - event: raman/measure
 
-  XRF_RAMAN_analysis:
-    description: XRF and Raman puntual measurements are being performed at AI-extracted points (first position)
-    meta: { position: disk_first, parallel_actors: [robot_first, xrf, raman] }
+  RAMAN_analysis:
+    description: Raman puntual measurements are being performed at AI-extracted points (first position)
+    meta: { position: disk_first, parallel_actors: [robot_first, raman] }
     transitions:
-      - event: measurements_complete
+      - event: raman_measurement_complete
         target: moving_to_box
         actions:
           - log_event

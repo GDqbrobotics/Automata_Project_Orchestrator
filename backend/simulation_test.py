@@ -1065,11 +1065,14 @@ def test_object_state_machine_config() -> None:
         # rotating_platform command.
         # The object lands on the first position in 'ai_processing' and
         # waits there until the AI finishes extracting the interest points;
-        # only then does the XRF/Raman stage start (ai_complete fires the
-        # measurement commands).
+        # only then does the measurement stage start. XRF and Raman are two
+        # sequential states: each one's incoming transition fires the
+        # commands of the next stage, and each ends when its
+        # parallel_actors (robot + analyzer) report back ready.
         "HSI_analysis": ["ai_analysis/plan", "workflow/rotation_requested_first"],
-        "ai_processing": ["robot_first/measure_xrf_raman", "xrf/measure", "raman/measure"],
-        "XRF_RAMAN_analysis": ["robot_first/return"],
+        "ai_processing": ["robot_first/measure_xrf", "xrf/measure"],
+        "XRF_analysis": ["robot_first/measure_raman", "raman/measure"],
+        "RAMAN_analysis": ["robot_first/return"],
     }
     for state, expected_events in expected_scoped_events.items():
         if state not in manager.config.states:
@@ -1337,6 +1340,119 @@ async def test_debug_mode() -> None:
             "Debug topics include rotating_platform /response",
         )
 
+    # 1b. Configuration wizard commands are available in debug mode:
+    #     the snapshot lists the editable files and the MQTT formats.
+    await ws_client.send_command("get_config")
+    snapshot: Optional[Dict[str, Any]] = None
+    for _ in range(30):
+        for m in await ws_client.drain_messages():
+            if m.get("event") == "config_snapshot":
+                snapshot = m.get("details")
+        if snapshot:
+            break
+        time.sleep(0.2)
+    results.check(
+        snapshot is not None and len(snapshot.get("files", [])) > 0,
+        "Wizard get_config returns a snapshot of editable files (debug mode)",
+    )
+    if snapshot:
+        paths = [f["path"] for f in snapshot["files"]]
+        results.check(
+            any(p.endswith("workflow.yaml") for p in paths)
+            and any(p.endswith("mqtt_formats.yaml") for p in paths),
+            "Wizard snapshot includes workflow.yaml and mqtt_formats.yaml",
+        )
+        results.check(
+            isinstance(snapshot.get("message_formats"), dict),
+            "Wizard snapshot includes the parsed MQTT message formats",
+        )
+
+        # patch_config edits the buffer without writing to disk
+        workflow_entry = next(
+            (f for f in snapshot["files"] if f["path"].endswith("workflow.yaml")),
+            None,
+        )
+        if workflow_entry:
+            await ws_client.send_command(
+                "patch_config",
+                {
+                    "path": workflow_entry["path"],
+                    "content": workflow_entry["content"],
+                    "patches": [
+                        {
+                            "path": ["metadata", "error_state"],
+                            "value": "error",
+                        }
+                    ],
+                },
+            )
+            patched = None
+            for _ in range(30):
+                for m in await ws_client.drain_messages():
+                    if m.get("event") == "config_patched":
+                        patched = m.get("details")
+                if patched:
+                    break
+                time.sleep(0.2)
+            results.check(
+                patched is not None and "metadata" in patched.get("content", ""),
+                "Wizard patch_config returns the patched buffer",
+            )
+
+        # The structured state-machine editor renders a states: block over
+        # the wire (no write): add a transition/state and check the result.
+        subsystem_entry = next(
+            (f for f in snapshot["files"] if f["path"].endswith("subsystems/xrf.yaml")),
+            None,
+        )
+        if subsystem_entry and isinstance(subsystem_entry.get("parsed"), dict):
+            parsed = subsystem_entry["parsed"]
+            states = dict(parsed.get("states") or {})
+            if states and "measuring" in states:
+                states["measuring"] = dict(states["measuring"])
+                states["measuring"]["description"] = "Edited by the wizard test"
+                states["calibrating"] = {
+                    "description": "Analyzer is calibrating",
+                    "transitions": [
+                        {
+                            "event": "calibrated",
+                            "target": "ready",
+                            "actions": ["log_event"],
+                        }
+                    ],
+                }
+                ready_transitions = list(states["ready"].get("transitions") or [])
+                ready_transitions.append(
+                    {"event": "calibrate", "target": "calibrating", "actions": ["log_event"]}
+                )
+                states["ready"] = dict(states["ready"], transitions=ready_transitions)
+                await ws_client.send_command(
+                    "render_state_machine",
+                    {
+                        "path": subsystem_entry["path"],
+                        "content": subsystem_entry["content"],
+                        "states": states,
+                        "initial_state": parsed.get("initial_state"),
+                    },
+                )
+                sm_response = None
+                for _ in range(30):
+                    for m in await ws_client.drain_messages():
+                        details = m.get("details") or {}
+                        if m.get("event") == "config_patched" and details.get(
+                            "state_machine"
+                        ):
+                            sm_response = details
+                    if sm_response:
+                        break
+                    time.sleep(0.2)
+                results.check(
+                    sm_response is not None
+                    and "Edited by the wizard test" in sm_response.get("content", "")
+                    and "calibrating" in sm_response.get("content", ""),
+                    "Wizard render_state_machine regenerates the states block (no write)",
+                )
+
     # 2. A sent status report is processed like a real subsystem message:
     #    the local subsystem SM syncs to the reported state
     adapter = orch.adapters.get(ROTATING_PLATFORM)
@@ -1428,19 +1544,27 @@ async def test_debug_mode() -> None:
             "payload": {"state": "ready"},
         },
     )
+    # The wizard is equally gated on debug mode.
+    await ws_client2.send_command("get_config")
     disabled_rejected = False
+    wizard_rejected = False
     for _ in range(30):
         for m in await ws_client2.drain_messages():
-            if m.get("event") == "error_reported" and "not enabled" in str(
-                (m.get("details") or {}).get("message", "")
-            ):
+            message = str((m.get("details") or {}).get("message", ""))
+            if m.get("event") == "error_reported" and "not enabled" in message:
                 disabled_rejected = True
-        if disabled_rejected:
+            if m.get("event") == "error_reported" and "debug mode" in message:
+                wizard_rejected = True
+        if disabled_rejected and wizard_rejected:
             break
         time.sleep(0.2)
     results.check(
         disabled_rejected,
         "Debug command is rejected when the backend is not running --debug",
+    )
+    results.check(
+        wizard_rejected,
+        "Wizard command is rejected when the backend is not running --debug",
     )
 
     # No debug config in the status broadcast when debug mode is off
@@ -1618,6 +1742,365 @@ async def test_simulation_toggle() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 14: Configurable MQTT message formats (R10)
+# ---------------------------------------------------------------------------
+def test_message_formats() -> None:
+    """Test: the mqtt_formats.yaml field-mapping layer.
+
+    Builds and parses every message kind through the configured default
+    format, checks per-subsystem overrides (deep-merged) and nested dotted
+    field paths, so the orchestrator and the simulated subsystems cannot
+    drift apart when a real subsystem speaks a custom payload shape.
+    """
+    logger.info("--- TEST 14: MQTT message formats ---")
+
+    from backend.messaging.message_format import MessageFormatSet
+
+    formats_path = CONFIG_DIR / "mqtt_formats.yaml"
+    results.check(formats_path.exists(), "mqtt_formats.yaml exists")
+    if not formats_path.exists():
+        return
+
+    formats = MessageFormatSet.from_yaml(formats_path)
+    default = formats.for_subsystem("anything")
+
+    # Default round trips (the historical payload shapes are unchanged)
+    command = default.command.build("measure", {"object_id": "object_001"})
+    results.check(
+        command.get("event") == "measure"
+        and command.get("source") == "orchestrator"
+        and command.get("object_id") == "object_001",
+        "Default command payload keeps event/source/context fields",
+    )
+    hardware = default.hardware_command.build("pause")
+    results.check(
+        hardware.get("event") == "pause" and "timestamp" not in hardware,
+        "Default hardware command payload has no timestamp",
+    )
+    status = default.status.build("ready", "xrf", True, False)
+    results.check(
+        default.status.extract_state(status) == "ready"
+        and default.status.extract_ready(status) is True
+        and default.status.extract_paused(status) is False,
+        "Default status payload round-trips state/ready/paused",
+    )
+    response = default.response.build("objects_detected", ["object_001"], 1)
+    rtype, objects, count = default.response.extract(response)
+    results.check(
+        rtype == "objects_detected" and objects == ["object_001"] and count == 1,
+        "Default response payload round-trips type/objects/count",
+    )
+
+    # Per-subsystem override, deep-merged over the default
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        override_path = Path(tmp) / "mqtt_formats.yaml"
+        override_path.write_text(
+            "default:\n"
+            "  command:\n"
+            "    event_field: event\n"
+            "subsystems:\n"
+            "  custom_device:\n"
+            "    command:\n"
+            "      event_field: cmd\n"
+            "      static_fields: {protocol: v2}\n"
+            "    status:\n"
+            "      state_field: data.state\n"
+            "      ready_field: data.ready\n"
+        )
+        overrides = MessageFormatSet.from_yaml(override_path)
+        custom = overrides.for_subsystem("custom_device")
+        # Overridden fields…
+        payload = custom.command.build("start")
+        results.check(
+            payload.get("cmd") == "start"
+            and "event" not in payload
+            and payload.get("protocol") == "v2",
+            "Per-subsystem command override changes the event field + adds static fields",
+        )
+        # …while non-overridden fields still inherit the default
+        results.check(
+            payload.get("source") == "orchestrator",
+            "Non-overridden command fields inherit the default format",
+        )
+        nested = custom.status.extract_state(
+            {"data": {"state": "measuring", "ready": False}}
+        )
+        results.check(
+            nested == "measuring"
+            and custom.status.extract_ready({"data": {"ready": True}}) is True,
+            "Dotted field paths read nested status payloads",
+        )
+
+    # Every configured subsystem resolves a format (override or default)
+    for name in ALL_SUBSYSTEMS:
+        fmt = formats.for_subsystem(name)
+        results.check(
+            fmt.status.state_field == default.status.state_field,
+            f"Subsystem '{name}' resolves the default status format",
+        )
+
+    logger.info("Message format test complete.\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Configuration service (the wizard backend)
+# ---------------------------------------------------------------------------
+def test_config_service() -> None:
+    """Test: snapshot/validate/patch/create/delete on a temp copy of config."""
+    logger.info("--- TEST 15: Configuration service (wizard backend) ---")
+
+    import shutil
+    import tempfile
+
+    from backend.services.config_service import ConfigError, ConfigService
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        config_dir = root / "backend" / "config"
+        simulation_dir = root / "backend" / "simulation"
+        shutil.copytree(CONFIG_DIR, config_dir)
+        simulation_dir.mkdir(parents=True)
+        (simulation_dir / "xrf_sim.py").write_text("x")
+
+        service = ConfigService(config_dir, simulation_dir, root_dir=root)
+
+        snapshot = service.snapshot()
+        paths = [f["path"] for f in snapshot["files"]]
+        results.check(
+            any(p.endswith("workflow.yaml") for p in paths)
+            and any(p.endswith("subsystems/xrf.yaml") for p in paths)
+            and any(p.endswith("mqtt_formats.yaml") for p in paths),
+            "Snapshot lists workflow, subsystem and MQTT-format files",
+        )
+
+        # validate_content rejects broken machines, accepts good ones
+        bad = "initial_state: idle\nstates:\n  idle:\n    transitions:\n      - event: go\n        target: nowhere\n"
+        results.check(
+            len(service.validate_content("backend/config/workflow.yaml", bad)) > 0,
+            "Validation rejects a transition to an undefined state",
+        )
+        results.check(
+            service.validate_content("backend/config/global.yaml", "mqtt:\n  broker: localhost\n") == [],
+            "Validation accepts a well-formed global config",
+        )
+
+        # patch_content preserves comments and inserts missing keys
+        xrf_path = "backend/config/subsystems/xrf.yaml"
+        xrf_content = (config_dir / "subsystems" / "xrf.yaml").read_text()
+        patched = service.patch_content(
+            xrf_path,
+            xrf_content,
+            [
+                {"path": ["display_name"], "value": "XRF v2"},
+                {"path": ["metadata", "operator_notes"], "value": "added by test"},
+            ],
+        )["content"]
+        patched_data = yaml.safe_load(patched)
+        results.check(
+            patched_data["display_name"] == "XRF v2"
+            and patched_data["metadata"]["operator_notes"] == "added by test"
+            and "# XRF Analyzer Subsystem Configuration" in patched,
+            "Structured patch edits values and preserves comments",
+        )
+
+        # create_subsystem renders a valid, loadable YAML (not written)
+        created = service.create_subsystem(
+            {
+                "name": "laser_scanner",
+                "display_name": "Laser Scanner",
+                "type": "analyzer",
+                "required": False,
+                "init_duration": 1.0,
+                "work_state": "scanning",
+                "work_event": "scan",
+            }
+        )
+        created_data = yaml.safe_load(created["content"])
+        results.check(
+            created_data["name"] == "laser_scanner"
+            and "scanning" in created_data["states"]
+            and service.validate_content(created["path"], created["content"]) == [],
+            "create_subsystem renders a valid subsystem YAML",
+        )
+        results.check(
+            len(service.validate_content(created["path"], created["content"])) == 0
+            and "scanning" in (created_data.get("metadata", {}).get("work_durations") or {}),
+            "Created subsystem carries a work duration for its work state",
+        )
+
+        # The untouched object blueprint passes the cross-file validation
+        # (checked before the xrf deletion below).
+        results.check(
+            service.validate_content(
+                "backend/config/object.yaml",
+                (config_dir / "object.yaml").read_text(),
+            )
+            == [],
+            "Current object blueprint passes the cross-file validation",
+        )
+
+        # save writes atomically, delete removes YAML + simulator
+        service.save(created["path"], created["content"])
+        results.check(
+            (config_dir / "subsystems" / "laser_scanner.yaml").exists(),
+            "save writes the staged subsystem to disk",
+        )
+        refs = service.subsystem_references("xrf", exclude=config_dir / "subsystems" / "xrf.yaml")
+        results.check(
+            any(r["path"].endswith("object.yaml") for r in refs),
+            "subsystem_references finds object.yaml references (pre-delete check)",
+        )
+        deleted = service.delete_subsystem("xrf", delete_simulator=True)
+        results.check(
+            not (config_dir / "subsystems" / "xrf.yaml").exists()
+            and not (simulation_dir / "xrf_sim.py").exists()
+            and len(deleted["deleted"]) == 2,
+            "delete_subsystem removes the YAML and its simulator script",
+        )
+
+        # render_message_formats produces a parseable document
+        rendered = service.render_message_formats(
+            {
+                "default": {"status": {"state_field": "data.state"}},
+                "subsystems": {"xrf": {"command": {"event_field": "cmd"}}},
+            }
+        )
+        parsed = yaml.safe_load(rendered["content"])
+        results.check(
+            parsed["default"]["status"]["state_field"] == "data.state"
+            and parsed["subsystems"]["xrf"]["command"]["event_field"] == "cmd",
+            "render_message_formats writes a parseable overrides document",
+        )
+
+        # render_state_machine regenerates only the states: block
+        # (raman: xrf was removed by the delete check above).
+        sm_path = "backend/config/subsystems/raman.yaml"
+        sm_content = (config_dir / "subsystems" / "raman.yaml").read_text()
+        sm_data = yaml.safe_load(sm_content)
+        sm_states = sm_data["states"]
+        sm_states["calibrating"] = {
+            "description": "Analyzer is calibrating",
+            "transitions": [
+                {
+                    "event": "calibrated",
+                    "target": "ready",
+                    "actions": ["log_event"],
+                }
+            ],
+        }
+        sm_states["ready"]["transitions"].append(
+            {"event": "calibrate", "target": "calibrating", "actions": ["log_event"]}
+        )
+        rendered_sm = service.render_state_machine(
+            sm_path, sm_content, sm_states, "initializing"
+        )
+        rendered_data = yaml.safe_load(rendered_sm["content"])
+        results.check(
+            rendered_sm.get("state_machine") is True
+            and "calibrating" in rendered_data["states"]
+            and rendered_data["states"]["calibrating"]["transitions"][0]["actions"]
+            == ["log_event"]
+            and "# Raman Spectrometer Subsystem Configuration" in rendered_sm["content"]
+            and rendered_data["metadata"] == sm_data["metadata"],
+            "render_state_machine adds a state and preserves the header/metadata",
+        )
+        try:
+            service.render_state_machine(
+                sm_path,
+                sm_content,
+                {
+                    "ready": {
+                        "description": "x",
+                        "transitions": [
+                            {"event": "go", "target": "nowhere", "actions": []}
+                        ],
+                    }
+                },
+                "ready",
+            )
+            results.check(False, "render_state_machine validates transition targets")
+        except ConfigError:
+            results.check(True, "render_state_machine validates transition targets")
+        try:
+            service.render_state_machine(
+                sm_path,
+                sm_content,
+                {"bad name!": {"description": "x", "transitions": []}},
+                "bad name!",
+            )
+            results.check(False, "render_state_machine validates state names")
+        except ConfigError:
+            results.check(True, "render_state_machine validates state names")
+
+        # Completion contract: a work state with no way back to ready is
+        # refused (the exact mistake that stalls the pipeline).
+        broken_robot = yaml.safe_load(
+            (config_dir / "subsystems" / "robot_first.yaml").read_text()
+        )
+        del broken_robot["states"]["measuring_raman"]["transitions"][0]
+        broken_text = yaml.safe_dump(broken_robot, sort_keys=False)
+        results.check(
+            any(
+                "no transition back to the ready state" in e
+                for e in service.validate_content(
+                    "backend/config/subsystems/robot_first.yaml", broken_text
+                )
+            ),
+            "Validation refuses a work state that cannot complete (no ready transition)",
+        )
+
+        # Subsystem transitions cannot fire internal events (silent no-op).
+        action_text = (
+            "name: demo\ninitial_state: initializing\nrequired: true\nstates:\n"
+            "  initializing:\n    transitions:\n"
+            "      - event: init_complete\n        target: ready\n"
+            "  ready:\n    transitions:\n"
+            "      - event: work\n        target: working\n"
+            "  working:\n    transitions:\n"
+            "      - event: complete\n        target: ready\n"
+            "        actions:\n          - event: all/measure_complete\n"
+        )
+        results.check(
+            any(
+                "cannot fire internal events" in e
+                for e in service.validate_content(
+                    "backend/config/subsystems/demo.yaml", action_text
+                )
+            ),
+            "Validation refuses event actions on subsystem transitions (silent no-op)",
+        )
+
+        # Object actors are cross-checked against the subsystem machines.
+        obj_data = yaml.safe_load((config_dir / "object.yaml").read_text())
+        obj_data["states"]["XRF_analysis"]["meta"]["actor"] = "ghost_subsystem"
+        results.check(
+            any(
+                "actor 'ghost_subsystem' is not a configured subsystem" in e
+                for e in service.validate_content(
+                    "backend/config/object.yaml",
+                    yaml.safe_dump(obj_data, sort_keys=False),
+                )
+            ),
+            "Object validation refuses an actor that is not a configured subsystem",
+        )
+        # Unsafe paths are refused
+        try:
+            service.save("backend/config/../../../etc/passwd", "x")
+            results.check(False, "Out-of-tree writes are refused")
+        except ConfigError:
+            results.check(True, "Out-of-tree writes are refused")
+        try:
+            service.delete_subsystem("../../global")
+            results.check(False, "Traversal subsystem names are refused")
+        except ConfigError:
+            results.check(True, "Traversal subsystem names are refused")
+
+    logger.info("Configuration service test complete.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def run_all_tests(num_objects: int = 3) -> bool:
@@ -1654,6 +2137,10 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         await test_object_in_orchestrator()
         time.sleep(1)
         test_scoped_event_routing()
+        time.sleep(1)
+        test_message_formats()
+        time.sleep(1)
+        test_config_service()
         time.sleep(1)
         await test_debug_mode()
         time.sleep(1)

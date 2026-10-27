@@ -13,160 +13,146 @@ metadata:
   work_durations:
     picking: 2.0
     placing: 2.0
-    measuring_xrf_raman: 6.0
+    # The XRF and Raman stages are sequential; each one ends when the
+    # robot reports the ready state (there is no "measurement complete"
+    # event: completion is always reported over MQTT as ready).
+    measuring_xrf: 3.0
+    measuring_raman: 3.0
     returning: 2.5
 
 states:
   initializing:
-    description: "Robot is initializing"
+    description: Robot is initializing
     transitions:
       - event: init_complete
         target: ready
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
   ready:
-    description: "Robot is ready and idle"
+    description: Robot is ready and idle
     transitions:
       - event: pick
         target: picking
         actions:
           - log_event
-
       - event: place
         target: placing
         actions:
           - log_event
-
       - event: return
         target: returning
         actions:
           - log_event
-
-      - event: measure_xrf_raman
-        target: measuring_xrf_raman
-        actions:
-          - log_event
-
       - event: stop
         target: stopped
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
+      - event: measure_raman
+        target: measuring_raman
+        actions:
+          - log_event
+      - event: measure_xrf
+        target: measuring_xrf
+        actions:
+          - log_event
   picking:
-    description: "Robot is picking object"
+    description: Robot is picking object
     transitions:
       - event: complete
         target: ready
         actions:
           - log_event
-
       - event: stop
         target: stopped
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
   placing:
-    description: "Robot is placing object on the disk"
+    description: Robot is placing object on the disk
     transitions:
       - event: complete
         target: ready
         actions:
           - log_event
-
       - event: stop
         target: stopped
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
   returning:
-    description: "Robot is returning object"
+    description: Robot is returning object
     transitions:
       - event: complete
         target: ready
         actions:
           - log_event
-
       - event: stop
         target: stopped
         actions:
           - log_event
-
       - event: error
         target: error
         actions:
           - log_event
-
-  measuring_xrf_raman:
-    description: "Robot is performing XRF and Raman measurements on the object"
-    transitions:
-      - event: complete
-        target: ready
-        actions:
-          - log_event
-
-      - event: stop
-        target: stopped
-        actions:
-          - log_event
-
-      - event: error
-        target: error
-        actions:
-          - log_event
-
   stopped:
-    description: "Robot has stopped"
+    description: Robot has stopped
     transitions:
       - event: ready
         target: ready
         actions:
           - log_event
-
       - event: pick
         target: picking
         actions:
           - log_event
-
       - event: place
         target: placing
         actions:
           - log_event
-
-      - event: measure_xrf_raman
-        target: measuring_xrf_raman
-        actions:
-          - log_event
-
       - event: return
         target: returning
         actions:
           - log_event
-
   error:
-    description: "Robot is in error state"
+    description: Robot is in error state
     transitions:
       - event: reset
         target: ready
+        actions:
+          - log_event
+  measuring_xrf:
+    description: Robot is performing the XRF measurement on the object
+    transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+      - event: error
+        target: error
+        actions:
+          - log_event
+  measuring_raman:
+    description: Robot is performing the Raman measurement on the object
+    transitions:
+      - event: complete
+        target: ready
+        actions:
+          - log_event
+      - event: error
+        target: error
         actions:
           - log_event

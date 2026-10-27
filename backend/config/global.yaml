@@ -72,7 +72,8 @@ object_workflow:
     - HSI_analysis
     - object_going_first_position
     - ai_processing
-    - XRF_RAMAN_analysis
+    - XRF_analysis
+    - RAMAN_analysis
     - moving_to_box
     - object_analyzed
 
@@ -83,9 +84,10 @@ object_workflow:
     3DI_analysis: imaging
     HSI_analysis: imaging
     object_going_second_position: rotating
-    XRF_RAMAN_analysis: measuring
     object_going_first_position: rotating
     ai_processing: planning
+    XRF_analysis: measuring
+    RAMAN_analysis: measuring
     moving_to_box: moving
     object_analyzed: analyzed
 

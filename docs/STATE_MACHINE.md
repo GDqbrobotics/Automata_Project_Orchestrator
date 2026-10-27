@@ -31,6 +31,20 @@ Subsystem state machines are the **boundary layer**: they are the only level tha
 
 **Action** — A side effect executed during a transition. Actions are either strings (built-in handlers) or dicts with a single key (custom handlers). The only built-in action is `log_event`. Custom actions are registered at runtime via `StateMachineEngine.register_action()`. Event actions (`event: name`) fire the on-transition-completion callback for cross-level communication.
 
+## Completion Contract (object ↔ subsystem)
+
+When an object enters a state with `meta.actor` or `meta.parallel_actors`,
+the pipeline tracks those subsystems and fires the state's outgoing
+transition once all of them report the ready state. Consequences for
+configuration:
+
+| Rule | Where enforced |
+|---|---|
+| Every subsystem **work state** has a transition back to the ready state | wizard validation (`ConfigService._validate_subsystem`), `simulation_test.py` |
+| Subsystem transitions only use `log_event` (no `event:` actions) | same |
+| Object `actor` / `parallel_actors` reference configured subsystems **that can complete** | `ConfigService._validate_object` (cross-file) |
+| The transition **into** a stage fires the next stage's commands; the state's own outgoing event is the internal completion label | `object.yaml` (R2) |
+
 ## Configuration Files
 
 | File | Purpose |
@@ -65,3 +79,16 @@ Subsystem state machines are the **boundary layer**: they are the only level tha
 11. **The subsystem SM is a mirror, not a predictor.** The orchestrator's local subsystem state machine reflects the subsystem's *real* state, which is authoritative and arrives as MQTT status reports (`automata/subsystem/<name>/status`). Issuing a command (publishing to `.../event`) does **not** advance the local SM: real subsystems take time to react, so advancing it on command would make it disagree with the state the subsystem actually reports. The local SM is only moved when a status report arrives (`SubsystemAdapter.mirror_reported_state`), which finds the YAML transition into the reported state and applies it *without* re-publishing MQTT. The simulated subsystem processes (`backend/simulation/*_sim.py`) keep their own SM that transitions on commands – that is the simulated hardware, indistinguishable from a real one.
 
 12. **Expected-state discrepancy check.** Because the local SM no longer advances on command, the orchestrator records the state a subsystem is *expected* to enter after each command and arms a timer (`orchestration.state_expect_timeout` in `global.yaml`, default 10 s; applied in `backend/adapters/subsystem.py`). If the subsystem never reports that state (or otherwise shows it reacted) within the window, a warning is raised (log + `subsystem_state_mismatch` frontend event) – flagging a slow, stuck, or unresponsive subsystem without changing the workflow state. The pipeline gates on the *effective* state (`WorkflowOrchestrator.subsystem_effective_state`): the pending expected working state while a command is in flight, otherwise the last reported state.
+
+13. **Completion is a state report, not an event.** A subsystem has
+    completed a work stage when it reports the **ready state** over MQTT
+    after a work state; that is what the pipeline (and the generic
+    simulator) watches for. Subsystem YAML transitions therefore only use
+    `log_event` — an `event:` action on a subsystem transition is ignored
+    (the config validator rejects it). The event name on an **object**
+    state's outgoing transition (e.g. `xrf_measurement_complete`) is an
+    internal label: the pipeline fires it when the state's actor(s) report
+    completion. Nothing outside the orchestrator "sends" that event. In
+    particular, every subsystem work state must define a transition back
+    to the ready state, or the workflow would wait for that subsystem
+    forever.

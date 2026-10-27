@@ -41,6 +41,20 @@ class WorkflowCommand(str, enum.Enum):
     # Debug mode only (--debug): inject an MQTT message on one of the
     # topics a real subsystem publishes, as if the subsystem sent it.
     DEBUG_SEND_SUBSYSTEM_MESSAGE = "debug_send_subsystem_message"
+    # Debug mode only (--debug): the configuration wizard. It reads,
+    # validates, patches and saves the YAML files under backend/config/
+    # while the workflow is not running.
+    GET_CONFIG = "get_config"
+    VALIDATE_CONFIG = "validate_config"
+    PATCH_CONFIG = "patch_config"
+    SAVE_CONFIG = "save_config"
+    CREATE_SUBSYSTEM = "create_subsystem"
+    DELETE_SUBSYSTEM = "delete_subsystem"
+    WRITE_SIMULATOR = "write_simulator"
+    RENDER_MESSAGE_FORMATS = "render_message_formats"
+    # Rebuild the `states:` block of a config file from the wizard's
+    # structured state-machine editor (states/transitions/messages).
+    RENDER_STATE_MACHINE = "render_state_machine"
 
 
 class Command(str, enum.Enum):
@@ -73,6 +87,14 @@ class BackendEvent(str, enum.Enum):
     # reported that (or any other) state: its real state lags the
     # expectation (see adapters/subsystem.py).
     SUBSYSTEM_STATE_MISMATCH = "subsystem_state_mismatch"
+    # Configuration wizard (debug mode only): snapshot of the editable
+    # config files, an in-memory patch result, a saved file, a validation
+    # result and a deleted subsystem.
+    CONFIG_SNAPSHOT = "config_snapshot"
+    CONFIG_PATCHED = "config_patched"
+    CONFIG_VALIDATED = "config_validated"
+    CONFIG_SAVED = "config_saved"
+    SUBSYSTEM_DELETED = "subsystem_deleted"
 
 
 @dataclass

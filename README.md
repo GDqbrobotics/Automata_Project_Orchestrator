@@ -145,7 +145,7 @@ Other useful invocations:
 | `python launch_gui.py` | normal mode — talks to the real subsystems over MQTT |
 | `python launch_gui.py --simulation --num-objects N` | simulation with N objects in the box |
 | `python launch_gui.py --broker <host> --mqtt-port <port>` | connect to an existing broker |
-| `python launch_gui.py --debug` | adds a debug panel to the subsystem windows (see below) |
+| `python launch_gui.py --debug` | adds a debug panel to the subsystem windows **and reveals the configuration wizard** (see below) |
 | `python launch_gui.py --ws-port <port>` | move the backend WebSocket port |
 | `python launch_gui.py --verbose` | detailed logging |
 
@@ -173,6 +173,19 @@ over an already-running instance (port conflict) is intentional.
   can hand-inject the status/response messages a real subsystem would
   publish, to test the orchestrator without hardware or to replay a
   specific message (e.g. a different object list from the camera).
+- **Configuration wizard** (only with `--debug`) — the ⚙ button in the top
+  bar opens a four-step guided editor for the YAML configuration: workflow
+  lifecycle and global settings, subsystems (basics, **add from a guided
+  template**, **remove with a reference check**), the **MQTT message
+  formats** and a review/save step. A **structured state-machine editor**
+  (states, transitions and the events/actions they carry) works on
+  `workflow.yaml` and `object.yaml` (where it also edits each state's
+  physical `meta`) and on every subsystem. It edits the same files
+  described under "Configuration", validates everything — including the
+  cross-file completion contract, so a run cannot be saved into a
+  configuration that would hang — before writing (the raw YAML stays
+  comment-preserving when structured forms are applied), and asks for a
+  restart so the changes are loaded.
 
 ## Configuration
 
@@ -201,11 +214,21 @@ rejects anything the configuration does not define.
   name, whether it is required for the run to start, simulated work
   durations, its reporting role if any) and the subsystem's state
   machine.
+- **`mqtt_formats.yaml`** — the payload field-mapping layer for every MQTT
+  message exchanged with a subsystem (command / hardware command / status /
+  response), with per-subsystem overrides and dotted paths for nested
+  payloads. A real subsystem that already speaks its own payload shape is
+  integrated here without touching Python; the orchestrator, the receive
+  path and the simulated subsystems all use the same format.
 
 The GUI is driven by the same files: the operator-button matrix, the
 workflow/object state-machine graphs and the display vocabulary are
 *broadcast to the frontend* from the YAML at startup, so a rename in the
-config shows up in the UI without any code change.
+config shows up in the UI without any code change. The GUI also *writes*
+these files through the **configuration wizard** (debug mode), which is a
+thin transport over `backend/services/config_service.py` — validation,
+comment-preserving patches and atomic writes happen in Python, never in
+the browser.
 
 **Adding a subsystem** is a configuration exercise: create a new YAML in
 `backend/config/subsystems/` with the subsystem's name and state machine,
@@ -257,3 +280,6 @@ launch_gui.py             # the single entry point for everything
   rules and how the YAML configuration works.
 - [DEVELOPEMENT_JOURNAL.md](DEVELOPEMENT_JOURNAL.md) — what changed recently;
   the right place to look before starting a development session.
+- [docs/IMPROVEMENT_IDEAS.md](docs/IMPROVEMENT_IDEAS.md) — collected ideas for
+  the next iterations (cross-file validation, config backup/diff, hot-reload,
+  schema-driven forms, CI, ...).

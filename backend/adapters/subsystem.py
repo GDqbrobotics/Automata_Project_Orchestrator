@@ -18,7 +18,6 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -28,6 +27,7 @@ from backend.domain.models import (
     SubsystemInfo,
     SubsystemState,
 )
+from backend.messaging.message_format import MessageFormat, MessageFormatSet
 from backend.state.state_machine import StateMachineError
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,9 @@ class SubsystemAdapter:
     metadata: Dict[str, Any] = field(default_factory=dict)
     # Per-subsystem MQTT topic template (subsystem YAML `mqtt_topic`).
     mqtt_topic: str = "automata/subsystem/{name}"
+    # MQTT payload format (mqtt_formats.yaml, R10): how this subsystem's
+    # commands are built and its reports are parsed.
+    message_format: MessageFormat = field(default_factory=MessageFormat)
     # Shared vocabulary (global.yaml `states:`)
     ready_state: str = "ready"
     non_work_states: frozenset = field(
@@ -229,16 +232,11 @@ class SubsystemAdapter:
         if event not in self.report_events:
             # Outgoing command: record the expectation (discrepancy check) and
             # publish it. The local SM keeps its last reported state until the
-            # subsystem confirms the new state over MQTT.
+            # subsystem confirms the new state over MQTT. The payload shape
+            # comes from the configured message format (R10).
             self._record_expected(expected, event, sm.current_state)
             topic = self.event_topic
-            payload = {
-                "event": event,
-                "source": "orchestrator",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            if data:
-                payload.update(data)
+            payload = self.message_format.command.build(event, data)
             self.mqtt_client.publish(topic, payload, qos=1)
             logger.info(
                 "[Boundary] Subsystem '%s' command '%s' -> expected '%s' (MQTT '%s')",
@@ -377,9 +375,12 @@ class SubsystemAdapter:
 
     def send_command(self, command: str, payload: Optional[Dict[str, Any]] = None) -> None:
         topic = self.command_topic
-        self.mqtt_client.publish(topic, payload or {})
+        # Built through the configured command format (R10), so a legacy
+        # /command consumer and the /event path see the same shape.
+        message = self.message_format.command.build(command, payload)
+        self.mqtt_client.publish(topic, message)
         if self.on_mqtt_publish:
-            self.on_mqtt_publish(topic, payload or {})
+            self.on_mqtt_publish(topic, message)
 
     def is_ready(self) -> bool:
         return self.state == SubsystemState.READY
@@ -394,12 +395,18 @@ class SubsystemAdapterFactory:
         subsystems_config: List[SubsystemConfig],
         config_dir: Optional[Path] = None,
         global_config: Optional[GlobalConfig] = None,
+        message_formats: Optional[MessageFormatSet] = None,
     ) -> None:
         self.mqtt_client = mqtt_client
         self.subsystems_config = subsystems_config
         self.config_dir = config_dir or Path(__file__).resolve().parent.parent / "config" / "subsystems"
         # Shared vocabulary + discrepancy timeout (global.yaml, R1).
         self.global_config = global_config or GlobalConfig()
+        # Payload formats (mqtt_formats.yaml, R10): loaded from the parent
+        # of the subsystems dir (backend/config/) when not injected.
+        self.message_formats = message_formats or MessageFormatSet.load(
+            self.config_dir.parent
+        )
         self.adapters: Dict[str, SubsystemAdapter] = {}
         self._build_adapters()
 
@@ -421,6 +428,7 @@ class SubsystemAdapterFactory:
                 required=cfg.required,
                 metadata=cfg.metadata,
                 mqtt_topic=cfg.mqtt_topic,
+                message_format=self.message_formats.for_subsystem(cfg.name),
                 ready_state=self.global_config.states_ready,
                 non_work_states=self.global_config.non_work_states,
                 report_events=self.global_config.report_events,
