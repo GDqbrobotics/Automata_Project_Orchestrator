@@ -158,3 +158,61 @@ the XRF/Raman split a fully guided operation.
 object metas, message formats, config service — no broker) and the full
 end-to-end `simulation_test.py`, wire the fast one plus `npm run build` into
 a pre-commit hook / GitHub Actions job, and keep the full run nightly.
+
+---
+
+Ideas opened by the real-interface scripts feature (R11,
+`metadata.interface`):
+
+## 14. Interface health watchdog (high value, low effort)
+
+`metadata.interface` launches the real interface and trusts it. Nothing
+detects an interface that died right after starting (the subsystem simply
+never reports `ready` and the run stalls in `starting` with only the
+generic "not ready" message).
+
+**Idea:** after a successful `ensure_started`, arm a readiness timer
+(reuse the discrepancy-check machinery, `orchestration.state_expect_timeout`):
+if the subsystem has not reported *any* state within N seconds of the
+launch, emit an error event naming the interface and, optionally, re-run
+the startup script once. A heartbeat gap on a subsystem whose interface we
+manage could trigger the same recovery path.
+
+## 15. Remote interfaces (the subsystems live on other PCs)
+
+The startup/shutdown commands run on the orchestrator's machine, but
+PROJECT_CONTEXT places most subsystems on other computers (Ubuntu and
+Windows). Today the operator works around it by making the command an
+`ssh host 'systemctl start xrf'` one-liner — which works but scatters
+host names through the YAML.
+
+**Idea:** support an optional `host:` key in `metadata.interface`
+(executed via a configured `ssh`/agent command by the interface manager),
+or document the one-liner pattern in R11 and validate that the configured
+command is non-empty per enabled interface. A per-subsystem
+`interface.host` keeps the YAML declarative and lets the wizard show
+"runs on <host>".
+
+## 16. Interface log viewer in the subsystem inspector (medium value, low effort)
+
+The interface output already lands in `backend/interface_logs/<name>.log`,
+but you have to open the file manually.
+
+**Idea:** a `get_interface_log` command (debug mode, or always for
+configured interfaces) that returns the last N lines of the log, rendered
+in the subsystem inspector as a collapsible panel — the fastest way to
+answer "why did the camera interface not come up?".
+
+## 17. Generalized per-state script hooks (only if ever needed)
+
+R11 deliberately attached the scripts to the subsystem (startup before
+initialization, shutdown on `stopped`) instead of to states, because the
+startup case is special: the interface must run *before* the subsystem
+can report entering any state, so a "run on entering state X" hook could
+never express it.
+
+**Idea:** if a real use case appears for side effects on *other* state
+entries (e.g. warm-up on `ready`, teardown on `error`), add an optional
+`on_enter` script to the state editor instead of special-casing states in
+Python — but keep the interface pair in `metadata.interface`, where the
+orchestrator's proactive launch semantics live.

@@ -95,6 +95,10 @@ class BackendEvent(str, enum.Enum):
     CONFIG_VALIDATED = "config_validated"
     CONFIG_SAVED = "config_saved"
     SUBSYSTEM_DELETED = "subsystem_deleted"
+    # The orchestrator launched / stopped the real interface of a
+    # subsystem (subsystem YAML metadata.interface, R11) — headless, the
+    # subsystem state is known through MQTT from then on.
+    INTERFACE_COMMAND = "interface_command"
 
 
 @dataclass
@@ -138,6 +142,40 @@ class SubsystemConfig:
             "required": self.required,
             "metadata": self.metadata,
         }
+
+
+@dataclass
+class InterfaceConfig:
+    """Real-interface scripts of a subsystem (subsystem YAML metadata).
+
+    A real subsystem cannot initialize until its interface (ROS node,
+    device daemon, ...) is running. ``metadata.interface`` declares the
+    shell commands the orchestrator executes *headless*:
+
+    - ``startup``  - launched when the subsystem's interface is needed
+      (orchestrator start, workflow start / wake of a stopped subsystem,
+      SIM->REAL toggle): the subsystem boots and reports its state over
+      MQTT like any hardware.
+    - ``shutdown`` - launched when the subsystem reports entering the
+      ``stopped`` state and, waited on, at orchestrator shutdown.
+    """
+
+    enabled: bool = False
+    startup: str = ""
+    shutdown: str = ""
+    cwd: str = ""
+
+    @classmethod
+    def from_metadata(cls, metadata: Optional[Dict[str, Any]]) -> "InterfaceConfig":
+        raw = (metadata or {}).get("interface")
+        if not isinstance(raw, dict):
+            return cls()
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            startup=str(raw.get("startup") or ""),
+            shutdown=str(raw.get("shutdown") or ""),
+            cwd=str(raw.get("cwd") or ""),
+        )
 
 
 @dataclass

@@ -32,6 +32,7 @@ export type WorkflowEvent =
   | 'object_removed'
   | 'object_alias_assigned'
   | 'subsystem_simulation_toggled'
+  | 'interface_command'
   | 'subsystem_message'
   | 'object_message'
   | 'messages_cleared'

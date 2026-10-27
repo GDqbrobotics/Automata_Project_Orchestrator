@@ -562,6 +562,29 @@ class ConfigService:
             errors.append("'required' must be true or false")
         # Reporting roles (R5): the declared `after` transition must exist.
         metadata = data.get("metadata") or {}
+        # Real-interface scripts (R11): an enabled interface needs the
+        # command that starts it, otherwise the orchestrator could never
+        # bring the subsystem's interface up.
+        interface = metadata.get("interface") if isinstance(metadata, dict) else None
+        if interface is not None:
+            if not isinstance(interface, dict):
+                errors.append("metadata.interface must be a mapping")
+            else:
+                if not isinstance(interface.get("enabled", False), bool):
+                    errors.append("metadata.interface.enabled must be true or false")
+                if interface.get("enabled") and not str(interface.get("startup") or "").strip():
+                    errors.append(
+                        "metadata.interface: 'startup' is required when "
+                        "'enabled' is true (the command that starts the "
+                        "subsystem's real interface)"
+                    )
+                for key in ("startup", "shutdown", "cwd"):
+                    if key in interface and not str(interface.get(key) or "").strip():
+                        errors.append(
+                            f"metadata.interface.{key} must not be empty "
+                            f"(remove the key instead)"
+                        )
+        # Reporting roles (R5): the declared `after` transition must exist.
         for rep in metadata.get("reports") or []:
             if not isinstance(rep, dict) or not rep.get("type"):
                 errors.append("metadata.reports: every report needs a 'type'")
@@ -934,7 +957,22 @@ class ConfigService:
             work_state=work_state,
             work_event=work_event,
         )
-        content = header + yaml_body + state_machine
+        # Discoverability note for the real-interface scripts (R11): the
+        # block itself stays commented out so a new subsystem is inert
+        # until the operator fills it in (or uses the wizard's Basics tab).
+        interface_note = (
+            "\n# Real-interface scripts (docs/CONFIG_CHANGE_GUIDE.md, R11):\n"
+            "# uncomment under metadata: (or edit in the wizard's Basics tab):\n"
+            "#   interface:\n"
+            "#     enabled: true\n"
+            "#     startup: interfaces/start_{name}.sh   # shell command, headless\n"
+            "#     shutdown: interfaces/stop_{name}.sh   # optional\n"
+            "# The orchestrator runs 'startup' when the interface is needed\n"
+            "# (orchestrator start, wake, SIM->REAL) and 'shutdown' when the\n"
+            "# subsystem reports stopped; output goes to\n"
+            "# backend/interface_logs/{name}.log.\n"
+        ).format(name=name)
+        content = header + yaml_body + state_machine + interface_note
 
         rel = self._rel(path)
         errors = self.validate_content(rel, content)

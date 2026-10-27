@@ -186,6 +186,14 @@ over an already-running instance (port conflict) is intentional.
   configuration that would hang — before writing (the raw YAML stays
   comment-preserving when structured forms are applied), and asks for a
   restart so the changes are loaded.
+- **Real-interface scripts** — a subsystem YAML can declare
+  `metadata.interface` (enable + startup/shutdown command, editable in the
+  wizard's Basics tab). The orchestrator runs the startup command
+  **headless** when the subsystem's interface is needed (launch, run start
+  after a stop, SIM→REAL toggle) and the shutdown command when the
+  subsystem reports `stopped`; from then on the subsystem state is known
+  through MQTT only. Output lands in `backend/interface_logs/<name>.log`
+  and every launch/stop shows up in the event log.
 
 ## Configuration
 
@@ -212,8 +220,9 @@ rejects anything the configuration does not define.
   works on it — the pipeline controller is driven by these declarations.
 - **`subsystems/<name>.yaml`** — one file per subsystem: metadata (display
   name, whether it is required for the run to start, simulated work
-  durations, its reporting role if any) and the subsystem's state
-  machine.
+  durations, its reporting role if any, and the optional `interface`
+  scripts that start/stop the real subsystem's interface headless) and
+  the subsystem's state machine.
 - **`mqtt_formats.yaml`** — the payload field-mapping layer for every MQTT
   message exchanged with a subsystem (command / hardware command / status /
   response), with per-subsystem overrides and dotted paths for nested

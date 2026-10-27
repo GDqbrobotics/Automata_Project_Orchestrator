@@ -936,10 +936,35 @@ export class ConfigWizard {
         fieldRow('Init duration (s)', patchedInput('metadata.init_duration', str(getPath(file.parsed, ['metadata', 'init_duration'])), 'number')),
       );
       form.appendChild(fields);
+      form.appendChild(el('h5', 'cw-form-title', 'Interface (real hardware)'));
+      const ifaceFields = el('div', 'cw-fields');
+      ifaceFields.appendChild(
+        fieldRow('Manage interface', patchedInput('metadata.interface.enabled', str(getPath(file.parsed, ['metadata', 'interface', 'enabled'])), 'bool')),
+      );
+      ifaceFields.appendChild(
+        fieldRow('Startup command', patchedInput('metadata.interface.startup', str(getPath(file.parsed, ['metadata', 'interface', 'startup'])))),
+      );
+      ifaceFields.appendChild(
+        fieldRow('Shutdown command', patchedInput('metadata.interface.shutdown', str(getPath(file.parsed, ['metadata', 'interface', 'shutdown'])))),
+      );
+      ifaceFields.appendChild(
+        fieldRow('Working directory', patchedInput('metadata.interface.cwd', str(getPath(file.parsed, ['metadata', 'interface', 'cwd'])))),
+      );
+      form.appendChild(ifaceFields);
       form.appendChild(this.applyButton(file, form));
       detail.appendChild(form);
       detail.appendChild(
         el('p', 'cw-form-hint', 'The machine initial state is chosen in the State machine tab.'),
+      );
+      detail.appendChild(
+        el(
+          'p',
+          'cw-form-hint',
+          'Interface: the shell command that starts (and stops) the real subsystem interface. ' +
+            'Run headless by the orchestrator when the subsystem must initialize (start, wake, SIM→REAL) ' +
+            'and when it reports stopped; the subsystem state is then known through MQTT only. ' +
+            'Output goes to backend/interface_logs/<name>.log. Simulated subsystems are never touched.',
+        ),
       );
 
       if (file.created) {

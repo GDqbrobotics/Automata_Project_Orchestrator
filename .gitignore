@@ -2,3 +2,4 @@ __pycache__
 node_modules/
 object_states/
 frontend/dist/assets/
+backend/interface_logs/

@@ -325,6 +325,19 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     });
   }
 
+  // Real-interface scripts (metadata.interface): the orchestrator
+  // launched or stopped a subsystem's interface headless.
+  if (m.event === 'interface_command' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    const ok = Boolean(d.ok);
+    logs.push({
+      time: now(),
+      source: 'interface',
+      message: `${d.subsystem}: interface ${d.action}${ok ? '' : ' FAILED'} — ${d.command}`,
+      level: ok ? 'info' : 'error',
+    });
+  }
+
   // Handle object alias assignment (operator action)
   if (m.event === 'object_alias_assigned' && m.details) {
     const d = m.details as Record<string, unknown>;

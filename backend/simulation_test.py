@@ -1292,6 +1292,96 @@ def test_scoped_event_routing() -> None:
 # ---------------------------------------------------------------------------
 # Test 12: Debug mode (manual MQTT injection from the subsystem windows)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Test 16: Real-interface scripts (metadata.interface, R11)
+# ---------------------------------------------------------------------------
+def _wait_for_condition(check, timeout_s: float, interval_s: float = 0.2) -> bool:
+    """Poll a condition until it holds or the timeout expires."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(interval_s)
+    return check()
+
+
+def test_interface_scripts() -> None:
+    """Test: the orchestrator launches and stops a subsystem's real interface.
+
+    The subsystem YAML declares headless shell commands under
+    metadata.interface (R11): startup runs when the interface is needed
+    (here: at orchestrator start), shutdown runs when the subsystem
+    reports entering the stopped state.
+    """
+    logger.info("--- TEST 16: Real-interface scripts (metadata.interface) ---")
+
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        config_dir = tmpdir / "config"
+        shutil.copytree(CONFIG_DIR, config_dir)
+        config_path = str(config_dir / "workflow.yaml")
+        subsystems_dir = str(config_dir / "subsystems")
+
+        # Configure a startup + shutdown script for raman: both append to
+        # a marker file. The startup process stays alive (blocking style)
+        # so the shutdown path also exercises terminating the tracked
+        # startup process.
+        marker = tmpdir / "iface_marker.log"
+        raman_path = config_dir / "subsystems" / "raman.yaml"
+        raman_data = yaml.safe_load(raman_path.read_text())
+        raman_data["metadata"]["interface"] = {
+            "enabled": True,
+            "startup": f"echo up >> {marker}; sleep 120",
+            "shutdown": f"echo down >> {marker}",
+        }
+        raman_path.write_text(yaml.safe_dump(raman_data))
+
+        runner = OrchestratorRunner(config_path, subsystems_dir, use_simulation=False)
+        runner.start()
+        try:
+            results.check(
+                _wait_for_condition(
+                    lambda: marker.exists() and "up" in marker.read_text(), 10.0
+                ),
+                "Startup script ran when the orchestrator started (marker has 'up')",
+            )
+            results.check(
+                "up" in marker.read_text() and "down" not in marker.read_text(),
+                "Shutdown script did not run yet",
+            )
+
+            # Report the subsystem as stopped (the transition a workflow
+            # stop produces): the shutdown script must run exactly once.
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 10)
+            client.loop_start()
+            client.publish(
+                f"{TOPIC_SUBSYSTEM}/raman/status",
+                json.dumps({"state": "stopped", "name": "raman"}),
+                qos=1,
+            )
+            time.sleep(0.5)
+            client.loop_stop()
+            client.disconnect()
+
+            results.check(
+                _wait_for_condition(
+                    lambda: marker.exists() and "down" in marker.read_text(), 10.0
+                ),
+                "Shutdown script ran when the subsystem reported stopped",
+            )
+            content = marker.read_text()
+            results.check(
+                content.count("up") == 1 and content.count("down") == 1,
+                f"Startup/shutdown each ran exactly once (marker: {content!r})",
+            )
+        finally:
+            runner.stop()
+
+
 async def test_debug_mode() -> None:
     """Test: the --debug manual MQTT injection feature.
 
@@ -2072,6 +2162,36 @@ def test_config_service() -> None:
             "Validation refuses event actions on subsystem transitions (silent no-op)",
         )
 
+        # Real-interface scripts (R11): enabled without a startup command
+        # is refused; a valid interface block is accepted.
+        iface_robot = yaml.safe_load(
+            (config_dir / "subsystems" / "robot_first.yaml").read_text()
+        )
+        iface_robot["metadata"]["interface"] = {"enabled": True}
+        results.check(
+            any(
+                "'startup' is required" in e
+                for e in service.validate_content(
+                    "backend/config/subsystems/robot_first.yaml",
+                    yaml.safe_dump(iface_robot, sort_keys=False),
+                )
+            ),
+            "Validation refuses an enabled interface without a startup command",
+        )
+        iface_robot["metadata"]["interface"] = {
+            "enabled": True,
+            "startup": "interfaces/start_robot.sh",
+            "shutdown": "interfaces/stop_robot.sh",
+        }
+        results.check(
+            service.validate_content(
+                "backend/config/subsystems/robot_first.yaml",
+                yaml.safe_dump(iface_robot, sort_keys=False),
+            )
+            == [],
+            "Validation accepts a well-formed interface block",
+        )
+
         # Object actors are cross-checked against the subsystem machines.
         obj_data = yaml.safe_load((config_dir / "object.yaml").read_text())
         obj_data["states"]["XRF_analysis"]["meta"]["actor"] = "ghost_subsystem"
@@ -2141,6 +2261,8 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         test_message_formats()
         time.sleep(1)
         test_config_service()
+        time.sleep(1)
+        test_interface_scripts()
         time.sleep(1)
         await test_debug_mode()
         time.sleep(1)

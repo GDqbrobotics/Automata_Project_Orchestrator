@@ -8,20 +8,51 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 
 - Launch everything: `python launch_gui.py --simulation --num-objects 3` (UI on http://localhost:3000; starts mosquitto + backend + frontend — in simulation mode the *backend* starts the `backend/simulation/*_sim.py` processes itself)
 - Per-subsystem simulation toggle: in simulation mode each subsystem card has a **SIM/REAL** chip (before starting the workflow) to decide which subsystems are simulated and which are real
+- Real-interface scripts: a subsystem's `metadata.interface` (R11) declares the headless startup/shutdown commands for its real interface; the orchestrator launches them (start, wake, SIM→REAL toggle / when the subsystem reports `stopped`) via `backend/services/interface_manager.py`
 - Debug mode: `python launch_gui.py --debug` — subsystem inspector windows gain a panel to manually send the MQTT messages a real subsystem would publish (user-driven simulation), and the top bar reveals the **configuration wizard**
 - MQTT payload formats are configurable: `backend/config/mqtt_formats.yaml` maps every message kind to payload fields, with per-subsystem overrides (R10, `backend/messaging/message_format.py`); the adapters, the orchestrator receive path and the simulated subsystems all build/parse through it
 - Configuration wizard (debug mode only): 4 steps — workflow/global/object YAML, subsystem edit/add/remove, MQTT formats, review & save; backend `backend/services/config_service.py` validates, comment-preservingly patches and atomically writes, so the browser never touches files
-- Validation: `timeout 500 python backend/simulation_test.py` — 151 tests + 28 new checks (C14 message formats, C15 config service, wizard checks in C12); frontend `npm run build` clean
+- Validation: `timeout 500 python backend/simulation_test.py` — **203 checks** (C14 message formats, C15 config service, C16 interface scripts, wizard checks in C12); frontend `npm run build` clean
 - Validate: `timeout 500 python backend/simulation_test.py` — **always wrap in a timeout** (a bug can make it hang forever)
 - All state machines are YAML-driven: `backend/config/workflow.yaml`, `object.yaml`, `subsystems/*.yaml`, `global.yaml`. Simulated subsystems load the *same* YAML as the orchestrator. Work durations live in the subsystem YAML metadata (`work_durations`).
 - The object flow is driven by `backend/orchestrator/pipeline.py` (PipelineController) from MQTT status reports — identical code path for simulated and real subsystems.
-- Object workflow has an explicit `ai_processing` state between `object_going_first_position` and `XRF_RAMAN_analysis`: the object waits on the first position until the AI finishes extracting the XRF/Raman interest points (see Latest changes 2026-09-14 / ai_processing).
+- Object workflow has an explicit `ai_processing` state between `object_going_first_position` and `XRF_analysis`: the object waits on the first position until the AI finishes extracting the XRF/Raman interest points; the analysis itself is two sequential stages, `XRF_analysis` then `RAMAN_analysis` (see Latest changes 2026-09-14 / ai_processing and 2026-10-27 / completion contract).
 - Object data is stored **locally**; the local database is updated manually — there is no cloud_database subsystem (operator alias IDs are the local-database IDs).
 - Imaging on the second disk position is two sequential stages, **3DI first then HSI**, handled by two subsystems: `imaging_3di` and `imaging_hsi`.
 - The orchestrator's local **subsystem SM is a mirror, not a predictor**: issuing a command does NOT advance it (real subsystems lag); it only follows the state the subsystem reports over MQTT. An expected-state **discrepancy check** warns if a subsystem never reports the state it was commanded into (window: `orchestration.state_expect_timeout` in `global.yaml`, default 10 s).
 - **The YAML is the single source of truth** (docs/CONFIG_CHANGE_GUIDE.md, implemented 2026-10-08): no state/event names, subsystem names, topics, durations or button rules are hardcoded in Python or TypeScript. The GUI derives its operator-button matrix, state-machine graphs, tones and display vocabulary from the same YAML, broadcast at startup; a rename in `backend/config/` is a config-only change.
 
-## Latest changes (2026-10-27 — configuration wizard + configurable MQTT formats)
+## Latest changes (2026-10-27 — subsystem real-interface scripts)
+
+A real subsystem cannot initialize until its interface (ROS node, device
+daemon, …) runs. The subsystem YAML can now declare the commands that
+start and stop that interface (`metadata.interface`, R11 in
+`docs/CONFIG_CHANGE_GUIDE.md`), and the orchestrator executes them
+**headless** — detached, output appended to
+`backend/interface_logs/<name>.log` — because from that moment the
+subsystem state is known through MQTT only (`backend/services/interface_manager.py`).
+
+- `startup` runs when the interface is needed: at orchestrator start,
+  at workflow start (a subsystem left `stopped` gets its interface back
+  before the wake transition) and on a SIM→REAL toggle; always skipped
+  while a simulated process serves the subsystem.
+- `shutdown` runs when the subsystem reports entering `stopped`
+  (fire-and-forget so the MQTT receive path never blocks) and, waited on
+  with a 5 s timeout, at orchestrator shutdown; a still-alive tracked
+  startup process is terminated best-effort so no orphan interface
+  survives.
+- Values are shell command lines (a launcher that spawns a daemon and
+  exits is as valid as a long-running process); scripts must be
+  idempotent; relative paths resolve against the project root; validation
+  refuses an enabled interface without a `startup` command; every
+  launch/stop is mirrored to the frontend event log (`interface_command`).
+- Wizard: Subsystems → Basics → *Interface (real hardware)* (enabled
+  checkbox + startup/shutdown/cwd, same comment-preserving patches).
+- Tests: C16 `test_interface_scripts` (startup at start, shutdown on the
+  stopped report, exactly-once semantics) + validation refusals in C15;
+  **203/203** pass, frontend build clean.
+
+## Earlier changes (2026-10-27 — configuration wizard + configurable MQTT formats)
 
 Two additions, both debug-friendly and fully config-driven.
 

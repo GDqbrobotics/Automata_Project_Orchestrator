@@ -219,6 +219,43 @@ subsystems:                      # per-subsystem overrides, deep-merged over def
 
 ---
 
+## R11 — Real-Interface Scripts (`metadata.interface`)
+
+A real subsystem cannot initialize until its interface (ROS node, device
+daemon, camera service, …) is running. The subsystem YAML declares the
+shell commands that start and stop that interface; the orchestrator
+executes them **headless** (detached, output appended to
+`backend/interface_logs/<name>.log`) because from that moment the
+subsystem state is known through MQTT messages only
+(`backend/services/interface_manager.py`).
+
+```yaml
+# subsystems/<name>.yaml
+metadata:
+  interface:
+    enabled: true
+    startup: interfaces/start_xrf.sh     # shell command line (required)
+    shutdown: interfaces/stop_xrf.sh     # optional
+    cwd: /opt/xrf                        # optional working directory
+```
+
+| Hook | When it runs |
+|---|---|
+| `startup` | orchestrator start; workflow start (a subsystem left `stopped` gets its interface back before the wake transition); SIM→REAL toggle — **skipped while a simulated process serves the subsystem** |
+| `shutdown` | the subsystem reports entering the `stopped` state (fire-and-forget, never blocks the MQTT receive path); orchestrator shutdown (waited, 5 s timeout) |
+
+**Rules:**
+- `enabled: false` (or no `interface` section at all) → the orchestrator never touches the interface (backwards compatible).
+- The value is a **command line** run through the shell, so a launcher that spawns a daemon and exits (`systemctl start …`, `ssh host …`) is as valid as a long-running process; a still-alive tracked startup process is terminated best-effort after the shutdown script.
+- Scripts must be **idempotent**: after an orchestrator restart the startup command runs again.
+- Relative paths are resolved against the project root; the startup/shutdown commands are validated (an enabled interface without `startup` is refused).
+- Every launch/stop is mirrored to the frontend event log (`interface_command`) and to `backend/interface_logs/<name>.log`.
+- Simulated subsystems are never touched: in simulation mode the simulator *is* the subsystem.
+
+**Wizard:** Subsystems → Basics → *Interface (real hardware)* — enable/disable and edit the commands (same comment-preserving patch as every other field).
+
+---
+
 ## R6 — Object Journey Final States (Derived, Not Hardcoded)
 
 The object workflow's final state(s) are **states with no outgoing transitions** in `object.yaml`. Code uses `StateMachineConfig.final_states` property.
@@ -450,7 +487,7 @@ states: {state_name: {description, meta{position, actor?, parallel_actors[], rot
 ### subsystems/*.yaml
 ```yaml
 name, display_name, type, mqtt_topic, initial_state, required
-metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}}]}
+metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}}], interface{enabled, startup, shutdown?, cwd?}}
 states: {state_name: {description, transitions[{event, target, actions[]}]}}
 ```
 
