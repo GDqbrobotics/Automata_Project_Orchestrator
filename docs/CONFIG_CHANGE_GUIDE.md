@@ -241,7 +241,7 @@ metadata:
 
 | Hook | When it runs |
 |---|---|
-| `startup` | **when the workflow starts** (`start_requested` — before the wake transitions are sent). Launching the GUI does *not* power the subsystems. Also on a SIM→REAL toggle. Skipped while a simulated process serves the subsystem, and skipped while the interface is already up (subsystems left `stopped` with a shut-down interface are relaunched here too) |
+| `startup` | **when the workflow starts** (`start_requested` — before the wake transitions are sent). Neither launching the GUI nor toggling a subsystem SIM→REAL powers the hardware. Skipped while a simulated process serves the subsystem, and skipped while the interface is already up (subsystems left `stopped` with a shut-down interface are relaunched here too) |
 | `shutdown` | when the workflow **reaches its stop state** (the operator Stop button or the automatic end-of-run stop; fire-and-forget) and at orchestrator shutdown, i.e. when the GUI closes (waited, 5 s timeout) |
 
 A subsystem *reporting* the `stopped` state only marks its interface down
@@ -257,6 +257,8 @@ the workflow stop and the GUI shutdown.
 - Simulated subsystems are never touched: in simulation mode the simulator *is* the subsystem.
 
 **Wizard:** Subsystems → Basics → *Interface (real hardware)* — enable/disable and edit the commands (same comment-preserving patch as every other field).
+
+**Operator flow (simulation mode):** toggle the subsystems that must run on real hardware to REAL (this only switches the routing — nothing is started), then press Start: the orchestrator launches their interfaces headless and waits in `starting` until the hardware reports ready.
 
 ---
 

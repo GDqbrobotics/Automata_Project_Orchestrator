@@ -1480,6 +1480,80 @@ async def test_object_points_flow() -> None:
         runner.stop()
 
 
+async def test_toggle_starts_no_interface() -> None:
+    """Test: toggling SIM->REAL starts no interface (R11).
+
+    The interface scripts follow the *workflow* start, not the operator
+    panel: a toggle alone must never power the hardware (the regression
+    the operator hit when switching Robot Arm 1 to real started the real
+    stack immediately).
+    """
+    logger.info("--- TEST 18: SIM->REAL toggle starts no interface ---")
+
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        config_dir = tmpdir / "config"
+        shutil.copytree(CONFIG_DIR, config_dir)
+        config_path = str(config_dir / "workflow.yaml")
+        subsystems_dir = str(config_dir / "subsystems")
+
+        marker = tmpdir / "robot_iface_marker.log"
+        robot_path = config_dir / "subsystems" / "robot_first.yaml"
+        robot_data = yaml.safe_load(robot_path.read_text())
+        robot_data["metadata"]["interface"] = {
+            "enabled": True,
+            "startup": f"echo up >> {marker}",
+            "shutdown": f"echo down >> {marker}",
+        }
+        robot_path.write_text(yaml.safe_dump(robot_data))
+
+        runner = OrchestratorRunner(
+            config_path, subsystems_dir, use_simulation=True, num_objects=1
+        )
+        runner.start()
+        try:
+            ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+            await ws_client.connect()
+
+            # Toggling the robot to real must not launch its interface.
+            await ws_client.send_command(
+                "toggle_subsystem_simulation", {"subsystem": "robot_first"}
+            )
+            await ws_client.receive()
+            time.sleep(1.5)
+            results.check(
+                not marker.exists(),
+                "SIM->REAL toggle starts no interface (marker absent)",
+            )
+
+            # Starting the workflow does.
+            await ws_client.send_command("start_workflow")
+            await ws_client.receive()
+            results.check(
+                _wait_for_condition(
+                    lambda: marker.exists() and "up" in marker.read_text(), 10.0
+                ),
+                "Workflow start launches the interface of the real subsystem",
+            )
+
+            # Stopping the workflow shuts it down again.
+            await ws_client.send_command("stop_workflow")
+            await ws_client.receive()
+            results.check(
+                _wait_for_condition(
+                    lambda: "down" in marker.read_text(), 10.0
+                ),
+                "Workflow stop shuts the interface down",
+            )
+
+            await ws_client.ws.close()
+        finally:
+            runner.stop()
+
+
 async def test_debug_mode() -> None:
     """Test: the --debug manual MQTT injection feature.
 
@@ -2399,6 +2473,8 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         await test_interface_scripts()
         time.sleep(1)
         await test_object_points_flow()
+        time.sleep(1)
+        await test_toggle_starts_no_interface()
         time.sleep(1)
         await test_debug_mode()
         time.sleep(1)

@@ -22,7 +22,34 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - The orchestrator's local **subsystem SM is a mirror, not a predictor**: issuing a command does NOT advance it (real subsystems lag); it only follows the state the subsystem reports over MQTT. An expected-state **discrepancy check** warns if a subsystem never reports the state it was commanded into (window: `orchestration.state_expect_timeout` in `global.yaml`, default 10 s).
 - **The YAML is the single source of truth** (docs/CONFIG_CHANGE_GUIDE.md, implemented 2026-10-08): no state/event names, subsystem names, topics, durations or button rules are hardcoded in Python or TypeScript. The GUI derives its operator-button matrix, state-machine graphs, tones and display vocabulary from the same YAML, broadcast at startup; a rename in `backend/config/` is a config-only change.
 
-## Latest changes (2026-10-27 — object measurement points, R12)
+## Latest changes (2026-11-04 — interface lifecycle + broker-start fixes)
+
+Two fixes from the operator's first real-hardware attempt (Robot Arm 1
+switched to REAL in simulation mode):
+
+- **Toggling SIM→REAL no longer starts the subsystem's interface** — that
+  hook launched the real stack (`docker compose up`) the moment the chip
+  was pressed. The interface follows the *workflow* only: it starts at
+  workflow start and stops at the workflow stop state / GUI close. The
+  operator flow is: toggle the subsystems to REAL (routing only, nothing
+  starts), press Start — the orchestrator launches their interfaces and
+  waits in `starting` until the hardware reports ready.
+- **The launcher now refuses a busy MQTT port.** A stale broker left on
+  1883 (e.g. bound to loopback only, as a bare `mosquitto` run loads the
+  system config) made the launcher's own broker die silently at bind time
+  while its wait loop 'succeeded' against the stale one — the real
+  subsystems (reaching the broker through the LAN address) then got
+  TCP connect failures ("MQTT client is not connected"). The launch now
+  probe-binds the port up front (`check_ports_free` also covers it) and
+  the generated mosquitto config uses an explicit `listener` (all
+  interfaces).
+- Diagnosed from `backend/interface_logs/robot_first.log` (the interface
+  log captured the whole docker-compose run and the node's connect
+  errors) — exactly what the interface logs are for.
+- Tests: new Test 18 (SIM→REAL toggle starts no interface; workflow start
+  does; workflow stop shuts it down). Full suite **214/214**.
+
+## Earlier changes (2026-10-27 — object measurement points, R12)
 
 Objects now carry geometric data through their lifecycle, all of it
 config-declared (R12 in `docs/CONFIG_CHANGE_GUIDE.md`):

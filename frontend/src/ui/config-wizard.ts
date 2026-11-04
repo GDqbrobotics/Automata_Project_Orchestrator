@@ -972,9 +972,9 @@ export class ConfigWizard {
           'p',
           'cw-form-hint',
           'Interface: the shell command that starts (and stops) the real subsystem interface. ' +
-            'Run headless by the orchestrator when the workflow starts (not when the GUI is launched; ' +
-            'SIM→REAL too) and when the workflow stops or the GUI closes; the subsystem state is then ' +
-            'known through MQTT only. Output goes to backend/interface_logs/<name>.log. ' +
+            'Run headless by the orchestrator when the workflow starts (never at GUI launch and never ' +
+            'on a SIM→REAL toggle) and when the workflow stops or the GUI closes; the subsystem state ' +
+            'is then known through MQTT only. Output goes to backend/interface_logs/<name>.log. ' +
             'Simulated subsystems are never touched.',
         ),
       );

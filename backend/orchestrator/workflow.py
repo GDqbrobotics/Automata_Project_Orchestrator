@@ -1018,10 +1018,10 @@ class WorkflowOrchestrator:
             )
 
         self._reset_subsystem_view(name)
-        if name not in self._simulated:
-            # Real side of the toggle: make sure the subsystem's interface
-            # is running so the hardware can boot and report (R11).
-            self._interfaces.ensure_started(name, self._interface_config(name))
+        # NOTE (R11): toggling SIM->REAL does NOT start the subsystem's
+        # interface. The interface scripts follow the *workflow* start
+        # (_handle_start) — a toggle alone must never power the hardware,
+        # exactly like launching the GUI must not.
         # Propagate the new simulation set to all connected frontends.
         self.frontend.set_simulation_info(self.simulation_info)
         self._fire_frontend_event(

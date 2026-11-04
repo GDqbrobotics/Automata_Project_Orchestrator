@@ -75,10 +75,34 @@ def start_pipe_drainers(proc: subprocess.Popen) -> None:
 
 def start_mosquitto_broker(port: int = 1883) -> subprocess.Popen:
     """Start mosquitto broker in the background."""
+    import socket
     import tempfile
-    
+
+    # Refuse when *anything* already listens on the port (bind probe on
+    # 0.0.0.0: binding all interfaces conflicts with every existing
+    # listener on that port, whatever address it is bound to). Without
+    # this check our broker would die silently at bind time while the
+    # wait loop below 'succeeds' against whatever else is listening —
+    # e.g. a loopback-only instance — leaving the broker unreachable for
+    # the real subsystems, which connect through the LAN address.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("0.0.0.0", port))
+    except OSError as exc:
+        raise SystemExit(
+            f"Cannot start the MQTT broker: port {port} is already in use "
+            f"({exc}). Stop the broker that is running there — a broker "
+            "bound to localhost only would not be reachable by the real "
+            "subsystems — or launch on a different port (--mqtt-port)."
+        )
+    finally:
+        probe.close()
+
     conf_file = tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False)
-    conf_file.write(f"port {port}\n")
+    # `listener` (not the legacy `port` directive) binds ALL interfaces:
+    # the real subsystems reach this broker through the LAN address, and
+    # an unspecified/loopback binding would make them fail to connect.
+    conf_file.write(f"listener {port}\n")
     conf_file.write("allow_anonymous true\n")
     conf_file.flush()
     conf_file.close()
@@ -306,6 +330,7 @@ def main() -> None:
     # the port in frontend/vite.config.ts).
     check_ports_free(
         {
+            args.mqtt_port: "Another MQTT broker",
             args.ws_port: "Another orchestrator",
             defaults["dev_port"]: "Another frontend dev server",
         }
