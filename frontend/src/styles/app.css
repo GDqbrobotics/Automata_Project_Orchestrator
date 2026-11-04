@@ -628,7 +628,7 @@ body {
   padding: 2px 9px;
   border-radius: 999px;
   margin-left: auto;
-  max-width: 150px;
+  max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1021,6 +1021,48 @@ body {
 .sm-legend .lg-initial { background: var(--success); border-radius: 50%; }
 .sm-legend .lg-scoped  { background: var(--accent); height: 3px; width: 16px; border-radius: 2px; }
 .sm-legend .lg-internal { background: #777; height: 3px; width: 16px; border-radius: 2px; }
+
+/* object measurement points (R12) */
+.sm-points {
+  border-top: 1px solid var(--border);
+  padding: 8px 18px 10px;
+}
+.sm-points[hidden] { display: none; }
+.sm-points-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.sm-points-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 6px 0 3px;
+}
+.sm-points-kind {
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--cyan);
+  background: rgba(95, 217, 230, 0.13);
+  padding: 1px 8px;
+  border-radius: 999px;
+}
+.sm-points-src { font-size: 0.7rem; color: var(--text-faint); }
+.sm-points-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 1px 0;
+}
+.sm-points-label { color: var(--text-dim); min-width: 72px; }
+.sm-points-coords { color: var(--text); }
 
 .sm-modal-feed-header {
   display: flex;

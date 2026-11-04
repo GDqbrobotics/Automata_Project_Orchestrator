@@ -103,6 +103,7 @@ const FORMAT_FALLBACKS: Record<string, Record<string, string>> = {
     source_field: 'source',
     source_value: 'orchestrator',
     timestamp_field: 'timestamp',
+    object_id_field: 'object_id',
   },
   hardware_command: {
     event_field: 'event',
@@ -119,6 +120,16 @@ const FORMAT_FALLBACKS: Record<string, Record<string, string>> = {
     type_field: 'type',
     objects_field: 'objects',
     count_field: 'count',
+    object_id_field: 'object_id',
+    points_field: 'points',
+  },
+  points_command: {
+    event_field: 'event',
+    object_id_field: 'object_id',
+    points_field: 'points',
+    source_field: 'source',
+    source_value: 'orchestrator',
+    timestamp_field: 'timestamp',
   },
 };
 
@@ -1753,6 +1764,7 @@ export class ConfigWizard {
       ['hardware_command', 'Hardware command (pause / resume)'],
       ['status', 'Status report (subsystem → orchestrator /status)'],
       ['response', 'Response (subsystem → orchestrator /response)'],
+      ['points_command', 'Points push (orchestrator → consumer /points, R12)'],
     ];
     for (const [kind, label] of kinds) {
       const fieldset = el('div', 'cw-fieldset');

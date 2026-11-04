@@ -15,6 +15,7 @@
 import type {
   DebugTopicDescriptor,
   ObjectMessage,
+  ObjectPointsData,
   StateMachineDef,
   SubsystemMessage,
 } from '../contracts.js';
@@ -36,6 +37,9 @@ export interface ModalData {
   stateDescription: string;
   subsystemMessages?: SubsystemMessage[];
   objectMessages?: ObjectMessage[];
+  /** Measurement points received for this object over MQTT (R12,
+   *  object modals only): gripper contacts, AI points of interest, ... */
+  objectPoints?: ObjectPointsData[];
   /** Debug mode (--debug): topics the real subsystem is expected to publish.
    *  When set (subsystem modals only), the modal shows the manual MQTT
    *  injection panel (user-driven simulation). */
@@ -75,6 +79,8 @@ export class StateMachineModal {
   private stateDescEl: HTMLElement;
   private graphWrapEl: HTMLElement;
   private legendEl: HTMLDivElement;
+  private pointsEl: HTMLDivElement;
+  private pointsBodyEl: HTMLDivElement;
   private feedTitleEl: HTMLElement;
   private feedCountEl: HTMLElement;
   private feedEl: HTMLDivElement;
@@ -119,6 +125,10 @@ export class StateMachineModal {
           <div class="sm-modal-graph"></div>
         </div>
         <div class="sm-legend"></div>
+        <div class="sm-points" hidden>
+          <div class="sm-points-title">measurement points</div>
+          <div class="sm-points-body"></div>
+        </div>
         <div class="sm-debug" hidden>
           <div class="sm-debug-header">
             <span class="sm-debug-title">debug — send subsystem message</span>
@@ -154,6 +164,8 @@ export class StateMachineModal {
     this.stateDescEl = this.overlay.querySelector('.sm-modal-state-desc')!;
     this.graphWrapEl = this.overlay.querySelector('.sm-modal-graph')!;
     this.legendEl = this.overlay.querySelector('.sm-legend')!;
+    this.pointsEl = this.overlay.querySelector('.sm-points')!;
+    this.pointsBodyEl = this.overlay.querySelector('.sm-points-body')!;
     this.feedTitleEl = this.overlay.querySelector('.sm-modal-feed-title')!;
     this.feedCountEl = this.overlay.querySelector('.sm-modal-feed-count')!;
     this.feedEl = this.overlay.querySelector('.sm-modal-feed')!;
@@ -251,6 +263,9 @@ export class StateMachineModal {
         'Press “⟳ Refresh Status” or wait for the next state broadcast.</div>';
     }
 
+    // ── object measurement points (R12) ──
+    this.renderObjectPoints(d);
+
     // ── message feed ──
     const isSubsystem = d.kind === 'subsystem';
     this.feedTitleEl.textContent = isSubsystem
@@ -276,6 +291,44 @@ export class StateMachineModal {
       }
     }
     this.feedEl.scrollTop = this.feedEl.scrollHeight;
+  }
+
+  /**
+   * The measurement points stored for this object (R12): one block per
+   * kind (gripper contacts, AI points of interest, ...) with every point
+   * and, when the producer labeled them, its label.
+   */
+  private renderObjectPoints(d: ModalData): void {
+    const sets = d.kind === 'object' ? d.objectPoints || [] : [];
+    this.pointsEl.hidden = sets.length === 0;
+    this.pointsBodyEl.innerHTML = '';
+    for (const set of sets) {
+      const head = document.createElement('div');
+      head.className = 'sm-points-head';
+      const kind = document.createElement('span');
+      kind.className = 'sm-points-kind';
+      kind.textContent = set.kind;
+      const src = document.createElement('span');
+      src.className = 'sm-points-src';
+      src.textContent = `from ${set.source} · ${formatTime(set.received_at)}`;
+      head.appendChild(kind);
+      head.appendChild(src);
+      this.pointsBodyEl.appendChild(head);
+
+      for (const p of set.points || []) {
+        const row = document.createElement('div');
+        row.className = 'sm-points-row';
+        const label = document.createElement('span');
+        label.className = 'sm-points-label';
+        label.textContent = p.label || 'point';
+        const coords = document.createElement('span');
+        coords.className = 'sm-points-coords';
+        coords.textContent = `[${(p.coordinates || []).map((v) => (+v).toFixed(3)).join(', ')}]`;
+        row.appendChild(label);
+        row.appendChild(coords);
+        this.pointsBodyEl.appendChild(row);
+      }
+    }
   }
 
   // ------------------------------------------------------------------

@@ -32,7 +32,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -108,6 +108,10 @@ class CommandFormat:
     source_value: str = "orchestrator"
     timestamp_field: str = "timestamp"
     include_timestamp: bool = True
+    # The object the command belongs to (dotted path allowed). Only set
+    # when the orchestrator issues the command *for an object* — global
+    # broadcasts (stop, pause) carry no object id.
+    object_id_field: str = "object_id"
     # Extra constant fields some subsystems expect (dotted paths allowed).
     static_fields: Dict[str, Any] = field(default_factory=dict)
 
@@ -120,6 +124,7 @@ class CommandFormat:
             source_value=_text(data.get("source_value"), "orchestrator"),
             timestamp_field=_text(data.get("timestamp_field"), "timestamp"),
             include_timestamp=_bool(data.get("include_timestamp"), True),
+            object_id_field=_text(data.get("object_id_field"), "object_id"),
             static_fields=dict(data.get("static_fields") or {}),
         )
 
@@ -130,6 +135,7 @@ class CommandFormat:
             "source_value": self.source_value,
             "timestamp_field": self.timestamp_field,
             "include_timestamp": self.include_timestamp,
+            "object_id_field": self.object_id_field,
             "static_fields": dict(self.static_fields),
         }
 
@@ -138,12 +144,14 @@ class CommandFormat:
         event: str,
         data: Optional[Dict[str, Any]] = None,
         timestamp: Optional[str] = None,
+        object_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build the outgoing payload for a command event.
 
         Context ``data`` merges at the top level (as it always did); the
         format's own fields win, so an event cannot be overwritten by a
-        stray context key.
+        stray context key. ``object_id`` (the object the command belongs
+        to) is set last through the configured ``object_id_field``.
         """
         payload: Dict[str, Any] = {}
         for key, value in self.static_fields.items():
@@ -160,10 +168,16 @@ class CommandFormat:
             )
         for key, value in (data or {}).items():
             payload[key] = value
+        if object_id is not None and self.object_id_field:
+            set_path(payload, self.object_id_field, object_id)
         return payload
 
     def extract_event(self, payload: Any) -> Optional[str]:
         value = get_path(payload, self.event_field)
+        return str(value) if value is not None else None
+
+    def extract_object_id(self, payload: Any) -> Optional[str]:
+        value = get_path(payload, self.object_id_field)
         return str(value) if value is not None else None
 
 
@@ -237,6 +251,10 @@ class ResponseFormat:
     type_field: str = "type"
     objects_field: str = "objects"
     count_field: str = "count"
+    # Points reports (R5 `points` roles): the object the points belong to
+    # and the coordinate list itself.
+    object_id_field: str = "object_id"
+    points_field: str = "points"
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ResponseFormat":
@@ -245,6 +263,8 @@ class ResponseFormat:
             type_field=_text(data.get("type_field"), "type"),
             objects_field=_text(data.get("objects_field"), "objects"),
             count_field=_text(data.get("count_field"), "count"),
+            object_id_field=_text(data.get("object_id_field"), "object_id"),
+            points_field=_text(data.get("points_field"), "points"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -252,6 +272,8 @@ class ResponseFormat:
             "type_field": self.type_field,
             "objects_field": self.objects_field,
             "count_field": self.count_field,
+            "object_id_field": self.object_id_field,
+            "points_field": self.points_field,
         }
 
     def build(
@@ -288,10 +310,104 @@ class ResponseFormat:
             count = len(objects)
         return report_type, objects, count
 
+    def build_points(
+        self,
+        report_type: str,
+        object_id: Optional[str],
+        points: List[Any],
+    ) -> Dict[str, Any]:
+        """Build a points-report payload (sim reports + debug defaults).
+
+        ``points`` is a list of coordinate lists (``[x, y, z(, r, p, y)]``).
+        """
+        payload: Dict[str, Any] = {}
+        if self.type_field:
+            set_path(payload, self.type_field, report_type)
+        if object_id is not None and self.object_id_field:
+            set_path(payload, self.object_id_field, object_id)
+        if self.points_field:
+            set_path(payload, self.points_field, list(points))
+        return payload
+
+    def extract_points(self, payload: Any) -> Tuple[Optional[str], List[Any]]:
+        """Extract ``(object_id, points)`` from a points-report payload.
+
+        ``points`` accepts both shapes a real system may send: a plain list
+        of coordinate lists, or a list of ``{label, coordinates}`` objects
+        (labels are kept by the orchestrator's points store).
+        """
+        raw_id = get_path(payload, self.object_id_field)
+        object_id = str(raw_id) if raw_id is not None else None
+        raw_points = get_path(payload, self.points_field)
+        points = list(raw_points) if isinstance(raw_points, list) else []
+        return object_id, points
+
+
+@dataclass
+class PointsCommandFormat:
+    """Orchestrator → consumer push of an object's stored points.
+
+    Published on the consumer's dedicated points topic
+    (``<mqtt_topic>/points``) right after the command that needs them
+    (R12): the payload names the command it belongs to, the object and the
+    selected coordinates, in order.
+    """
+
+    event_field: str = "event"
+    object_id_field: str = "object_id"
+    points_field: str = "points"
+    source_field: str = "source"
+    source_value: str = "orchestrator"
+    timestamp_field: str = "timestamp"
+    include_timestamp: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "PointsCommandFormat":
+        data = data or {}
+        return cls(
+            event_field=_text(data.get("event_field"), "event"),
+            object_id_field=_text(data.get("object_id_field"), "object_id"),
+            points_field=_text(data.get("points_field"), "points"),
+            source_field=_text(data.get("source_field"), "source"),
+            source_value=_text(data.get("source_value"), "orchestrator"),
+            timestamp_field=_text(data.get("timestamp_field"), "timestamp"),
+            include_timestamp=_bool(data.get("include_timestamp"), True),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event_field": self.event_field,
+            "object_id_field": self.object_id_field,
+            "points_field": self.points_field,
+            "source_field": self.source_field,
+            "source_value": self.source_value,
+            "timestamp_field": self.timestamp_field,
+            "include_timestamp": self.include_timestamp,
+        }
+
+    def build(
+        self,
+        event: str,
+        object_id: str,
+        points: List[Any],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if self.event_field:
+            set_path(payload, self.event_field, event)
+        if self.object_id_field:
+            set_path(payload, self.object_id_field, object_id)
+        if self.points_field:
+            set_path(payload, self.points_field, list(points))
+        if self.source_field:
+            set_path(payload, self.source_field, self.source_value)
+        if self.include_timestamp and self.timestamp_field:
+            set_path(payload, self.timestamp_field, datetime.now(timezone.utc).isoformat())
+        return payload
+
 
 @dataclass
 class MessageFormat:
-    """All four message formats of one subsystem."""
+    """All message formats of one subsystem."""
 
     command: CommandFormat = field(default_factory=CommandFormat)
     hardware_command: CommandFormat = field(
@@ -299,6 +415,7 @@ class MessageFormat:
     )
     status: StatusFormat = field(default_factory=StatusFormat)
     response: ResponseFormat = field(default_factory=ResponseFormat)
+    points_command: PointsCommandFormat = field(default_factory=PointsCommandFormat)
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "MessageFormat":
@@ -316,6 +433,7 @@ class MessageFormat:
             hardware_command=hardware,
             status=StatusFormat.from_dict(data.get("status")),
             response=ResponseFormat.from_dict(data.get("response")),
+            points_command=PointsCommandFormat.from_dict(data.get("points_command")),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -324,6 +442,7 @@ class MessageFormat:
             "hardware_command": self.hardware_command.to_dict(),
             "status": self.status.to_dict(),
             "response": self.response.to_dict(),
+            "points_command": self.points_command.to_dict(),
         }
 
 

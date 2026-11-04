@@ -132,6 +132,17 @@ class SubsystemConfig:
     def response_topic(self) -> str:
         return self.mqtt_topic.replace("{name}", self.name) + "/response"
 
+    @property
+    def points_topic(self) -> str:
+        """Dedicated topic the orchestrator pushes an object's stored
+        points on, right after the command that needs them (R12). The
+        suffix is configurable for systems that already have a topic for
+        it."""
+        suffix = "points"
+        if isinstance(self.metadata, dict):
+            suffix = str(self.metadata.get("points_topic") or "points")
+        return self.mqtt_topic.replace("{name}", self.name) + "/" + suffix
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -370,6 +381,10 @@ class ObjectInfo:
     # The machine keeps working with object_id; the alias is the ID the
     # locally stored data gets when the database is updated manually.
     alias: str = ""
+    # Measurement points received for this object over MQTT (R12): the
+    # gripper contact points from vision, the AI points of interest, ...
+    # Each entry: {kind, source, object_id, received_at, points: [...]}
+    points: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -380,6 +395,7 @@ class ObjectInfo:
             "last_state_change": self.last_state_change,
             "transitions": self.transitions,
             "alias": self.alias,
+            "points": self.points,
         }
 
 

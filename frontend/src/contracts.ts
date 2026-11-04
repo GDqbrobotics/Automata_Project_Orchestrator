@@ -87,6 +87,22 @@ export interface SubsystemConfig {
   metadata: Record<string, unknown>;
 }
 
+/** One stored point of an object's measurement-points set (R12). */
+export interface ObjectPoint {
+  label?: string;
+  coordinates: number[];
+}
+
+/** A points set received for an object over MQTT (R12): vision gripper
+ *  contacts, AI points of interest, ... keyed by kind. */
+export interface ObjectPointsData {
+  kind: string;
+  source: string;
+  object_id: string;
+  received_at: string;
+  points: ObjectPoint[];
+}
+
 export interface ObjectInfo {
   object_id: string;
   state: string;
@@ -96,6 +112,8 @@ export interface ObjectInfo {
   transitions: Array<{ from: string; to: string; event: string; timestamp: string }>;
   /** Operator-assigned alias ID used by the local database ('' = none). */
   alias?: string;
+  /** Measurement points received so far (R12), shown in the object window. */
+  points?: ObjectPointsData[];
 }
 
 /** One transition edge in a state machine definition (from YAML). */
@@ -219,6 +237,8 @@ export interface MqttCommandFormat {
   source_value?: string;
   timestamp_field?: string;
   include_timestamp?: boolean;
+  /** The object the command belongs to (object-driven commands only, R12). */
+  object_id_field?: string;
   static_fields?: Record<string, unknown>;
 }
 
@@ -233,14 +253,29 @@ export interface MqttResponseFormat {
   type_field?: string;
   objects_field?: string;
   count_field?: string;
+  /** Points reports (R12): object id + coordinate list fields. */
+  object_id_field?: string;
+  points_field?: string;
 }
 
-/** The four message formats of one subsystem (all fields optional = inherit). */
+/** The push of an object's stored points to a consumer (R12). */
+export interface MqttPointsCommandFormat {
+  event_field?: string;
+  object_id_field?: string;
+  points_field?: string;
+  source_field?: string;
+  source_value?: string;
+  timestamp_field?: string;
+  include_timestamp?: boolean;
+}
+
+/** The message formats of one subsystem (all fields optional = inherit). */
 export interface MqttFormatGroup {
   command?: MqttCommandFormat;
   hardware_command?: MqttCommandFormat;
   status?: MqttStatusFormat;
   response?: MqttResponseFormat;
+  points_command?: MqttPointsCommandFormat;
 }
 
 /** Parsed `mqtt_formats.yaml`: a default + per-subsystem overrides. */

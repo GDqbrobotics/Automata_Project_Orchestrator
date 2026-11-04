@@ -260,6 +260,94 @@ the workflow stop and the GUI shutdown.
 
 ---
 
+## R12 — Object Measurement Points (`points` reports + `points_requests`)
+
+During its lifecycle an object accumulates geometry produced by the
+subsystems that work on it, and the robot needs it pushed to it at the
+right moment. All of it is configuration-declared; the orchestrator only
+stores, selects and forwards.
+
+**Producers** declare a `points` section inside a `metadata.reports[]`
+entry (R5): when the `after` transition happens, the subsystem publishes
+the geometry of one object on its `/response` topic:
+
+```yaml
+# vision.yaml — two gripper contact points [x y z] per discovered object
+reports:
+  - type: objects_detected          # the box-scan object list (existing)
+    after: { from: capturing, to: ready }
+    object_ids: { count_source: num_objects }
+  - type: object_points             # one message PER discovered object
+    after: { from: capturing, to: ready }
+    object_ids: { count_source: num_objects }
+    points: { kind: gripper_contacts, count: 2, dimensions: 3 }
+
+# ai_analysis.yaml — surface points of interest [x y z r p y], one per
+# analysis, labeled after the analyzer that will measure it
+reports:
+  - type: object_points
+    after: { from: analyzing, to: ready }
+    points: { kind: points_of_interest, count: 2, dimensions: 6,
+              labels: [xrf, raman] }
+```
+
+Payload shape (R10 `response` format, `object_id_field` + `points_field`):
+`{"type": "object_points", "object_id": "object_001",
+  "points": [[x, y, z], ...]}` — a plain coordinate list, or
+`{"label": "xrf", "coordinates": [...]}` objects when labeled.
+
+**Storage**: the orchestrator keeps the points per object ID
+(`backend/orchestrator/object_points.py`) and shows them in the object
+window (Measurement points section, labels included).
+
+**Consumers** declare which stored points each of their commands needs
+(`metadata.points_requests` in the consumer's YAML). Right after the
+orchestrator publishes such a command, the selected points — in order —
+are pushed on the consumer's dedicated topic (`mqtt_topic` + `/points`,
+suffix configurable via `metadata.points_topic`):
+
+```yaml
+# robot_first.yaml
+metadata:
+  points_requests:
+    - { command: pick,         source: vision,      kind: gripper_contacts }
+    - { command: place,        source: vision,      kind: gripper_contacts }
+    - { command: return,       source: vision,      kind: gripper_contacts }
+    - { command: measure_xrf,  source: ai_analysis, kind: points_of_interest, label: xrf }
+    - { command: measure_raman, source: ai_analysis, kind: points_of_interest, label: raman }
+```
+
+Push payload (R10 `points_command` format):
+`{"event": "pick", "object_id": "object_001", "points": [[...], ...],
+  "source": "orchestrator", "timestamp": ...}`.
+
+**Rules:**
+- Object-driven commands carry the object ID (`command` format
+  `object_id_field`, set only when the command belongs to an object —
+  broadcasts like stop/pause do not). Producers use it to reference the
+  object in their points reports; consumers use it to know what they work on.
+- If a command fires before the points are stored (the first pick of a
+  freshly discovered object races the points report), the push is
+  **deferred** and delivered as soon as the report arrives — a consumer
+  is guaranteed to receive the points of every commanded action.
+- `dimensions` is `3` ([x y z]) or `6` ([x y z r p y]); `labels` (when
+  present) must have exactly `count` entries and let a request select a
+  specific point (`label:`), or `index:` selects by position; with
+  neither, all stored points of the kind are pushed in report order.
+- Validation cross-checks both sides: a request's `command` must be an
+  event of the consumer's own state machine, and its `source`/`kind`
+  must match a declared points report (labels/count included).
+- Simulated producers generate deterministic placeholder coordinates
+  (stable per object ID) with the declared count/dimensions; real
+  producers send their actual measurements through the same formats.
+- The points store is cleared on workflow reset (the points belong to
+  the run's objects).
+
+**Frontend impact:** the object window renders each stored points set
+(kind chip, source, per-point labels and coordinates).
+
+---
+
 ## R6 — Object Journey Final States (Derived, Not Hardcoded)
 
 The object workflow's final state(s) are **states with no outgoing transitions** in `object.yaml`. Code uses `StateMachineConfig.final_states` property.
@@ -491,14 +579,16 @@ states: {state_name: {description, meta{position, actor?, parallel_actors[], rot
 ### subsystems/*.yaml
 ```yaml
 name, display_name, type, mqtt_topic, initial_state, required
-metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}}], interface{enabled, startup, shutdown?, cwd?}}
+metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}, points{kind, count, dimensions, labels?}}], interface{enabled, startup, shutdown?, cwd?}, points_topic?, points_requests[{command, source, kind, label?|index?}]}
 states: {state_name: {description, transitions[{event, target, actions[]}]}}
 ```
 
 ### mqtt_formats.yaml
 ```yaml
-default: {command{}, hardware_command{}, status{}, response{}}
-subsystems: {name: {command?, hardware_command?, status?, response?}}
+# kinds: command (object_id_field), hardware_command, status,
+# response (object_id_field, points_field), points_command
+default: {command{}, hardware_command{}, status{}, response{}, points_command{}}
+subsystems: {name: {command?, hardware_command?, status?, response?, points_command?}}
 ```
 
 ---

@@ -246,6 +246,9 @@ export class App {
       stateDescription:
         obj?.state_description || (currentState && def?.states[currentState]?.description) || '',
       objectMessages: this.state.objectMessages[id] || [],
+      // Measurement points received for this object (R12), rendered in
+      // the object window as soon as the backend stores them.
+      objectPoints: obj?.points || [],
     };
   }
 

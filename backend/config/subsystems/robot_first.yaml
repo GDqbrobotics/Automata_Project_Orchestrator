@@ -2,7 +2,7 @@
 name: robot_first
 display_name: Robot Arm 1
 type: robot
-mqtt_topic: "automata/subsystem/{name}"
+mqtt_topic: automata/subsystem/{name}
 initial_state: initializing
 required: true
 metadata:
@@ -20,6 +20,37 @@ metadata:
     measuring_raman: 3.0
     returning: 2.5
 
+  interface:
+    enabled: true
+    startup: ' docker compose -f docker-compose.runtime.yml up'
+    shutdown: ' docker compose -f docker-compose.runtime.yml down'
+    cwd: ~/project_pnrr
+  # Points requests (R12): which stored object points this robot needs
+  # for each of its commands. Right after the orchestrator publishes the
+  # command, the selected points are pushed — in order — on this
+  # subsystem's dedicated points topic (mqtt_topic + /points):
+  #   {event: <command>, object_id: ..., points: [[...], ...]}
+  # The points themselves are produced by the source subsystems' reports
+  # (vision: gripper contacts, ai_analysis: points of interest) and stored
+  # per object ID by the orchestrator.
+  points_requests:
+    - command: pick
+      source: vision
+      kind: gripper_contacts
+    - command: place
+      source: vision
+      kind: gripper_contacts
+    - command: return
+      source: vision
+      kind: gripper_contacts
+    - command: measure_xrf
+      source: ai_analysis
+      kind: points_of_interest
+      label: xrf
+    - command: measure_raman
+      source: ai_analysis
+      kind: points_of_interest
+      label: raman
 states:
   initializing:
     description: Robot is initializing

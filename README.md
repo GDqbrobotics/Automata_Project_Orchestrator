@@ -191,6 +191,14 @@ of design tokens (`frontend/src/styles/app.css`).
   configuration that would hang — before writing (the raw YAML stays
   comment-preserving when structured forms are applied), and asks for a
   restart so the changes are loaded.
+- **Object measurement points** — the producers declare what geometry
+  they send per object (vision: gripper contact points `[x y z]`, AI
+  analysis: labeled points of interest `[x y z r p y]`) and the consumers
+  declare which points each of their commands needs
+  (`metadata.points_requests`); the orchestrator stores the points per
+  object ID, shows them live in the object window and pushes the selected
+  ones — in order — on the consumer's dedicated `/points` topic right
+  after the command that needs them (R12).
 - **Real-interface scripts** — a subsystem YAML can declare
   `metadata.interface` (enable + startup/shutdown command, editable in the
   wizard's Basics tab). The orchestrator runs the startup command
@@ -225,8 +233,10 @@ rejects anything the configuration does not define.
   works on it — the pipeline controller is driven by these declarations.
 - **`subsystems/<name>.yaml`** — one file per subsystem: metadata (display
   name, whether it is required for the run to start, simulated work
-  durations, its reporting role if any, and the optional `interface`
-  scripts that start/stop the real subsystem's interface headless) and
+  durations, its reporting roles if any — including the per-object points
+  a producer sends —, the optional `interface` scripts that start/stop
+  the real subsystem's interface headless, and the `points_requests`
+  declaring which stored object points each of its commands needs) and
   the subsystem's state machine.
 - **`mqtt_formats.yaml`** — the payload field-mapping layer for every MQTT
   message exchanged with a subsystem (command / hardware command / status /

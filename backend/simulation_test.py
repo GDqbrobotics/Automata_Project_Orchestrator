@@ -1383,6 +1383,103 @@ async def test_interface_scripts() -> None:
             runner.stop()
 
 
+async def test_object_points_flow() -> None:
+    """Test: object measurement points end-to-end (R12).
+
+    Vision reports the gripper contact points and the AI the points of
+    interest for each object over MQTT; the orchestrator stores them per
+    object ID and, right after every robot command that declared it needs
+    them, pushes the selected points on the robot's dedicated /points
+    topic. The object window (full status) carries the stored points.
+    """
+    logger.info("--- TEST 17: Object measurement points (R12) ---")
+
+    received: List[Dict[str, Any]] = []
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+    def _on_points(_c: Any, _u: Any, msg: Any) -> None:
+        try:
+            data = json.loads(msg.payload.decode())
+        except (json.JSONDecodeError, AttributeError):
+            return
+        received.append(data)
+
+    client.on_message = _on_points
+    client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 10)
+    client.loop_start()
+    client.subscribe(f"{TOPIC_SUBSYSTEM}/robot_first/points", qos=1)
+
+    runner = OrchestratorRunner(
+        CONFIG_PATH, SUBSYSTEMS_CONFIG_DIR, use_simulation=True, num_objects=1
+    )
+    runner.start()
+    try:
+        ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+        await ws_client.connect()
+        await ws_client.send_command("start_workflow")
+        await ws_client.receive()
+
+        # The robot is commanded: pick, place (task chain), measure_xrf,
+        # measure_raman, return. Each must be followed by the push of the
+        # points its YAML requested, addressed to the object.
+        expected = {"pick", "place", "measure_xrf", "measure_raman", "return"}
+
+        def _seen_events() -> set:
+            return {m.get("event") for m in received}
+
+        ok = _wait_for_condition(
+            lambda: expected.issubset(_seen_events()), 150.0, interval_s=1.0
+        )
+        results.check(
+            ok,
+            f"Robot received a points push after every command "
+            f"(missing: {sorted(expected - _seen_events())})",
+        )
+
+        by_event = {}
+        for m in received:
+            by_event.setdefault(m.get("event"), m)
+        gripper = by_event.get("pick") or {}
+        results.check(
+            bool(gripper.get("object_id"))
+            and len(gripper.get("points") or []) == 2
+            and all(len(p) == 3 for p in gripper.get("points") or []),
+            "Pick push carries the object id and both [x y z] gripper contacts",
+        )
+        for cmd in ("measure_xrf", "measure_raman"):
+            push = by_event.get(cmd) or {}
+            points = push.get("points") or []
+            results.check(
+                bool(push.get("object_id"))
+                and len(points) == 1
+                and len(points[0]) == 6,
+                f"{cmd} push carries the labeled [x y z r p y] point of interest",
+            )
+
+        # The object window (full status) shows the stored points.
+        objects = runner.orchestrator._status.objects
+        results.check(
+            len(objects) == 1 and len(objects[0].points) == 2,
+            "The object carries both stored points sets (gripper + POI)",
+        )
+        if objects and objects[0].points:
+            poi = next(
+                (p for p in objects[0].points if p["kind"] == "points_of_interest"),
+                None,
+            )
+            labels = [pt.get("label") for pt in (poi or {}).get("points", [])]
+            results.check(
+                labels == ["xrf", "raman"],
+                f"The AI points of interest are labeled for their analyzer ({labels})",
+            )
+
+        await ws_client.ws.close()
+    finally:
+        client.loop_stop()
+        client.disconnect()
+        runner.stop()
+
+
 async def test_debug_mode() -> None:
     """Test: the --debug manual MQTT injection feature.
 
@@ -2193,6 +2290,42 @@ def test_config_service() -> None:
             "Validation accepts a well-formed interface block",
         )
 
+        # Points declarations (R12): the requests are cross-checked against
+        # the consumer's own state machine and the producing subsystem.
+        points_robot = yaml.safe_load(
+            (config_dir / "subsystems" / "robot_first.yaml").read_text()
+        )
+        points_robot["metadata"]["points_requests"] = [
+            {"command": "pick", "source": "vision", "kind": "gripper_contacts"},
+            {"command": "measure_xrf", "source": "nonexistent", "kind": "points"},
+        ]
+        results.check(
+            any(
+                "is not configured" in e or "not an event" in e
+                for e in service.validate_content(
+                    "backend/config/subsystems/robot_first.yaml",
+                    yaml.safe_dump(points_robot, sort_keys=False),
+                )
+            ),
+            "Validation refuses a points request with an unknown source",
+        )
+        points_vision = yaml.safe_load(
+            (config_dir / "subsystems" / "vision.yaml").read_text()
+        )
+        for rep in points_vision["metadata"]["reports"]:
+            if isinstance(rep.get("points"), dict):
+                rep["points"]["dimensions"] = 5
+        results.check(
+            any(
+                "dimensions" in e
+                for e in service.validate_content(
+                    "backend/config/subsystems/vision.yaml",
+                    yaml.safe_dump(points_vision, sort_keys=False),
+                )
+            ),
+            "Validation refuses a points report with invalid dimensions",
+        )
+
         # Object actors are cross-checked against the subsystem machines.
         obj_data = yaml.safe_load((config_dir / "object.yaml").read_text())
         obj_data["states"]["XRF_analysis"]["meta"]["actor"] = "ghost_subsystem"
@@ -2264,6 +2397,8 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         test_config_service()
         time.sleep(1)
         await test_interface_scripts()
+        time.sleep(1)
+        await test_object_points_flow()
         time.sleep(1)
         await test_debug_mode()
         time.sleep(1)

@@ -22,6 +22,10 @@ default:
     source_value: orchestrator
     timestamp_field: timestamp
     include_timestamp: true
+    # The object the command belongs to. Set only on object-driven
+    # commands (the pipeline / an object transition); global broadcasts
+    # (stop, pause) carry no object id.
+    object_id_field: object_id
     # Extra constant fields some subsystems expect, e.g. {protocol: v2}
     static_fields: {}
   # orchestrator -> subsystem: /event (raw pause/resume hardware commands)
@@ -37,11 +41,27 @@ default:
     ready_field: ready
     paused_field: paused
     name_field: name
-  # subsystem -> orchestrator: /response (reports, e.g. object list)
+  # subsystem -> orchestrator: /response (reports, e.g. object list).
+  # Points reports (R12) ride the same topic: object_id_field names the
+  # object the geometry belongs to, points_field carries the coordinate
+  # list ([x, y, z] or [x, y, z, r, p, y], plain lists or {label,
+  # coordinates} objects).
   response:
     type_field: type
     objects_field: objects
     count_field: count
+    object_id_field: object_id
+    points_field: points
+  # orchestrator -> consumer: <mqtt_topic>/points — an object's stored
+  # points, pushed right after the command that needs them (R12). The
+  # event names the command the points belong to.
+  points_command:
+    event_field: event
+    object_id_field: object_id
+    points_field: points
+    source_field: source
+    source_value: orchestrator
+    include_timestamp: true
 
 # Per-subsystem overrides, deep-merged over `default`. Example: a component
 # that reports {"data": {"state": "ready"}} and acknowledges commands with

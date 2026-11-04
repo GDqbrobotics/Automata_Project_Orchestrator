@@ -236,9 +236,15 @@ class PipelineController:
         self._settle(object_id)
         return True
 
-    def _command(self, name: str, event: str) -> None:
-        """Issue a command through the subsystem SM (boundary layer)."""
-        self._orch.fire_subsystem_transition(name, event)
+    def _command(
+        self, name: str, event: str, object_id: Optional[str] = None
+    ) -> None:
+        """Issue a command through the subsystem SM (boundary layer).
+
+        ``object_id`` (when the command belongs to an object) is embedded
+        in the payload and drives the points push for consumers that
+        requested the object's stored points (R12)."""
+        self._orch.fire_subsystem_transition(name, event, object_id=object_id)
 
     def _states_with_position(self, position: str) -> List[str]:
         return [s for s, m in self._state_meta.items() if m.get("position") == position]
@@ -373,7 +379,7 @@ class PipelineController:
         if name in self._task_chains and self._robot_task is not None:
             object_id, action = self._robot_task
             if action.get("kind") == "command":
-                self._command(name, action["event"])
+                self._command(name, action["event"], object_id=object_id)
                 self._robot_task = (object_id, action["next"])
             else:
                 self._robot_task = None

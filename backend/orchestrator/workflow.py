@@ -73,6 +73,7 @@ from backend.domain.models import (
 )
 from backend.messaging.message_format import MessageFormatSet
 from backend.messaging.mqtt_client import MqttClient
+from backend.orchestrator.object_points import ObjectPointsStore
 from backend.services.config_service import ConfigError, ConfigService
 from backend.services.frontend_server import FrontendServer
 from backend.services.interface_manager import InterfaceProcessManager
@@ -304,6 +305,32 @@ class WorkflowOrchestrator:
         # first and then the events it fired (not interleaved out of order).
         self._object_event_buffer: Dict[str, List[Dict[str, Any]]] = {}
 
+        # ─── Object Points (R12) ───
+        # Geometry the producers measure for an object (vision gripper
+        # contacts, AI points of interest, ...) arrives over MQTT and is
+        # stored per object ID; consumers (the robot) declare which points
+        # each of their commands needs and receive them pushed on their
+        # dedicated points topic right after the command.
+        self._points_store = ObjectPointsStore()
+        # Commands whose points were not stored yet (R12): the first pick
+        # of a freshly discovered object can race the points report (the
+        # object list is processed first). Those pushes are deferred and
+        # delivered as soon as the producer reports the points.
+        self._pending_points: Set[Tuple[str, str, str]] = set()
+        # Points reporting roles (R5 `points:` sections): per subsystem,
+        # response type -> {kind, labels}. Responses of these types carry
+        # geometry for one object and are stored, not dispatched further.
+        self._points_reports: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for _pname, _padapter in self.adapters.items():
+            for _rep in (_padapter.metadata.get("reports") or []):
+                _points_cfg = _rep.get("points")
+                if isinstance(_points_cfg, dict) and _rep.get("type"):
+                    self._points_reports.setdefault(_pname, {})[str(_rep["type"])] = {
+                        "type": str(_rep["type"]),
+                        "kind": str(_points_cfg.get("kind") or ""),
+                        "labels": [str(l) for l in (_points_cfg.get("labels") or [])],
+                    }
+
         # ─── Pipeline Controller ───
         # Orchestrates the object flow (PROJECT_CONTEXT workflow). It is
         # event-driven on subsystem status reports arriving over MQTT, so it
@@ -417,11 +444,20 @@ class WorkflowOrchestrator:
         # to publish, and the operator can send one of them manually
         # (user-driven simulation; see _handle_debug_send_subsystem_message).
         self._debug_mode = debug_mode
-    def _on_event(self, event_name: str, data: Optional[Dict[str, Any]] = None) -> None:
+    def _on_event(
+        self,
+        event_name: str,
+        data: Optional[Dict[str, Any]] = None,
+        object_id: Optional[str] = None,
+    ) -> None:
         """Route internal events fired by state machines.
 
         `data` (optional) is merged into the MQTT command payload when the
-        event is routed to a subsystem.
+        event is routed to a subsystem. `object_id` (optional) names the
+        object the command belongs to: it is embedded in the payload
+        (command format `object_id_field`) and, when the target subsystem
+        declared it needs points for this command, its stored points are
+        pushed right after the command (R12).
 
         Events can be:
           - Unscoped: "error" → broadcast to all subsystems
@@ -462,7 +498,9 @@ class WorkflowOrchestrator:
                 "Routing scoped event '%s' → subsystem '%s'",
                 event_name, scope,
             )
-            self._route_event_to_subsystem(scope, local_event, data=data)
+            self._route_event_to_subsystem(
+                scope, local_event, data=data, object_id=object_id
+            )
         else:
             # Unscoped event: broadcast to all subsystems
             logger.info("Broadcasting unscoped event '%s' to all subsystems", event_name)
@@ -473,6 +511,7 @@ class WorkflowOrchestrator:
         subsystem_name: str,
         event_name: str,
         data: Optional[Dict[str, Any]] = None,
+        object_id: Optional[str] = None,
     ) -> None:
         """Route a scoped event to a specific subsystem (issue a command).
 
@@ -487,6 +526,9 @@ class WorkflowOrchestrator:
             subsystem_name: The target subsystem.
             event_name: The command event to issue.
             data: Optional context merged into the MQTT command payload.
+            object_id: The object the command belongs to (embedded in the
+                payload; its stored points are pushed right after the
+                command when the subsystem requested them, R12).
         """
         adapter = self.adapters.get(subsystem_name)
         if adapter is None:
@@ -498,7 +540,9 @@ class WorkflowOrchestrator:
             return
 
         try:
-            expected = adapter.fire_transition(event_name, data)
+            expected = adapter.fire_transition(
+                event_name, data, object_id=object_id
+            )
             logger.info(
                 "Subsystem '%s' commanded '%s' -> expected '%s' (current: '%s')",
                 subsystem_name, event_name, expected,
@@ -507,6 +551,9 @@ class WorkflowOrchestrator:
             # Keep the full-status snapshot fresh (it reflects the last
             # reported state; the card updates when the subsystem confirms).
             self._refresh_subsystem_info(subsystem_name)
+            # The command went out: push the object's stored points the
+            # subsystem declared it needs for this command (R12).
+            self._push_object_points(object_id, subsystem_name, event_name)
         except StateMachineError as exc:
             logger.warning(
                 "Subsystem '%s' rejected event '%s': %s",
@@ -590,8 +637,10 @@ class WorkflowOrchestrator:
             # transition path); the controller only sets flags here.
             self._pipeline.on_object_workflow_event(object_id, local_event)
             return
-        # Reuse the same routing logic as workflow events
-        self._on_event(event_name)
+        # Reuse the same routing logic as workflow events; the object id
+        # travels with the command (payload object_id_field) and drives
+        # the points push for consumers that requested them (R12).
+        self._on_event(event_name, object_id=object_id)
 
     # ------------------------------------------------------------------
     # Operator Command Handlers
@@ -1340,6 +1389,9 @@ class WorkflowOrchestrator:
         self._status.current_object = None
         self._status.objects = []
         self._object_event_buffer.clear()
+        # The points of the previous run belong to its objects (R12).
+        self._points_store.clear()
+        self._pending_points.clear()
         # Drop any pending expected-state checks from the previous run so a
         # stale command cannot raise a spurious discrepancy warning.
         self._clear_all_subsystem_expected()
@@ -1551,6 +1603,15 @@ class WorkflowOrchestrator:
                     else MessageFormatSet().default.response
                 )
                 report_type, report_objects, _ = response_fmt.extract(data)
+                # Points reports (R12): geometry a producer measured for
+                # one object — stored per object ID, never dispatched to
+                # the pipeline's object discovery.
+                points_role = self._points_reports.get(name, {}).get(
+                    report_type or ""
+                )
+                if points_role is not None:
+                    self._handle_points_report(name, points_role, response_fmt, data)
+                    return
                 if report_type in self._report_types:
                     logger.info(
                         "Report '%s' from subsystem: %s",
@@ -1570,6 +1631,121 @@ class WorkflowOrchestrator:
     ) -> None:
         """Register a callback for MQTT messages matching a topic pattern."""
         self._subsystem_callbacks[topic_pattern] = callback
+
+    # ------------------------------------------------------------------
+    # Object Points (R12)
+    # ------------------------------------------------------------------
+    def _handle_points_report(
+        self,
+        subsystem_name: str,
+        role: Dict[str, Any],
+        response_fmt: Any,
+        data: Dict[str, Any],
+    ) -> None:
+        """Store a points report (R12): geometry a producer measured for
+        one object (vision gripper contacts, AI points of interest, ...).
+
+        The report type/kind/labels come from the producer's YAML
+        (metadata.reports[].points); the payload shape from its response
+        format (object_id_field + points_field, R10).
+        """
+        object_id, raw_points = response_fmt.extract_points(data)
+        if not object_id:
+            logger.warning(
+                "[points] report '%s' from '%s' carries no object id – ignored",
+                role.get("type"), subsystem_name,
+            )
+            return
+        entry = self._points_store.add(
+            object_id,
+            role.get("kind") or "",
+            subsystem_name,
+            raw_points,
+            labels=role.get("labels") or None,
+        )
+        if entry is None:
+            logger.warning(
+                "[points] unusable points report '%s' from '%s' for '%s'",
+                role.get("type"), subsystem_name, object_id,
+            )
+            return
+        logger.info(
+            "[points] stored %d '%s' point(s) for object '%s' (from %s)",
+            len(entry.points), entry.kind, object_id, subsystem_name,
+        )
+        # Deliver anything a consumer is already waiting for (R12): a
+        # command may have been issued before this report arrived.
+        self._flush_pending_points(object_id)
+        # The object window shows the stored points: refresh the objects
+        # broadcast so an open inspector updates immediately.
+        self._broadcast_objects()
+
+    def _flush_pending_points(self, object_id: str) -> None:
+        """Deliver the deferred point pushes of one object (R12)."""
+        pending = {
+            (oid, sub, cmd)
+            for oid, sub, cmd in self._pending_points
+            if oid == object_id
+        }
+        for oid, sub, cmd in sorted(pending):
+            self._pending_points.discard((oid, sub, cmd))
+            logger.info(
+                "[points] delivering deferred points for '%s' (%s/%s)",
+                oid, sub, cmd,
+            )
+            self._push_object_points(oid, sub, cmd)
+
+    def _push_object_points(
+        self,
+        object_id: Optional[str],
+        subsystem_name: str,
+        command: str,
+    ) -> None:
+        """Push an object's stored points to a consumer, in order (R12).
+
+        Called right after a command was published for an object: the
+        consumer's YAML declares (metadata.points_requests) which stored
+        points each of its commands needs — producer + kind, optionally
+        narrowed by label or index — and they are published on its
+        dedicated points topic in one message.
+        """
+        if not object_id:
+            return
+        adapter = self.adapters.get(subsystem_name)
+        if adapter is None:
+            return
+        requests = adapter.metadata.get("points_requests") or []
+        for req in requests:
+            if not isinstance(req, dict) or str(req.get("command")) != command:
+                continue
+            kind = str(req.get("kind") or "")
+            coords = self._points_store.select(
+                object_id, kind, label=req.get("label"), index=req.get("index")
+            )
+            if coords is None:
+                logger.warning(
+                    "[points] %s: no '%s' points available for object '%s' "
+                    "(command '%s') – push deferred until they are reported",
+                    subsystem_name, kind, object_id, command,
+                )
+                # The command already went out: deliver the points as soon
+                # as the producer reports them (see _handle_points_report).
+                self._pending_points.add((object_id, subsystem_name, command))
+                continue
+            payload = adapter.message_format.points_command.build(
+                command, object_id=object_id, points=coords
+            )
+            topic = adapter.config.points_topic
+            self.mqtt.publish(topic, payload, qos=1)
+            logger.info(
+                "[points] pushed %d '%s' point(s) for '%s' → %s (%s)",
+                len(coords), kind, object_id, subsystem_name, topic,
+            )
+            # Mirror the push in the inspector's traffic feed.
+            self._fire_subsystem_message(subsystem_name, "sent", topic, payload)
+            # A successful push settles any earlier deferral of the same
+            # request (e.g. a re-issued command after the report arrived).
+            self._pending_points.discard((object_id, subsystem_name, command))
 
     # ------------------------------------------------------------------
     # Subsystem Status Updates
@@ -1767,6 +1943,7 @@ class WorkflowOrchestrator:
         self,
         subsystem_name: str,
         event: str,
+        object_id: Optional[str] = None,
     ) -> bool:
         """Issue a command to a subsystem (boundary layer).
 
@@ -1774,6 +1951,10 @@ class WorkflowOrchestrator:
         command is published over MQTT; the local subsystem SM is NOT advanced
         (the subsystem's reported state is authoritative and mirrors it). The
         expected state is tracked for the discrepancy check.
+
+        ``object_id`` (optional) names the object the command belongs to:
+        embedded in the payload and, when the consumer requested points for
+        this command, its stored points are pushed right after it (R12).
         """
         adapter = self.adapters.get(subsystem_name)
         if adapter is None:
@@ -1785,7 +1966,9 @@ class WorkflowOrchestrator:
             return False
 
         try:
-            expected = adapter.fire_transition(event)  # boundary: publishes MQTT
+            expected = adapter.fire_transition(  # boundary: publishes MQTT
+                event, object_id=object_id
+            )
             logger.info(
                 "Subsystem '%s' commanded '%s' -> expected '%s' (current: '%s')",
                 subsystem_name, event, expected, adapter.state_machine.current_state,
@@ -1793,6 +1976,9 @@ class WorkflowOrchestrator:
             # Keep the full-status snapshot fresh; the card reflects the last
             # reported state and updates when the subsystem confirms.
             self._refresh_subsystem_info(subsystem_name)
+            # The command went out: push the object's stored points the
+            # subsystem declared it needs for this command (R12).
+            self._push_object_points(object_id, subsystem_name, event)
             return True
 
         except Exception as exc:
@@ -1882,6 +2068,7 @@ class WorkflowOrchestrator:
                     last_state_change=obj.get("last_state_change", ""),
                     transitions=obj.get("transitions", []),
                     alias=obj.get("alias", ""),
+                    points=self._points_store.info(obj["object_id"]),
                 )
                 for obj in self.object_manager.get_all_objects_info()
             ]
@@ -1905,13 +2092,26 @@ class WorkflowOrchestrator:
                     last_state_change=obj.get("last_state_change", ""),
                     transitions=obj.get("transitions", []),
                     alias=obj.get("alias", ""),
+                    # Stored measurement points (R12), shown in the object
+                    # window as soon as they arrive over MQTT.
+                    points=self._points_store.info(obj["object_id"]),
                 )
                 for obj in objects_info
             ]
 
+        # The event payload carries the points too (R12) so an open object
+        # window updates without waiting for the next full status.
+        points_by_id = {
+            info.object_id: info.points for info in self._status.objects
+        }
         self._fire_frontend_event(
             BackendEvent.WORKFLOW_STATE_CHANGED.value,
-            {"objects": objects_info},
+            {
+                "objects": [
+                    {**obj, "points": points_by_id.get(obj.get("object_id"), [])}
+                    for obj in objects_info
+                ]
+            },
         )
         self.frontend.broadcast_with_display_config(self._status)
 

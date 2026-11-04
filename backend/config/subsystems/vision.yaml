@@ -23,6 +23,18 @@ metadata:
       after: { from: capturing, to: ready }
       object_ids:
         count_source: num_objects
+    # Gripper contact points (R12): two [x, y, z] points per discovered
+    # object, published on /response right after the object list (one
+    # message per object, keyed by its ID). The dispatching robot receives
+    # them pushed on its /points topic with its pick/place commands.
+    - type: object_points
+      after: { from: capturing, to: ready }
+      object_ids:
+        count_source: num_objects
+      points:
+        kind: gripper_contacts
+        count: 2
+        dimensions: 3
 
 states:
   initializing:

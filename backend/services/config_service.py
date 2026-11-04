@@ -602,6 +602,50 @@ class ConfigService:
                     f"metadata.reports['{rep.get('type')}']: no transition "
                     f"'{frm}' -> '{to}' in the state machine"
                 )
+            # Points roles (R12): the declaration must be parseable and
+            # internally consistent (kind, count, dimensions, labels).
+            points_cfg = rep.get("points")
+            if points_cfg is None:
+                continue
+            rep_type = str(rep.get("type"))
+            if not isinstance(points_cfg, dict):
+                errors.append(
+                    f"metadata.reports['{rep_type}'].points must be a mapping"
+                )
+                continue
+            if not str(points_cfg.get("kind") or "").strip():
+                errors.append(
+                    f"metadata.reports['{rep_type}']: points.kind is required "
+                    f"(what these points are, e.g. gripper_contacts)"
+                )
+            count = points_cfg.get("count")
+            if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool) or count < 1
+            ):
+                errors.append(
+                    f"metadata.reports['{rep_type}']: points.count must be "
+                    f"a positive integer"
+                )
+            dimensions = points_cfg.get("dimensions", 3)
+            if dimensions not in (3, 6):
+                errors.append(
+                    f"metadata.reports['{rep_type}']: points.dimensions must "
+                    f"be 3 ([x y z]) or 6 ([x y z r p y])"
+                )
+            labels = points_cfg.get("labels")
+            if labels is not None:
+                if not isinstance(labels, list) or not all(
+                    isinstance(l, str) and l.strip() for l in labels
+                ):
+                    errors.append(
+                        f"metadata.reports['{rep_type}']: points.labels must "
+                        f"be a list of non-empty strings"
+                    )
+                elif isinstance(count, int) and len(labels) != count:
+                    errors.append(
+                        f"metadata.reports['{rep_type}']: points.labels must "
+                        f"have exactly 'count' entries"
+                    )
 
         # ── Completion contract ────────────────────────────────────────
         # The pipeline (and the generic simulator) detect completion when a
@@ -640,7 +684,130 @@ class ConfigService:
                             f"State '{state_name}': unsupported action '{action}' "
                             "(subsystem transitions only support 'log_event')"
                         )
+
+        # ── Points requests (R12) ──────────────────────────────────
+        # Which stored object points each of this subsystem's commands
+        # needs. Cross-checked against this state machine (the command
+        # must exist, otherwise nothing would ever trigger the push) and
+        # the producing subsystem (it must declare a points report of
+        # that kind, with matching labels/count).
+        requests = metadata.get("points_requests")
+        if requests is not None:
+            if not isinstance(requests, list):
+                errors.append("metadata.points_requests must be a list")
+            else:
+                own_events = self._subsystem_events(states)
+                seen_commands: set = set()
+                for req in requests:
+                    if not isinstance(req, dict):
+                        errors.append(
+                            "metadata.points_requests: every entry must be a mapping"
+                        )
+                        continue
+                    command = str(req.get("command") or "").strip()
+                    source = str(req.get("source") or "").strip()
+                    kind = str(req.get("kind") or "").strip()
+                    if not command:
+                        errors.append(
+                            "metadata.points_requests: 'command' is required"
+                        )
+                    elif command not in own_events:
+                        errors.append(
+                            f"metadata.points_requests: '{command}' is not an "
+                            f"event of this state machine (the push would "
+                            f"never be triggered)"
+                        )
+                    if command:
+                        if command in seen_commands:
+                            errors.append(
+                                f"metadata.points_requests: duplicate command "
+                                f"'{command}'"
+                            )
+                        seen_commands.add(command)
+                    if not source or not kind:
+                        errors.append(
+                            "metadata.points_requests: 'source' and 'kind' "
+                            "are required"
+                        )
+                        continue
+                    if not SUBSYSTEM_NAME_RE.match(source):
+                        errors.append(
+                            f"metadata.points_requests: invalid source "
+                            f"subsystem name '{source}'"
+                        )
+                        continue
+                    producer = self._load_subsystem(source)
+                    if producer is None:
+                        errors.append(
+                            f"metadata.points_requests: source subsystem "
+                            f"'{source}' is not configured"
+                        )
+                        continue
+                    src_reports = (producer.get("metadata") or {}).get(
+                        "reports"
+                    ) or []
+                    src_points = next(
+                        (
+                            r.get("points")
+                            for r in src_reports
+                            if isinstance(r, dict)
+                            and isinstance(r.get("points"), dict)
+                            and str(r.get("points").get("kind") or "") == kind
+                        ),
+                        None,
+                    )
+                    if src_points is None:
+                        errors.append(
+                            f"metadata.points_requests: '{source}' declares no "
+                            f"points report of kind '{kind}'"
+                        )
+                        continue
+                    label = req.get("label")
+                    index = req.get("index")
+                    if label is not None and index is not None:
+                        errors.append(
+                            "metadata.points_requests: use either 'label' or "
+                            "'index', not both"
+                        )
+                    src_labels = src_points.get("labels")
+                    if label is not None and isinstance(src_labels, list):
+                        if str(label) not in [str(l) for l in src_labels]:
+                            errors.append(
+                                f"metadata.points_requests: '{source}' labels "
+                                f"do not include '{label}'"
+                            )
+                    if index is not None:
+                        if (
+                            not isinstance(index, int)
+                            or isinstance(index, bool)
+                            or index < 0
+                        ):
+                            errors.append(
+                                "metadata.points_requests: 'index' must be a "
+                                "non-negative integer"
+                            )
+                        else:
+                            src_count = src_points.get("count")
+                            if isinstance(src_count, int) and index >= src_count:
+                                errors.append(
+                                    f"metadata.points_requests: index {index} is "
+                                    f"out of range ('{source}' reports "
+                                    f"{src_count} points)"
+                                )
         return errors
+
+    def _load_subsystem(self, name: str) -> Optional[Dict[str, Any]]:
+        """Parse one subsystem YAML by name (validation cross-checks)."""
+        if not SUBSYSTEM_NAME_RE.match(name):
+            return None
+        path = self.config_dir / "subsystems" / f"{name}.yaml"
+        if not path.exists():
+            return None
+        try:
+            data = self._parse(path.read_text())
+        except OSError:
+            return None
+        return data if isinstance(data, dict) else None
 
     def _validate_object(self, data: Dict[str, Any]) -> List[str]:
         """Validate the object blueprint, cross-checking the subsystems.

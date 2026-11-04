@@ -149,6 +149,10 @@ class SubsystemSimulator:
         self._timer: Optional[threading.Timer] = None
         self._deadline: Optional[float] = None
         self._pending: Optional[Tuple[str, str]] = None  # (event, state)
+        # The object the last received command belongs to (commands carry
+        # object_id, R12): points reports reference it when the report is
+        # about the object being worked on (e.g. the AI points of interest).
+        self._last_object_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -211,7 +215,15 @@ class SubsystemSimulator:
         event = self._format.command.extract_event(data)
         if not event:
             return
-        logger.info("[%s] command '%s' received", self.name, event)
+        # Object-driven commands carry the object they belong to (R12):
+        # remembered so the points reports reference the right object.
+        object_id = self._format.command.extract_object_id(data)
+        if object_id:
+            self._last_object_id = object_id
+        logger.info(
+            "[%s] command '%s' received%s",
+            self.name, event, f" (object: {object_id})" if object_id else "",
+        )
         # Raw hardware commands (ordered [pause, resume], from global.yaml):
         # they bypass the state machine (it does not model pause).
         if self._hardware_commands and event == self._hardware_commands[0]:
@@ -267,7 +279,10 @@ class SubsystemSimulator:
 
         Generic (R5): for each report declared in the YAML metadata,
         publish it on /response when the declared `after` transition
-        happens.
+        happens. Reports with a `points:` section (R12) publish the
+        object's geometry instead of an object list: one message per
+        discovered object when the report declares `object_ids`, else one
+        message for the object of the last received command.
         """
         for rep in self._reports:
             after = rep.get("after") or {}
@@ -277,13 +292,15 @@ class SubsystemSimulator:
             ):
                 continue
             ids_cfg = rep.get("object_ids") or {}
-            fmt = ids_cfg.get("format", self._object_id_format)
-            count = (
-                self.num_objects
-                if ids_cfg.get("count_source") == "num_objects"
-                else 0
-            )
-            object_ids = [fmt.format(i=i) for i in range(1, count + 1)]
+            object_ids: List[str] = []
+            if ids_cfg.get("count_source") == "num_objects" and self.num_objects > 0:
+                fmt = ids_cfg.get("format", self._object_id_format)
+                object_ids = [fmt.format(i=i) for i in range(1, self.num_objects + 1)]
+
+            if isinstance(rep.get("points"), dict):
+                self._publish_points_report(rep, object_ids)
+                continue
+
             logger.info(
                 "[%s] reporting %d objects ('%s')",
                 self.name, len(object_ids), rep.get("type"),
@@ -295,6 +312,62 @@ class SubsystemSimulator:
                 ),
                 qos=1,
             )
+
+    def _publish_points_report(self, rep: Dict, object_ids: List[str]) -> None:
+        """Publish the fake geometry of a points report (R12).
+
+        Real producers send their actual measurements; the simulated ones
+        generate deterministic placeholder coordinates (stable per object
+        id) with the count/dimensions declared in the subsystem YAML.
+        """
+        points_cfg = rep.get("points") or {}
+        report_type = str(rep.get("type") or "object_points")
+        count = int(points_cfg.get("count") or 1)
+        dimensions = int(points_cfg.get("dimensions") or 3)
+        targets = object_ids or (
+            [self._last_object_id] if self._last_object_id else []
+        )
+        if not targets:
+            logger.warning(
+                "[%s] points report '%s' has no object to reference "
+                "(the triggering command carried no object id)",
+                self.name, report_type,
+            )
+            return
+        for oid in targets:
+            coords = self._fake_points(oid, count, dimensions)
+            logger.info(
+                "[%s] reporting %d point(s) for object '%s' ('%s')",
+                self.name, len(coords), oid, report_type,
+            )
+            self.mqtt.publish(
+                self._response_topic,
+                self._format.response.build_points(report_type, oid, coords),
+                qos=1,
+            )
+
+    def _fake_points(
+        self, object_id: str, count: int, dimensions: int
+    ) -> List[List[float]]:
+        """Deterministic placeholder geometry for one object (R12).
+
+        Stable per object id so a run can be replayed and compared;
+        ``dimensions`` 3 renders [x, y, z], 6 renders [x, y, z, r, p, y].
+        """
+        digits = int("".join(c for c in object_id if c.isdigit())[-3:] or 0)
+        pts: List[List[float]] = []
+        for i in range(max(1, count)):
+            x = round(0.10 + 0.001 * ((digits + 17 * i) % 100), 4)
+            y = round(0.20 + 0.001 * ((digits * 3 + 11 * i) % 100), 4)
+            z = round(0.05 + 0.001 * ((digits + 7 * i) % 50), 4)
+            if dimensions >= 6:
+                yaw = round(
+                    ((digits * 13 + 45 * i) % 360) * 3.14159265 / 180.0, 4
+                )
+                pts.append([x, y, z, 0.0, 0.0, yaw])
+            else:
+                pts.append([x, y, z])
+        return pts
 
     # ------------------------------------------------------------------
     # Work timer (pause-aware)

@@ -190,7 +190,10 @@ class SubsystemAdapter:
             self.error = error
 
     def fire_transition(
-        self, event: str, data: Optional[Dict[str, Any]] = None
+        self,
+        event: str,
+        data: Optional[Dict[str, Any]] = None,
+        object_id: Optional[str] = None,
     ) -> str:
         """Issue a command to the subsystem (BOUNDARY) without advancing the
         local state machine.
@@ -215,6 +218,9 @@ class SubsystemAdapter:
         Args:
             event: The command event.
             data: Optional context merged into the MQTT command payload.
+            object_id: The object this command belongs to (embedded in the
+                payload through the configured ``object_id_field`` when
+                the orchestrator issues the command for an object).
 
         Returns the expected new state name (the command's target state).
         Raises SubsystemStateMachineError if there is no state machine, or
@@ -233,10 +239,14 @@ class SubsystemAdapter:
             # Outgoing command: record the expectation (discrepancy check) and
             # publish it. The local SM keeps its last reported state until the
             # subsystem confirms the new state over MQTT. The payload shape
-            # comes from the configured message format (R10).
+            # comes from the configured message format (R10); object-driven
+            # commands carry the object id through the configured
+            # object_id_field so the subsystem knows what it works on.
             self._record_expected(expected, event, sm.current_state)
             topic = self.event_topic
-            payload = self.message_format.command.build(event, data)
+            payload = self.message_format.command.build(
+                event, data, object_id=object_id
+            )
             self.mqtt_client.publish(topic, payload, qos=1)
             logger.info(
                 "[Boundary] Subsystem '%s' command '%s' -> expected '%s' (MQTT '%s')",

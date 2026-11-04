@@ -229,3 +229,20 @@ matter of swapping the `:root` block — e.g. a `data-theme` attribute on
 `<body>` plus a small picker persisted in `localStorage`. No component
 CSS would need to change; the only caution is keeping the backend-driven
 tones (F3) legible in both themes.
+
+## 18b. Points: frames, units and visualization (follow-ups of R12)
+
+The measurement points (R12) are forwarded opaquely: the orchestrator
+stores and pushes coordinate lists without knowing their reference frame
+or units — the producers and the robot implicitly agree.
+
+**Ideas:**
+- add an optional `frame:` field to the points report declaration (and
+  payload), validated for consistency between producer and consumer, so
+  a future mixed setup (camera frame vs object frame vs world frame)
+  cannot silently mix conventions;
+- visualize the points: the object window could render them on a simple
+  schematic of the object/platform (or a tiny 3D view), and the robot
+  card could show which points it received for the current command;
+- plausibility checks on arrival (count vs the declared `count`, NaN
+  rejection, range warnings) instead of accepting whatever arrives.

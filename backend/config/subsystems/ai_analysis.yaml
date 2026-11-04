@@ -11,6 +11,19 @@ metadata:
   init_duration: 1.5
   work_durations:
     analyzing: 5.0
+  # Points of interest (R12): after planning, the AI reports the surface
+  # points [x, y, z, r, p, y] it extracted for the analyzed object — one
+  # per puntual analysis, labeled after the analyzer that will measure it.
+  # The measurement robot receives them pushed on its /points topic with
+  # the matching measure command.
+  reports:
+    - type: object_points
+      after: { from: analyzing, to: ready }
+      points:
+        kind: points_of_interest
+        count: 2
+        dimensions: 6
+        labels: [xrf, raman]
 
 states:
   initializing:
