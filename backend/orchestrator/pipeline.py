@@ -469,6 +469,15 @@ class PipelineController:
             self._start_measurement_tracking(object_id, list(parallel))
             return
 
+        # Points dispatch (R13): a dispatch state has no actor — the
+        # pipeline immediately fires the event that leads to the next
+        # analysis (chosen by which points of interest are still
+        # unconsumed), or the done event when none remain.
+        dispatch = meta.get("points_dispatch")
+        if dispatch:
+            self._dispatch_points_stage(object_id, dispatch)
+            return
+
         actor = meta.get("actor")
         if actor is None:
             return
@@ -487,6 +496,53 @@ class PipelineController:
                     actor, state,
                 )
                 self._fire_object_event(object_id, event)  # recurses
+
+    def _dispatch_points_stage(
+        self, object_id: str, dispatch: Dict[str, Any]
+    ) -> None:
+        """Fire the next analysis event of a points-dispatch state (R13).
+
+        ``meta.points_dispatch`` declares, per points label, the event
+        that leads to the analysis state measuring that label, and the
+        event fired when no unconsumed points remain:
+
+            points_dispatch:
+              done_event: puntual_measurements_complete
+              remaining:
+                - { event: analyze_next_xrf_point, kind: points_of_interest, label: xrf }
+                - { event: analyze_next_raman_point, kind: points_of_interest, label: raman }
+
+        The declaration order is the priority: the first label that still
+        has unconsumed points in the object's stored points wins. Each
+        analysis round consumes its point at command time (``select:
+        next`` in the consumer's points_requests), so the object cycles
+        dispatch -> analysis -> dispatch until every point is measured.
+        """
+        store = self._orch._points_store
+        for entry in dispatch.get("remaining") or []:
+            if not isinstance(entry, dict):
+                continue
+            event = str(entry.get("event") or "")
+            kind = str(entry.get("kind") or "")
+            label = str(entry.get("label") or "")
+            if not event:
+                continue
+            left = store.remaining(object_id, kind, label)
+            if left > 0:
+                logger.info(
+                    "Pipeline: object '%s' has %d '%s' point(s) left – "
+                    "dispatching '%s'",
+                    object_id, left, label or kind, event,
+                )
+                self._fire_object_event(object_id, event)
+                return
+        done_event = str(dispatch.get("done_event") or "")
+        if done_event:
+            logger.info(
+                "Pipeline: all points of object '%s' measured – dispatching '%s'",
+                object_id, done_event,
+            )
+            self._fire_object_event(object_id, done_event)
 
     def _finish_rotation(self) -> None:
         """Apply the coupled disk rotation and start the arriving stages.

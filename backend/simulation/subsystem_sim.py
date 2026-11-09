@@ -45,7 +45,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure the project root is importable (backend package).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -317,13 +317,13 @@ class SubsystemSimulator:
         """Publish the fake geometry of a points report (R12).
 
         Real producers send their actual measurements; the simulated ones
-        generate deterministic placeholder coordinates (stable per object
-        id) with the count/dimensions declared in the subsystem YAML.
+        generate deterministic placeholder coordinates. The number of
+        points is whatever this producer reports: with a declared `count`
+        it is fixed, otherwise it is derived per object (R13b) — the
+        downstream flow adapts to the received data.
         """
         points_cfg = rep.get("points") or {}
         report_type = str(rep.get("type") or "object_points")
-        count = int(points_cfg.get("count") or 1)
-        dimensions = int(points_cfg.get("dimensions") or 3)
         targets = object_ids or (
             [self._last_object_id] if self._last_object_id else []
         )
@@ -335,7 +335,7 @@ class SubsystemSimulator:
             )
             return
         for oid in targets:
-            coords = self._fake_points(oid, count, dimensions)
+            coords = self._fake_points(oid, points_cfg)
             logger.info(
                 "[%s] reporting %d point(s) for object '%s' ('%s')",
                 self.name, len(coords), oid, report_type,
@@ -346,17 +346,25 @@ class SubsystemSimulator:
                 qos=1,
             )
 
-    def _fake_points(
-        self, object_id: str, count: int, dimensions: int
-    ) -> List[List[float]]:
+    def _fake_points(self, object_id: str, points_cfg: Dict) -> List[Any]:
         """Deterministic placeholder geometry for one object (R12).
 
         Stable per object id so a run can be replayed and compared;
         ``dimensions`` 3 renders [x, y, z], 6 renders [x, y, z, r, p, y].
+
+        - ``count`` declared: exactly that many points, distributed
+          round-robin over the ``labels`` vocabulary (labeled objects) or
+          plain coordinate lists when no labels are declared.
+        - ``count`` omitted (R13b): a dynamic number of points per
+          declared label (1..2, stable per object id) — the number of
+          points is whatever the producer reports, and the dispatch
+          adapts to it.
         """
         digits = int("".join(c for c in object_id if c.isdigit())[-3:] or 0)
-        pts: List[List[float]] = []
-        for i in range(max(1, count)):
+        dimensions = int(points_cfg.get("dimensions") or 3)
+        labels = [str(l) for l in (points_cfg.get("labels") or [])]
+
+        def _coords(i: int) -> List[float]:
             x = round(0.10 + 0.001 * ((digits + 17 * i) % 100), 4)
             y = round(0.20 + 0.001 * ((digits * 3 + 11 * i) % 100), 4)
             z = round(0.05 + 0.001 * ((digits + 7 * i) % 50), 4)
@@ -364,10 +372,31 @@ class SubsystemSimulator:
                 yaw = round(
                     ((digits * 13 + 45 * i) % 360) * 3.14159265 / 180.0, 4
                 )
-                pts.append([x, y, z, 0.0, 0.0, yaw])
-            else:
-                pts.append([x, y, z])
-        return pts
+                return [x, y, z, 0.0, 0.0, yaw]
+            return [x, y, z]
+
+        count_cfg = points_cfg.get("count")
+        points: List[Any] = []
+        if count_cfg is not None:
+            total = max(1, int(count_cfg))
+            for i in range(total):
+                if labels:
+                    points.append(
+                        {"label": labels[i % len(labels)], "coordinates": _coords(i)}
+                    )
+                else:
+                    points.append(_coords(i))
+            return points
+
+        # Dynamic mode: a stable per-object count per declared label.
+        i = 0
+        for idx, label in enumerate(labels):
+            for _ in range(1 + (digits + 7 * idx) % 2):
+                points.append({"label": label, "coordinates": _coords(i)})
+                i += 1
+        if not labels:
+            points = [_coords(i) for i in range(1 + digits % 2)]
+        return points
 
     # ------------------------------------------------------------------
     # Work timer (pause-aware)

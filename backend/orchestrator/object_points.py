@@ -65,10 +65,18 @@ class ObjectPoints:
 
 
 class ObjectPointsStore:
-    """``object_id -> kind -> ObjectPoints`` with request-based selection."""
+    """``object_id -> kind -> ObjectPoints`` with request-based selection.
+
+    Points can also be *consumed* one at a time (R13): a measurement
+    command takes the next unconsumed point of its label, and the
+    per-(object, kind, label) cursor advances — this is how the pipeline
+    knows how many points of each label remain to analyze.
+    """
 
     def __init__(self) -> None:
         self._data: Dict[str, Dict[str, ObjectPoints]] = {}
+        # (object_id, kind, label) -> number of points already taken
+        self._consumed: Dict[str, Dict[str, Dict[str, int]]] = {}
 
     # -- population ------------------------------------------------------
 
@@ -111,6 +119,9 @@ class ObjectPointsStore:
             object_id=object_id, kind=kind, source=source, points=points
         )
         self._data.setdefault(object_id, {})[kind] = entry
+        # A fresh report replaces the previous one: its consumption
+        # cursors start over.
+        self._consumed.get(object_id, {}).pop(kind, None)
         return entry
 
     # -- lookup ----------------------------------------------------------
@@ -147,6 +158,46 @@ class ObjectPointsStore:
             return None
         return [p.coordinates for p in entry.points]
 
+    # -- consumption (R13) -------------------------------------------------
+
+    def _cursor_key(self, object_id: str, kind: str, label: str) -> int:
+        """How many points of ``(object, kind, label)`` were consumed."""
+        return self._consumed.get(object_id, {}).get(kind, {}).get(label, 0)
+
+    def remaining(self, object_id: Optional[str], kind: str, label: str = "") -> int:
+        """Unconsumed points of ``(object, kind, label)``."""
+        entry = self.get(object_id, kind)
+        if entry is None:
+            return 0
+        total = len(
+            [p for p in entry.points if not label or p.label == label]
+        )
+        return max(0, total - self._cursor_key(object_id, kind, label))
+
+    def take_next(
+        self,
+        object_id: Optional[str],
+        kind: str,
+        label: str = "",
+    ) -> Optional[List[List[float]]]:
+        """The next unconsumed point of ``(object, kind, label)``, consumed.
+
+        Returns the single coordinate list (advancing the cursor), or
+        ``None`` when nothing remains. The push of a ``select: next``
+        points request uses this so every measurement command delivers
+        exactly one fresh point.
+        """
+        entry = self.get(object_id, kind)
+        if entry is None:
+            return None
+        candidates = [p for p in entry.points if not label or p.label == label]
+        taken = self._cursor_key(object_id, kind, label)
+        if taken >= len(candidates):
+            return None
+        point = candidates[taken]
+        self._consumed.setdefault(object_id, {}).setdefault(kind, {})[label] = taken + 1
+        return [point.coordinates]
+
     # -- frontend info / lifecycle ----------------------------------------
 
     def info(self, object_id: str) -> List[Dict[str, Any]]:
@@ -159,6 +210,8 @@ class ObjectPointsStore:
 
     def drop(self, object_id: str) -> None:
         self._data.pop(object_id, None)
+        self._consumed.pop(object_id, None)
 
     def clear(self) -> None:
         self._data.clear()
+        self._consumed.clear()

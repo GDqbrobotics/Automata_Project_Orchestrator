@@ -40,11 +40,17 @@ class MqttClient:
         logger.info("MQTT connected to %s:%d", self.broker, self.port)
 
     def disconnect(self) -> None:
+        # paho-mqtt 2.x: neither loop_stop() nor disconnect() accepts the
+        # timeout argument this call used to pass — it raised TypeError and
+        # the except below swallowed it, so the network thread (and the
+        # MQTT connection, with all its subscriptions) survived: a
+        # "stopped" orchestrator kept processing MQTT forever, doubling
+        # every downstream effect (stores, pushes, commands).
         try:
-            self._client.loop_stop(timeout=0.1)
-            self._client.disconnect(timeout=0.1)
+            self._client.disconnect()
+            self._client.loop_stop()
         except Exception:
-            pass
+            logger.exception("MQTT disconnect failed")
         logger.info("MQTT disconnected")
 
     # ------------------------------------------------------------------

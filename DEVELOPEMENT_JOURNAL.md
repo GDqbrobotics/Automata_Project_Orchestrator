@@ -22,7 +22,41 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - The orchestrator's local **subsystem SM is a mirror, not a predictor**: issuing a command does NOT advance it (real subsystems lag); it only follows the state the subsystem reports over MQTT. An expected-state **discrepancy check** warns if a subsystem never reports the state it was commanded into (window: `orchestration.state_expect_timeout` in `global.yaml`, default 10 s).
 - **The YAML is the single source of truth** (docs/CONFIG_CHANGE_GUIDE.md, implemented 2026-10-08): no state/event names, subsystem names, topics, durations or button rules are hardcoded in Python or TypeScript. The GUI derives its operator-button matrix, state-machine graphs, tones and display vocabulary from the same YAML, broadcast at startup; a rename in `backend/config/` is a config-only change.
 
-## Latest changes (2026-11-04 — interface lifecycle + broker-start fixes)
+## Latest changes (2026-11-04 — multi-point analysis dispatch, R13)
+
+The puntual analyses now walk ALL the AI points of interest, one per
+round (R13 in `docs/CONFIG_CHANGE_GUIDE.md`, built on the object journey
+the operator drafted: the `puntual_measurements` dispatch state):
+
+- `object.yaml`: after `ai_processing`, the object reaches
+  `puntual_measurements` — a state with **no actor** whose
+  `meta.points_dispatch` declares, per points label, the event that leads
+  to its analysis (`analyze_next_xrf_point` → XRF_analysis,
+  `analyze_next_raman_point` → RAMAN_analysis) and the
+  `puntual_measurements_complete` done event. Each analysis returns to
+  the dispatch state over its completion event; each dispatch transition
+  carries that round's commands (robot + analyzer).
+- The pipeline fires the dispatch: entering the state, it fires the first
+  declared event whose label still has unconsumed points, and the done
+  event when none remain. The number of points is **whatever the AI
+  report carried** (dynamic, R13b — `labels` in the producer YAML is the
+  label vocabulary, not a fixed count); the robot's measure requests
+  declare `select: next` — each measurement command **consumes** the next
+  unconsumed point of its label (per-object cursors in the points store).
+- Validation: dispatch events must leave the dispatch state and reference
+  producer-declared labels; `select` must be `all`/`next`.
+- **Found and fixed a paho-mqtt 2.x API break**: `MqttClient.disconnect()`
+  called `loop_stop(timeout=…)`/`disconnect(timeout=…)` — neither accepts
+  a timeout in paho 2.1, the `TypeError` was silently swallowed, and every
+  "stopped" orchestrator kept its MQTT connection and subscriptions alive,
+  processing messages forever (duplicated stores/pushes across tests, and
+  a likely cause of transient physical-invariant flaps). Disconnects now
+  actually happen.
+- Tests: Test 17 asserts one push per measurement round with distinct,
+  in-order coordinates; the journey-walk helper handles the dispatch
+  branch. **221/221** pass.
+
+## Earlier changes (2026-11-04 — interface lifecycle + broker-start fixes)
 
 Two fixes from the operator's first real-hardware attempt (Robot Arm 1
 switched to REAL in simulation mode):
@@ -82,127 +116,6 @@ config-declared (R12 in `docs/CONFIG_CHANGE_GUIDE.md`):
   with the right shape; the object status carries both sets) + validation
   refusals in Test 15. **211/211** pass; frontend build clean; verified in
   the object window with headless-Chrome screenshots.
-
-## Earlier changes (2026-10-27 — UI polish pass)
-
-A CSS-only aesthetic pass over the operator dashboard (no behavior
-changes; all class names and the YAML-driven derivation rules stay).
-
-- Refreshed design tokens: refined dark palette with an elevation ladder
-  (`surface` → `surface-4`), soft shadows, one focus ring, Inter/system
-  font stack, tabular numerals, `prefers-reduced-motion` support.
-- Top bar is now an elevated toolbar (brand tile + uppercase subtitle);
-  panel headers got an accent tick and right-aligned count chips; buttons
-  use inline SVG icons and gradient/raised styling; the event log renders
-  the source as a chip (no more `[brackets]`) with an empty-state hint.
-- **Fixed a pre-existing layout bug**: `.panel { display: flex }` was
-  defined *after* `.control-panel { display: grid }` with equal
-  specificity, so the control deck's three-column grid never applied and
-  state/progress/actions always stacked vertically. The deck now uses
-  `.panel.control-panel` (and the ≤1100px override matches) — the deck
-  finally renders as designed.
-- Modal/wizard polish: stronger backdrop blur, deeper shadows, hover and
-  focus rings on inputs. Object-card top row wraps so long IDs stay
-  readable next to long state names.
-- Verified with headless-Chrome screenshots at 1680/1280/900 px widths,
-  idle and mid-run, including the inspector modal and the wizard.
-  Backend suite still **203/203** (backend untouched); `npm run build` clean.
-
-## Earlier changes (2026-10-27 — subsystem real-interface scripts)
-
-A real subsystem cannot initialize until its interface (ROS node, device
-daemon, …) runs. The subsystem YAML can now declare the commands that
-start and stop that interface (`metadata.interface`, R11 in
-`docs/CONFIG_CHANGE_GUIDE.md`), and the orchestrator executes them
-**headless** — detached, output appended to
-`backend/interface_logs/<name>.log` — because from that moment the
-subsystem state is known through MQTT only (`backend/services/interface_manager.py`).
-
-- The lifecycle follows the **workflow, not the GUI process**: `startup`
-  runs when the operator starts the workflow (a subsystem left `stopped`
-  gets its interface back before the wake transition) and on a SIM→REAL
-  toggle — launching the GUI starts nothing; `shutdown` runs when the
-  workflow reaches its stop state (the Stop button or the automatic
-  end-of-run stop, fire-and-forget) and, waited on with a 5 s timeout,
-  when the GUI closes. A subsystem reporting `stopped` only marks its
-  interface down (no script). A still-alive tracked startup process is
-  terminated best-effort so no orphan interface survives.
-- Values are shell command lines (a launcher that spawns a daemon and
-  exits is as valid as a long-running process); scripts must be
-  idempotent; relative paths resolve against the project root; validation
-  refuses an enabled interface without a `startup` command; every
-  launch/stop is mirrored to the frontend event log (`interface_command`).
-- Wizard: Subsystems → Basics → *Interface (real hardware)* (enabled
-  checkbox + startup/shutdown/cwd, same comment-preserving patches).
-- Tests: C16 `test_interface_scripts` (startup at start, shutdown on the
-  stopped report, exactly-once semantics) + validation refusals in C15;
-  **203/203** pass, frontend build clean.
-
-## Earlier changes (2026-10-27 — configuration wizard + configurable MQTT formats)
-
-Two additions, both debug-friendly and fully config-driven.
-
-**1. MQTT message formats are now configurable (R10).** New field-mapping
-layer `backend/config/mqtt_formats.yaml` + `backend/messaging/message_format.py`.
-Each message kind (`command`, `hardware_command`, `status`, `response`) maps
-the logical values to payload fields; per-subsystem overrides are deep-merged
-over `default:`, and dotted field names reach nested payloads (`data.state`).
-Integrated in `SubsystemAdapter.fire_transition`/`send_command`,
-`WorkflowOrchestrator._broadcast_command_to_subsystems`/`_update_subsystem_status`/
-`_on_mqtt_message`/`_build_debug_topics`/`_report_payload` and in
-`backend/simulation/subsystem_sim.py`, so orchestrator and sim can never
-drift. Defaults reproduce the previous payloads exactly (151/151 pre-existing
-tests pass unchanged).
-
-**2. Configuration wizard (debug mode).** `⚙` in the top bar (revealed by
-`--debug`, gated server-side on debug + workflow-not-running). Four steps:
-workflow metadata/global settings/object blueprint (structured forms that
-apply comment-preserving line patches + raw YAML editor), subsystems
-(basics, a **structured state-machine editor**, addition from a commented
-template, staged removal with reference check), MQTT formats (structured
-fields + per-subsystem overrides), review & save (validate all, sequential
-save, then create simulators / delete staged files). New commands
-`get_config`, `validate_config`, `patch_config`, `save_config`,
-`create_subsystem`, `delete_subsystem`, `write_simulator`,
-`render_message_formats`, `render_state_machine`; new events
-`config_snapshot`, `config_patched`, `config_validated`, `config_saved`,
-`subsystem_deleted`. The browser holds no filesystem access:
-`backend/services/config_service.py` validates (YAML + structural checks),
-patches by line (comments preserved) and writes atomically. A restart is
-always requested after saving.
-
-**2b. State-machine editor (subsystems).** Inside the wizard's Subsystems
-step, a third tab edits the machine as structured data: states (add / remove
-/ description / initial), transitions (event, target) and their actions
-(`log_event`, a fired scoped/internal event, or a raw preserved action).
-`ConfigService.render_state_machine` validates the whole candidate document
-and re-serializes **only the `states:` block** with an indenting dumper;
-the file header (name, metadata and their comments) survives unchanged.
-Pending drafts are rendered automatically at save time (`render_sm` ops in
-the frontend save queue) and everything stays client-side until the Review
-step writes it. The same editor is available for `workflow.yaml` and
-`object.yaml` (Workflow step); for object states it also edits the physical
-`meta` (position, actor, parallel actors, rotate request/command, actor op).
-
-**2c. Completion contract validation (why a run can hang).** Splitting a
-subsystem stage (e.g. `robot_first.measuring_xrf_raman` → `measuring_xrf` +
-`measuring_raman`) only works if **every work state transitions back to the
-ready state**: the pipeline (and the generic simulator) treats a work →
-ready status report as completion, so a work state with no way back stalls
-the object forever. Subsystem transitions also cannot fire internal events
-(`event:` actions are ignored — the engine callback is not wired on either
-the sim or the mirror), so the wizard now rejects them with an explanation.
-`ConfigService` gained the cross-file object validation: actors must be
-configured subsystems with a completion path, positions must match the
-layout, rotate commands must exist, and task chains must reference real
-object events/subsystem commands (see `docs/STATE_MACHINE.md` principle 13
-and R2's completion contract). `simulation_test.py` covers the split journey
-and the new refusals.
-
-- Docs: `docs/CONFIG_CHANGE_GUIDE.md` (R10 + wizard section), `README.md`,
-  `docs/IMPROVEMENT_IDEAS.md` (out-of-scope ideas report).
-- Validation: `timeout 500 python backend/simulation_test.py` → pass
-  (+28 new checks), `cd frontend && npm run build` clean.
 
 ## Next steps
 

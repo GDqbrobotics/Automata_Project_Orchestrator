@@ -47,10 +47,14 @@ metadata:
       source: ai_analysis
       kind: points_of_interest
       label: xrf
+      # One point per measurement round (R13): the push consumes the next
+      # unconsumed xrf point of the object instead of pushing them all.
+      select: next
     - command: measure_raman
       source: ai_analysis
       kind: points_of_interest
       label: raman
+      select: next
 states:
   initializing:
     description: Robot is initializing

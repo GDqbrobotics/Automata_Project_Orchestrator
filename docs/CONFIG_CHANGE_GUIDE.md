@@ -285,12 +285,17 @@ reports:
     points: { kind: gripper_contacts, count: 2, dimensions: 3 }
 
 # ai_analysis.yaml — surface points of interest [x y z r p y], one per
-# analysis, labeled after the analyzer that will measure it
+# analysis, labeled after the analyzer that will measure it. The number
+# of points is whatever the report carries (dynamic, R13b); `labels` is
+# the label vocabulary the dispatch routes on. A declared `count` would
+# fix the simulated amount.
 reports:
   - type: object_points
     after: { from: analyzing, to: ready }
-    points: { kind: points_of_interest, count: 2, dimensions: 6,
-              labels: [xrf, raman] }
+    points:
+      kind: points_of_interest
+      dimensions: 6
+      labels: [xrf, raman]
 ```
 
 Payload shape (R10 `response` format, `object_id_field` + `points_field`):
@@ -332,13 +337,17 @@ Push payload (R10 `points_command` format):
   freshly discovered object races the points report), the push is
   **deferred** and delivered as soon as the report arrives — a consumer
   is guaranteed to receive the points of every commanded action.
-- `dimensions` is `3` ([x y z]) or `6` ([x y z r p y]); `labels` (when
-  present) must have exactly `count` entries and let a request select a
-  specific point (`label:`), or `index:` selects by position; with
-  neither, all stored points of the kind are pushed in report order.
+- `dimensions` is `3` ([x y z]) or `6` ([x y z r p y]). The **number of
+  points is whatever the report carries** (R13b): `labels` (when
+  present) is the label *vocabulary* the dispatch routes on, not a
+  fixed positional sequence, and `count` is optional (a fixed simulated
+  amount; omit it and the simulated producer derives a per-object
+  count). A request selects a specific point (`label:`), by position
+  (`index:`), consumes them one per command (`select: next`), or pushes
+  all stored points of the kind in report order (default).
 - Validation cross-checks both sides: a request's `command` must be an
   event of the consumer's own state machine, and its `source`/`kind`
-  must match a declared points report (labels/count included).
+  must match a declared points report (labels included).
 - Simulated producers generate deterministic placeholder coordinates
   (stable per object ID) with the declared count/dimensions; real
   producers send their actual measurements through the same formats.
@@ -347,6 +356,76 @@ Push payload (R10 `points_command` format):
 
 **Frontend impact:** the object window renders each stored points set
 (kind chip, source, per-point labels and coordinates).
+
+---
+
+## R13 — Multi-Point Analysis Dispatch (`points_dispatch` + `select: next`)
+
+A producer may deliver several points of interest per object (e.g. the AI
+labels N points `xrf` and M points `raman`); each one is measured in its
+own analysis round. The object journey models this with a **dispatch
+state** — a state with no actor that the pipeline exits immediately by
+firing exactly one of its outgoing events:
+
+```yaml
+# object.yaml
+puntual_measurements:
+  meta:
+    position: disk_first
+    points_dispatch:
+      done_event: puntual_measurements_complete
+      remaining:
+        - { event: analyze_next_xrf_point,  kind: points_of_interest, label: xrf }
+        - { event: analyze_next_raman_point, kind: points_of_interest, label: raman }
+  transitions:
+    - event: analyze_next_xrf_point
+      target: XRF_analysis
+      actions: [log_event, {event: robot_first/measure_xrf}, {event: xrf/measure}]
+    - event: analyze_next_raman_point
+      target: RAMAN_analysis
+      actions: [log_event, {event: robot_first/measure_raman}, {event: raman/measure}]
+    - event: puntual_measurements_complete
+      target: moving_to_box
+      actions: [log_event, {event: robot_first/return}]
+
+XRF_analysis:
+  meta: { position: disk_first, parallel_actors: [robot_first, xrf] }
+  transitions:
+    - event: xrf_measurement_complete      # internal label (principle 13)
+      target: puntual_measurements
+```
+
+**How it works:** when the object enters the dispatch state, the pipeline
+fires the FIRST declared event whose label still has unconsumed points in
+the object's stored points (R12), and `done_event` when none remain. Each
+analysis round **consumes** its point at command time — the consumer's
+points request declares `select: next`:
+
+```yaml
+# robot_first.yaml
+points_requests:
+  - { command: measure_xrf, source: ai_analysis, kind: points_of_interest,
+      label: xrf, select: next }
+```
+
+so every `measure_xrf` command pushes exactly the next unconsumed `xrf`
+point (a per-object consumption cursor advances in the points store), the
+analysis runs, the parallel actors report ready, the object returns to
+the dispatch state, and the cycle repeats until `done_event`.
+
+**Rules:**
+- The producer must publish its points report **before** reporting the
+  ready state — the dispatch decision reads the stored points at the
+  moment the object enters the dispatch state (the generic simulator does
+  exactly that; it is the natural real-hardware contract too).
+- The dispatch events, the `done_event`, the `label`/`kind` pairs and the
+  analysis return transitions are all validated cross-file (the events
+  must leave the dispatch state; the labels must be declared by a
+  producer's points report).
+- `select` is `all` (default — every stored point of the label/kind in
+  one push) or `next` (one point per command, consumed in order).
+- A points report that replaces a previous one resets that kind's
+  consumption cursors; the whole store is cleared on workflow reset.
 
 ---
 
@@ -575,13 +654,13 @@ states: {state_name: {description, transitions[{event, target, actions[]}]}}
 ```yaml
 name, initial_state
 metadata: {disks, disk_names[], hand_slots, task_chains{subsystem[{op, object_event, next_command?, done_event, releases?}]}}
-states: {state_name: {description, meta{position, actor?, parallel_actors[], rotate_request?, rotate_command?, actor_op?}, transitions[{event, target, actions[]}]}}
+states: {state_name: {description, meta{position, actor?, parallel_actors[], rotate_request?, rotate_command?, actor_op?, points_dispatch{done_event, remaining[{event, kind, label}]}}, transitions[{event, target, actions[]}]}}
 ```
 
 ### subsystems/*.yaml
 ```yaml
 name, display_name, type, mqtt_topic, initial_state, required
-metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}, points{kind, count, dimensions, labels?}}], interface{enabled, startup, shutdown?, cwd?}, points_topic?, points_requests[{command, source, kind, label?|index?}]}
+metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}, points{kind, count?, dimensions, labels?}}], interface{enabled, startup, shutdown?, cwd?}, points_topic?, points_requests[{command, source, kind, label?|index?, select?}]}
 states: {state_name: {description, transitions[{event, target, actions[]}]}}
 ```
 

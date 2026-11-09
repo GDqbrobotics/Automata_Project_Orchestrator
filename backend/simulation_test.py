@@ -141,14 +141,62 @@ HAND_STATES = set(_OBJ_STATES_BY_POSITION.get("hand", []))
 
 def _object_journey() -> List[Tuple[str, str]]:
     """Walk the object.yaml journey from the initial state: a list of
-    (event, target_state) pairs up to the final state (linear blueprint)."""
+    (event, target_state) pairs up to the final state.
+
+    The blueprint is linear except the points-dispatch state (R13): the
+    pipeline picks the outgoing event by the object's remaining points.
+    For the walk, ONE measurement round of the first declared label is
+    taken (dispatch -> analysis -> back to the dispatch state), then the
+    done event completes the journey — modelling the shortest full pass.
+    """
+
+    def _target_of(cfg: StateMachineConfig, event: str) -> Optional[str]:
+        for t in cfg.transitions or []:
+            if t.event == event:
+                return t.target
+        return None
+
     steps: List[Tuple[str, str]] = []
     state = _OBJ_CFG.initial_state
     seen = {state}
+    dispatch_round_done = False
     while True:
         cfg = _OBJ_CFG.states.get(state)
         if cfg is None or not cfg.transitions:
             break
+        meta = cfg.meta or {}
+        dispatch = meta.get("points_dispatch")
+        if isinstance(dispatch, dict):
+            if dispatch_round_done:
+                event = str(dispatch.get("done_event") or "")
+            else:
+                remaining = dispatch.get("remaining") or []
+                event = (
+                    str((remaining[0] or {}).get("event") or "")
+                    if remaining
+                    else ""
+                )
+            target = _target_of(cfg, event)
+            if target is None:
+                break
+            steps.append((event, target))
+            if target in seen:
+                break  # safety
+            seen.add(target)
+            state = target
+            if event == str(dispatch.get("done_event") or ""):
+                dispatch_round_done = True
+            else:
+                # The analysis state returns over its outgoing transition
+                # (the measurement round completes).
+                analysis_cfg = _OBJ_CFG.states.get(target)
+                if analysis_cfg and analysis_cfg.transitions:
+                    t0 = analysis_cfg.transitions[0]
+                    steps.append((t0.event, t0.target))
+                    seen.add(t0.target)
+                    state = t0.target
+                dispatch_round_done = True
+            continue
         t = cfg.transitions[0]
         steps.append((t.event, t.target))
         if t.target in seen:
@@ -1065,14 +1113,22 @@ def test_object_state_machine_config() -> None:
         # rotating_platform command.
         # The object lands on the first position in 'ai_processing' and
         # waits there until the AI finishes extracting the interest points;
-        # only then does the measurement stage start. XRF and Raman are two
-        # sequential states: each one's incoming transition fires the
-        # commands of the next stage, and each ends when its
-        # parallel_actors (robot + analyzer) report back ready.
+        # the measurement rounds are then dispatched from the
+        # 'puntual_measurements' state (R13).
         "HSI_analysis": ["ai_analysis/plan", "workflow/rotation_requested_first"],
-        "ai_processing": ["robot_first/measure_xrf", "xrf/measure"],
-        "XRF_analysis": ["robot_first/measure_raman", "raman/measure"],
-        "RAMAN_analysis": ["robot_first/return"],
+        # After the AI, the object reaches the points-dispatch state: the
+        # pipeline fires one analysis event per remaining point of
+        # interest (labeled xrf / raman, R13) and the done event when all
+        # are measured. Each analysis transition commands its round
+        # (robot + analyzer); the analysis states return to the dispatch
+        # state when their parallel actors report back ready.
+        "puntual_measurements": [
+            "robot_first/measure_xrf",
+            "xrf/measure",
+            "robot_first/measure_raman",
+            "raman/measure",
+            "robot_first/return",
+        ],
     }
     for state, expected_events in expected_scoped_events.items():
         if state not in manager.config.states:
@@ -1419,9 +1475,10 @@ async def test_object_points_flow() -> None:
         await ws_client.send_command("start_workflow")
         await ws_client.receive()
 
-        # The robot is commanded: pick, place (task chain), measure_xrf,
-        # measure_raman, return. Each must be followed by the push of the
-        # points its YAML requested, addressed to the object.
+        # The robot is commanded: pick, place (task chain), then one measurement
+        # round PER point of interest the AI reported (dynamic count, R13b),
+        # then return. Every measure command must be followed by the push of
+        # exactly its next unconsumed point (select: next).
         expected = {"pick", "place", "measure_xrf", "measure_raman", "return"}
 
         def _seen_events() -> set:
@@ -1436,42 +1493,70 @@ async def test_object_points_flow() -> None:
             f"(missing: {sorted(expected - _seen_events())})",
         )
 
-        by_event = {}
-        for m in received:
-            by_event.setdefault(m.get("event"), m)
-        gripper = by_event.get("pick") or {}
+        def _events_of(name: str) -> List[Dict[str, Any]]:
+            return [m for m in received if m.get("event") == name]
+
+        gripper = _events_of("pick")[0] if _events_of("pick") else {}
         results.check(
             bool(gripper.get("object_id"))
             and len(gripper.get("points") or []) == 2
             and all(len(p) == 3 for p in gripper.get("points") or []),
             "Pick push carries the object id and both [x y z] gripper contacts",
         )
-        for cmd in ("measure_xrf", "measure_raman"):
-            push = by_event.get(cmd) or {}
-            points = push.get("points") or []
-            results.check(
-                bool(push.get("object_id"))
-                and len(points) == 1
-                and len(points[0]) == 6,
-                f"{cmd} push carries the labeled [x y z r p y] point of interest",
-            )
 
-        # The object window (full status) shows the stored points.
+        # The number of measurement rounds is defined by the points the AI
+        # actually reported (dynamic, R13b): read the stored points from
+        # the object status and require one push per stored point of each
+        # label, consumed in the stored order.
         objects = runner.orchestrator._status.objects
         results.check(
             len(objects) == 1 and len(objects[0].points) == 2,
             "The object carries both stored points sets (gripper + POI)",
         )
+        poi = None
         if objects and objects[0].points:
             poi = next(
                 (p for p in objects[0].points if p["kind"] == "points_of_interest"),
                 None,
             )
-            labels = [pt.get("label") for pt in (poi or {}).get("points", [])]
+        results.check(
+            poi is not None and len(poi.get("points") or []) > 0,
+            "The AI points of interest were stored for the object",
+        )
+        if poi:
+            stored_by_label: Dict[str, List[Any]] = {}
+            for pt in poi.get("points") or []:
+                stored_by_label.setdefault(pt.get("label") or "", []).append(
+                    pt.get("coordinates")
+                )
             results.check(
-                labels == ["xrf", "raman"],
-                f"The AI points of interest are labeled for their analyzer ({labels})",
+                set(stored_by_label) == {"xrf", "raman"},
+                f"The AI reported points for both analyzers ({sorted(stored_by_label)})",
             )
+            for cmd, label in (("measure_xrf", "xrf"), ("measure_raman", "raman")):
+                pushes = _events_of(cmd)
+                expected_coords = stored_by_label.get(label) or []
+                results.check(
+                    len(pushes) == len(expected_coords),
+                    f"{cmd}: one push per received '{label}' point "
+                    f"({len(pushes)} pushes / {len(expected_coords)} stored)",
+                )
+                results.check(
+                    all(
+                        bool(p.get("object_id"))
+                        and len(p.get("points") or []) == 1
+                        and len(p["points"][0]) == 6
+                        for p in pushes
+                    ),
+                    f"{cmd} pushes carry one [x y z r p y] point each",
+                )
+                pushed_coords = [
+                    (p.get("points") or [None])[0] for p in pushes
+                ]
+                results.check(
+                    pushed_coords == expected_coords,
+                    f"{cmd} pushes deliver the stored points in stored order",
+                )
 
         await ws_client.ws.close()
     finally:

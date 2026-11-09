@@ -140,34 +140,64 @@ states:
     meta: { position: disk_first, actor: ai_analysis }
     transitions:
       - event: ai_complete
+        target: puntual_measurements
+        actions:
+          - log_event
+          # No commands here: the points-dispatch state below decides what
+          # to measure next (one event per remaining point of interest).
+
+  puntual_measurements:
+    description: Object is on the first position while its stored points of interest are measured one by one (the pipeline dispatches the next analysis)
+    meta:
+      position: disk_first
+      # Points dispatch (R13): the pipeline fires the first event whose
+      # label still has unconsumed points in the object's stored points
+      # of interest (in declaration order), and the done event when none
+      # remain. Each analysis round consumes its point at command time
+      # (select: next in the robot's points_requests) and returns here.
+      points_dispatch:
+        done_event: puntual_measurements_complete
+        remaining:
+          - { event: analyze_next_xrf_point, kind: points_of_interest, label: xrf }
+          - { event: analyze_next_raman_point, kind: points_of_interest, label: raman }
+    transitions:
+      - event: analyze_next_xrf_point
         target: XRF_analysis
         actions:
           - log_event
-          # The AI finished its analysis: the target points are known, so
-          # the puntual measurements start (robot 1 + the two analyzers).
+          # One XRF point is measured per round (the robot receives the
+          # next unconsumed point pushed on its /points topic).
           - event: robot_first/measure_xrf
           - event: xrf/measure
-
-  XRF_analysis:
-    description: XRF andpuntual measurements are being performed at AI-extracted points (first position)
-    meta: { position: disk_first, parallel_actors: [robot_first, xrf] }
-    transitions:
-      - event: xrf_measurement_complete
+      - event: analyze_next_raman_point
         target: RAMAN_analysis
         actions:
           - log_event
           - event: robot_first/measure_raman
           - event: raman/measure
+      - event: puntual_measurements_complete
+        target: moving_to_box
+        actions:
+          - log_event
+          - event: robot_first/return
+
+  XRF_analysis:
+    description: XRF puntual measurements are being performed at AI-extracted points (first position)
+    meta: { position: disk_first, parallel_actors: [robot_first, xrf] }
+    transitions:
+      - event: xrf_measurement_complete
+        target: puntual_measurements
+        actions:
+          - log_event
 
   RAMAN_analysis:
     description: Raman puntual measurements are being performed at AI-extracted points (first position)
     meta: { position: disk_first, parallel_actors: [robot_first, raman] }
     transitions:
       - event: raman_measurement_complete
-        target: moving_to_box
+        target: puntual_measurements
         actions:
           - log_event
-          - event: robot_first/return
 
   moving_to_box:
     description: Object is being moved from the disk back to its original position in the box

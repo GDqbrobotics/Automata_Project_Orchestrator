@@ -1719,9 +1719,18 @@ class WorkflowOrchestrator:
             if not isinstance(req, dict) or str(req.get("command")) != command:
                 continue
             kind = str(req.get("kind") or "")
-            coords = self._points_store.select(
-                object_id, kind, label=req.get("label"), index=req.get("index")
-            )
+            label = req.get("label")
+            if str(req.get("select") or "all") == "next":
+                # Consume one point per command (R13): every measurement
+                # command delivers exactly the next unconsumed point of
+                # the label, so a multi-point analysis walks the set.
+                coords = self._points_store.take_next(
+                    object_id, kind, label=str(label) if label else ""
+                )
+            else:
+                coords = self._points_store.select(
+                    object_id, kind, label=label, index=req.get("index")
+                )
             if coords is None:
                 logger.warning(
                     "[points] %s: no '%s' points available for object '%s' "

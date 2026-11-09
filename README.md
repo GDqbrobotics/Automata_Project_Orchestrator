@@ -198,7 +198,9 @@ of design tokens (`frontend/src/styles/app.css`).
   (`metadata.points_requests`); the orchestrator stores the points per
   object ID, shows them live in the object window and pushes the selected
   ones — in order — on the consumer's dedicated `/points` topic right
-  after the command that needs them (R12).
+  after the command that needs them. **Multiple points per analyzer are
+  dispatched one per round** from the object journey's dispatch state
+  (`puntual_measurements`, `select: next` — R13).
 - **Real-interface scripts** — a subsystem YAML can declare
   `metadata.interface` (enable + startup/shutdown command, editable in the
   wizard's Basics tab). The orchestrator runs the startup command

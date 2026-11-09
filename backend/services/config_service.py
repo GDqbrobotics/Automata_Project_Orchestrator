@@ -624,7 +624,7 @@ class ConfigService:
             ):
                 errors.append(
                     f"metadata.reports['{rep_type}']: points.count must be "
-                    f"a positive integer"
+                    f"a positive integer (omit it for a dynamic count, R13b)"
                 )
             dimensions = points_cfg.get("dimensions", 3)
             if dimensions not in (3, 6):
@@ -640,11 +640,6 @@ class ConfigService:
                     errors.append(
                         f"metadata.reports['{rep_type}']: points.labels must "
                         f"be a list of non-empty strings"
-                    )
-                elif isinstance(count, int) and len(labels) != count:
-                    errors.append(
-                        f"metadata.reports['{rep_type}']: points.labels must "
-                        f"have exactly 'count' entries"
                     )
 
         # ── Completion contract ────────────────────────────────────────
@@ -769,6 +764,13 @@ class ConfigService:
                             "metadata.points_requests: use either 'label' or "
                             "'index', not both"
                         )
+                    select = req.get("select")
+                    if select is not None and str(select) not in ("all", "next"):
+                        errors.append(
+                            "metadata.points_requests: 'select' must be "
+                            "'all' or 'next' (next consumes one point per "
+                            "command, R13)"
+                        )
                     src_labels = src_points.get("labels")
                     if label is not None and isinstance(src_labels, list):
                         if str(label) not in [str(l) for l in src_labels]:
@@ -809,6 +811,31 @@ class ConfigService:
             return None
         return data if isinstance(data, dict) else None
 
+    def _declared_points_labels(self) -> set:
+        """``{(kind, label)}`` declared by every subsystem's points reports
+        (R13): the object journey's points_dispatch references must match."""
+        declared: set = set()
+        subs_dir = self.config_dir / "subsystems"
+        if not subs_dir.exists():
+            return declared
+        for path in sorted(subs_dir.glob("*.yaml")):
+            try:
+                data = self._parse(path.read_text()) or {}
+            except OSError:
+                continue
+            for rep in (data.get("metadata") or {}).get("reports") or []:
+                points_cfg = rep.get("points") if isinstance(rep, dict) else None
+                if not isinstance(points_cfg, dict):
+                    continue
+                kind = str(points_cfg.get("kind") or "")
+                labels = points_cfg.get("labels") or []
+                if isinstance(labels, list) and labels:
+                    for label in labels:
+                        declared.add((kind, str(label)))
+                else:
+                    declared.add((kind, ""))
+        return declared
+
     def _validate_object(self, data: Dict[str, Any]) -> List[str]:
         """Validate the object blueprint, cross-checking the subsystems.
 
@@ -827,6 +854,7 @@ class ConfigService:
         ready = vocabulary["ready"]
         non_work = vocabulary["non_work"]
         machines = self._subsystem_machines()
+        declared_points = self._declared_points_labels()
 
         disk_names = [str(d) for d in (metadata.get("disk_names") or [])]
         valid_positions = {"box", "hand", *disk_names}
@@ -891,6 +919,63 @@ class ConfigService:
                     f"State '{state_name}': rotate_command '{command}' is not an "
                     "event of any configured subsystem"
                 )
+
+            # Points dispatch (R13): the events must leave THIS state and
+            # reference labels actually declared by a producer's points
+            # report, otherwise the pipeline could not drive the state.
+            dispatch = meta.get("points_dispatch")
+            if dispatch is not None:
+                if not isinstance(dispatch, dict):
+                    errors.append(
+                        f"State '{state_name}': meta.points_dispatch must be a mapping"
+                    )
+                else:
+                    outgoing = {
+                        t.get("event")
+                        for t in (state_def.get("transitions") or [])
+                        if isinstance(t, dict)
+                    }
+                    done_event = str(dispatch.get("done_event") or "")
+                    if not done_event:
+                        errors.append(
+                            f"State '{state_name}': points_dispatch.done_event is "
+                            "required (the event fired when every point is measured)"
+                        )
+                    elif done_event not in outgoing:
+                        errors.append(
+                            f"State '{state_name}': points_dispatch.done_event "
+                            f"'{done_event}' is not an outgoing transition of "
+                            "this state"
+                        )
+                    remaining = dispatch.get("remaining")
+                    if not isinstance(remaining, list) or not remaining:
+                        errors.append(
+                            f"State '{state_name}': points_dispatch.remaining must "
+                            "be a non-empty list"
+                        )
+                    else:
+                        for entry in remaining:
+                            if not isinstance(entry, dict):
+                                errors.append(
+                                    f"State '{state_name}': points_dispatch.remaining "
+                                    "entries must be mappings"
+                                )
+                                continue
+                            event = str(entry.get("event") or "")
+                            kind = str(entry.get("kind") or "")
+                            label = str(entry.get("label") or "")
+                            if not event or event not in outgoing:
+                                errors.append(
+                                    f"State '{state_name}': points_dispatch event "
+                                    f"'{event or '(missing)'}' is not an outgoing "
+                                    "transition of this state"
+                                )
+                            if (kind, label) not in declared_points:
+                                errors.append(
+                                    f"State '{state_name}': points_dispatch label "
+                                    f"'{label or '(none)'}' of kind '{kind}' is not "
+                                    "declared by any subsystem's points report"
+                                )
 
         for subsystem, entries in (metadata.get("task_chains") or {}).items():
             if subsystem not in machines:
