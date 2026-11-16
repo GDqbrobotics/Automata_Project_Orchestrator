@@ -19,7 +19,9 @@ export type WorkflowCommand =
   | 'delete_subsystem'
   | 'write_simulator'
   | 'render_message_formats'
-  | 'render_state_machine';
+  | 'render_state_machine'
+  // Stop/start recovery (R14): the *Keep object scenario* switch.
+  | 'set_scenario_memory';
 
 export type WorkflowEvent =
   | 'workflow_state_changed'
@@ -42,7 +44,10 @@ export type WorkflowEvent =
   | 'config_patched'
   | 'config_validated'
   | 'config_saved'
-  | 'subsystem_deleted';
+  | 'subsystem_deleted'
+  // Stop/start recovery (R14): a saved scenario was restored — the run
+  // continues from where it stopped instead of a fresh box scan.
+  | 'scenario_restored';
 
 /**
  * A workflow state name. workflow.yaml is the single source of truth (R3):
@@ -58,6 +63,8 @@ export interface WorkflowStatus {
   current_object: string | null;
   subsystems: Record<string, SubsystemStatus>;
   error: string | null;
+  /** Stop/start recovery (R14): whether *Keep object scenario* is enabled. */
+  scenario_memory?: boolean;
   last_update: string;
 }
 

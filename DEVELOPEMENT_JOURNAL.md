@@ -12,7 +12,8 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - Debug mode: `python launch_gui.py --debug` — subsystem inspector windows gain a panel to manually send the MQTT messages a real subsystem would publish (user-driven simulation), and the top bar reveals the **configuration wizard**
 - MQTT payload formats are configurable: `backend/config/mqtt_formats.yaml` maps every message kind to payload fields, with per-subsystem overrides (R10, `backend/messaging/message_format.py`); the adapters, the orchestrator receive path and the simulated subsystems all build/parse through it
 - Configuration wizard (debug mode only): 4 steps — workflow/global/object YAML, subsystem edit/add/remove, MQTT formats, review & save; backend `backend/services/config_service.py` validates, comment-preservingly patches and atomically writes, so the browser never touches files
-- Validation: `timeout 500 python backend/simulation_test.py` — **203 checks** (C14 message formats, C15 config service, C16 interface scripts, wizard checks in C12); frontend `npm run build` clean
+- Scenario memory (R14): a **Keep object scenario** switch in the top bar — Stop saves a snapshot (`backend/services/scenario_store.py`), Start resumes the run (no box scan; object states live in `backend/object_states/` and are never wiped by the orchestrator constructor any more), Reset discards it; unsafe/stale snapshots refuse the resume
+- Validation: `timeout 500 python backend/simulation_test.py` — **232 checks** (C14 message formats, C15 config service, C16 interface scripts, C19 scenario memory, wizard checks in C12); frontend `npm run build` clean
 - Validate: `timeout 500 python backend/simulation_test.py` — **always wrap in a timeout** (a bug can make it hang forever)
 - All state machines are YAML-driven: `backend/config/workflow.yaml`, `object.yaml`, `subsystems/*.yaml`, `global.yaml`. Simulated subsystems load the *same* YAML as the orchestrator. Work durations live in the subsystem YAML metadata (`work_durations`).
 - The object flow is driven by `backend/orchestrator/pipeline.py` (PipelineController) from MQTT status reports — identical code path for simulated and real subsystems.
@@ -22,7 +23,46 @@ Working prototype: TypeScript/Vite frontend + Python orchestrator + **process-ba
 - The orchestrator's local **subsystem SM is a mirror, not a predictor**: issuing a command does NOT advance it (real subsystems lag); it only follows the state the subsystem reports over MQTT. An expected-state **discrepancy check** warns if a subsystem never reports the state it was commanded into (window: `orchestration.state_expect_timeout` in `global.yaml`, default 10 s).
 - **The YAML is the single source of truth** (docs/CONFIG_CHANGE_GUIDE.md, implemented 2026-10-08): no state/event names, subsystem names, topics, durations or button rules are hardcoded in Python or TypeScript. The GUI derives its operator-button matrix, state-machine graphs, tones and display vocabulary from the same YAML, broadcast at startup; a rename in `backend/config/` is a config-only change.
 
-## Latest changes (2026-11-04 — multi-point analysis dispatch, R13)
+## Latest changes (2026-11-16 — scenario memory, R14 + stability fixes)
+
+- **Keep object scenario (R14)**: new top-bar switch, persisted server-side
+  (`backend/services/scenario_store.py`: atomic snapshot + settings). With it
+  on, a stop with unfinished objects saves a scenario snapshot; the next
+  start resumes it — no fresh box scan, objects keep their journey states
+  (persisted per-object at every transition in `backend/object_states/` and
+  reloaded at startup), stored points (R12, with consumption cursors) and the
+  pipeline bookkeeping (order, queue position, disk occupancy) are restored,
+  and mid-stage objects are re-driven by resume kicks (a kick re-runs a
+  dispatch state's event or fires the stage's outgoing event). The snapshot
+  is consumed on restore, discarded by Reset, and a **stale/unsafe** snapshot
+  (blueprint changed, object missing on disk, object in the hand / platform
+  rotating / robot task in flight) **refuses** the resume with a clear
+  message — never a half-reconciliation (docs: R14 in CONFIG_CHANGE_GUIDE).
+- **Bug found & fixed — the orchestrator constructor wiped the scenario**:
+  `WorkflowOrchestrator.__init__` called `object_manager.clear()`, which
+  deletes every `backend/object_states/*.json` on each startup — any
+  restart (the exact scenario the feature targets) lost all object states.
+  The clear now happens only on a fresh start / Reset, and a resume makes
+  the snapshot's object list authoritative (stale machines are dropped).
+- **Bug found & fixed — the frontend server shut down too late**:
+  `FrontendServer.stop()` signalled the server to close but hung on
+  `wait_closed()` while a client stayed connected — the (stopped) server
+  kept listening and serving commands to a dead orchestrator. `stop()` now
+  closes every live client connection before waiting, so the port frees
+  immediately (a restarted backend on the same port owns its connections).
+- **Test harness**: the WebSocket test client was rewritten (background
+  reader task; the old implementation cancelled `recv()` every 0.3 s which
+  broke the websockets keepalive and killed the connection mid-test), its
+  `drain_messages` yields to the loop (the polling callers' blocking sleeps
+  starved a purely synchronous drain), and test 19 reconnects after the
+  restart. Real-mode runners use a sanitized config copy (all
+  `metadata.interface` disabled — a suite run must never `docker compose
+  up` the real ROS stack). Test 19 covers the full cycle: run → safe pause →
+  stop (snapshot saved) → **fresh runner** → resume (no re-scan, states
+  kept, remaining objects completed, snapshot consumed) → final states.
+  **232/232** pass; frontend build clean.
+
+## Earlier changes (2026-11-04 — multi-point analysis dispatch, R13)
 
 The puntual analyses now walk ALL the AI points of interest, one per
 round (R13 in `docs/CONFIG_CHANGE_GUIDE.md`, built on the object journey
@@ -120,6 +160,6 @@ config-declared (R12 in `docs/CONFIG_CHANGE_GUIDE.md`):
 ## Next steps
 
 1. **MQTT integration with real subsystems** — receive path is wired; still needed: reconnection/health checks, command/response correlation, retry policies.
-2. **Reliability & recovery** — subsystem health checks, graceful degradation when non-critical subsystems are offline, workflow checkpoint/restore.
+2. **Reliability & recovery** — subsystem health checks, graceful degradation when non-critical subsystems are offline, periodic scenario snapshots (crash recovery), scenario resume across *config* changes (reconciliation).
 3. **CI/CD** — automated runs of `simulation_test.py`, linting (ruff/mypy, eslint/prettier), docker compose (orchestrator + mosquitto + frontend).
 4. **Enhanced UI** — alarm/notification system, data export, per-object data view (images/measurement points).

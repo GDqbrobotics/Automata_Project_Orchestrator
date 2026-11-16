@@ -128,6 +128,7 @@ _WORKFLOW_DONE_STATES = {_stop_done_state, _workflow_names.error_state} - {""}
 # Object states by physical position, from object.yaml meta (R2 metadata):
 # the pipeline's capacity invariants are checked against these sets.
 _OBJ_CFG = _load_object_config()
+_REAL_MODE_CONFIG_PATHS: Optional[Tuple[str, str]] = None
 _OBJ_STATES_BY_POSITION: Dict[str, List[str]] = {}
 for _s, _c in _OBJ_CFG.states.items():
     _pos = (_c.meta or {}).get("position")
@@ -214,6 +215,39 @@ logger = logging.getLogger("simulation_test")
 # ---------------------------------------------------------------------------
 # Test result tracking
 # ---------------------------------------------------------------------------
+
+def _real_mode_config() -> "tuple[str, str]":
+    """Config paths for the *real-mode* runners (use_simulation=False).
+
+    The interface scripts (R11) are the operator's deployment concern: a
+    workflow start in real mode launches them headless, and a suite run
+    must not `docker compose up` the real ROS stack mid-test (it eats the
+    machine and its MQTT nodes flap the subsystem topics). The real-mode
+    runners therefore use a temp copy of the config with every
+    `metadata.interface` disabled; test 16 exercises the interface feature
+    with its own dedicated temp config instead.
+    """
+    import shutil
+    import tempfile
+
+    global _REAL_MODE_CONFIG_PATHS
+    if _REAL_MODE_CONFIG_PATHS is None:
+        tmp = tempfile.mkdtemp(prefix="automata_realmode_")
+        config_dir = Path(tmp) / "config"
+        shutil.copytree(CONFIG_DIR, config_dir)
+        for yaml_path in sorted((config_dir / "subsystems").glob("*.yaml")):
+            data = yaml.safe_load(yaml_path.read_text()) or {}
+            meta = data.get("metadata") or {}
+            if isinstance(meta.get("interface"), dict):
+                meta["interface"]["enabled"] = False
+                yaml_path.write_text(yaml.safe_dump(data, sort_keys=False))
+        _REAL_MODE_CONFIG_PATHS = (
+            str(config_dir / "workflow.yaml"),
+            str(config_dir / "subsystems"),
+        )
+    return _REAL_MODE_CONFIG_PATHS
+
+
 class TestResults:
     def __init__(self) -> None:
         self.passed: List[str] = []
@@ -375,23 +409,60 @@ class OrchestratorRunner:
 # WebSocket client for simulating GUI commands
 # ---------------------------------------------------------------------------
 class WebSocketClient:
-    """Simple WebSocket client for sending GUI commands."""
+    """WebSocket client that emulates the GUI's command channel.
+
+    A background reader task consumes every incoming message (the server
+    broadcasts the full workflow/subsystem status constantly, so the
+    incoming stream never pauses) and feeds both ``received_messages``
+    and an asyncio queue. ``receive`` waits on that queue for the next
+    command acknowledgement.
+
+    The reader task matters for correctness, not convenience: wrapping
+    ``recv()`` in ``asyncio.wait_for`` (the previous implementation)
+    cancels the read every slice, which breaks the websockets protocol
+    loop – control frames (pings/pongs) stop being processed and the
+    keepalive kills the connection mid-test.
+    """
 
     def __init__(self, url: str = "ws://localhost:8081") -> None:
         self.url = url
         self.ws: Any = None
         self.received_messages: List[Dict[str, Any]] = []
+        self._queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        self._reader_task: Optional[asyncio.Task] = None
 
     async def connect(self, retries: int = 5) -> None:
         for i in range(retries):
             try:
-                self.ws = await websockets.connect(self.url)
-                return
+                # ping_interval=None: the server pings this client and the
+                # reader task keeps the protocol loop alive for the pongs;
+                # the client's own keepalive would only add a second timer
+                # that can fire while the test is between commands.
+                self.ws = await websockets.connect(self.url, ping_interval=None)
+                break
             except Exception:
                 if i < retries - 1:
                     time.sleep(0.5)
                 else:
                     raise
+        self._reader_task = asyncio.create_task(self._reader())
+
+    async def _reader(self) -> None:
+        try:
+            async for raw in self.ws:
+                try:
+                    msg = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                self.received_messages.append(msg)
+                # The server broadcasts the full status (configs + state
+                # machine graphs) constantly; keep the history bounded so a
+                # long test cannot grow the list without limits.
+                if len(self.received_messages) > 2000:
+                    del self.received_messages[:1000]
+                await self._queue.put(msg)
+        except Exception:
+            pass
 
     async def send_command(self, command: str, data: Dict[str, Any] | None = None) -> None:
         msg = {"command": command}
@@ -400,32 +471,39 @@ class WebSocketClient:
         await self.ws.send(json.dumps(msg))
 
     async def receive(self, timeout: float = 2.0) -> Dict[str, Any]:
-        """Receive messages until we get an ack or hit timeout."""
+        """Wait for the next command ack/error (up to ``timeout``)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                response = await asyncio.wait_for(self.ws.recv(), timeout=0.3)
-                msg = json.loads(response)
-                self.received_messages.append(msg)
-                if msg.get("received") or msg.get("error"):
-                    return msg
-            except (asyncio.TimeoutError, Exception):
+                msg = await asyncio.wait_for(self._queue.get(), timeout=0.3)
+            except asyncio.TimeoutError:
                 continue
+            if msg.get("received") or msg.get("error"):
+                return msg
         return {}
 
     async def drain_messages(self) -> List[Dict[str, Any]]:
-        """Drain all pending messages."""
-        msgs = []
-        for _ in range(10):  # Try a few times
-            try:
-                response = await asyncio.wait_for(self.ws.recv(), timeout=0.2)
-                msg = json.loads(response)
-                msgs.append(msg)
-            except Exception:
-                break
+        """Messages received since the last explicit drain (non-ack traffic
+        accumulates in ``received_messages`` via the reader task).
+
+        Yields briefly to the event loop first: the callers poll with
+        blocking ``time.sleep`` between drains, and a purely synchronous
+        drain would starve the reader task so no message would ever be
+        collected.
+        """
+        await asyncio.sleep(0.01)
+        msgs = list(self.received_messages)
+        self.received_messages = []
         return msgs
 
     async def close(self) -> None:
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reader_task = None
         if self.ws:
             await self.ws.close()
 
@@ -708,8 +786,7 @@ async def test_pause_resume_gui() -> None:
     logger.info("--- TEST 3: Pause/Resume Workflow (GUI) ---")
 
     runner = OrchestratorRunner(
-        CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_DIR,
+        *_real_mode_config(),
         use_simulation=False,
     )
     runner.start()
@@ -813,8 +890,7 @@ async def test_mqtt_topic_publishing() -> None:
     logger.info("--- TEST 4: MQTT Topic Publishing (GUI) ---")
 
     runner = OrchestratorRunner(
-        CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_DIR,
+        *_real_mode_config(),
         use_simulation=False,
     )
     runner.start()
@@ -891,8 +967,7 @@ async def test_error_recovery() -> None:
     logger.info("--- TEST 5: Error Recovery (GUI) ---")
 
     runner = OrchestratorRunner(
-        CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_DIR,
+        *_real_mode_config(),
         use_simulation=False,
     )
     runner.start()
@@ -958,8 +1033,7 @@ async def test_subsystem_state_machine() -> None:
     logger.info("--- TEST 6: Subsystem State Machine ---")
 
     runner = OrchestratorRunner(
-        CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_DIR,
+        *_real_mode_config(),
         use_simulation=False,
     )
     runner.start()
@@ -1008,7 +1082,7 @@ def test_subsystem_config() -> None:
     """Test: Validate subsystem configuration loads correctly."""
     logger.info("--- TEST 7: Subsystem Configuration ---")
 
-    runner = OrchestratorRunner(CONFIG_PATH, SUBSYSTEMS_CONFIG_DIR)
+    runner = OrchestratorRunner(*_real_mode_config())
     runner.start()
 
     results.check(
@@ -1217,8 +1291,7 @@ async def test_object_in_orchestrator() -> None:
     logger.info("--- TEST 10: Object in Orchestrator Integration ---")
 
     runner = OrchestratorRunner(
-        CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_DIR,
+        *_real_mode_config(),
         use_simulation=False,
     )
     runner.start()
@@ -1298,8 +1371,7 @@ def test_scoped_event_routing() -> None:
     logger.info("--- TEST 11: Scoped Event Routing ---")
 
     runner = OrchestratorRunner(
-        CONFIG_PATH,
-        SUBSYSTEMS_CONFIG_DIR,
+        *_real_mode_config(),
         use_simulation=False,
     )
     runner.start()
@@ -1382,6 +1454,14 @@ async def test_interface_scripts() -> None:
         shutil.copytree(CONFIG_DIR, config_dir)
         config_path = str(config_dir / "workflow.yaml")
         subsystems_dir = str(config_dir / "subsystems")
+        # The real subsystem interfaces (R11) must not leak into the suite:
+        # only the ones this test configures itself may run.
+        for yaml_path in sorted((config_dir / "subsystems").glob("*.yaml")):
+            data = yaml.safe_load(yaml_path.read_text()) or {}
+            meta = data.get("metadata") or {}
+            if isinstance(meta.get("interface"), dict):
+                meta["interface"]["enabled"] = False
+                yaml_path.write_text(yaml.safe_dump(data, sort_keys=False))
 
         # Configure a startup + shutdown script for raman: both append to
         # a marker file. The startup process stays alive (blocking style)
@@ -1639,6 +1719,196 @@ async def test_toggle_starts_no_interface() -> None:
             runner.stop()
 
 
+async def test_scenario_memory() -> None:
+    """Test: stop/start recovery keeps the object scenario (R14).
+
+    With *Keep object scenario* enabled, stopping the run persists the
+    scenario (objects + pipeline bookkeeping + points); restarting the
+    orchestrator (a fresh runner) and starting the workflow again resumes
+    the run — no fresh box scan, the objects keep their states and the
+    remaining work completes.
+    """
+    logger.info("--- TEST 19: Scenario memory (stop/start recovery) ---")
+
+    import shutil
+    import tempfile
+
+    ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+    runner_a: Optional[OrchestratorRunner] = None
+    runner_b: Optional[OrchestratorRunner] = None
+    runner_a_stopped = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        config_dir = tmpdir / "config"
+        shutil.copytree(CONFIG_DIR, config_dir)
+        config_path = str(config_dir / "workflow.yaml")
+        subsystems_dir = str(config_dir / "subsystems")
+        # The real subsystem interfaces (R11) are the operator's concern:
+        # the suite must never launch them.
+        for yaml_path in sorted((config_dir / "subsystems").glob("*.yaml")):
+            data = yaml.safe_load(yaml_path.read_text()) or {}
+            meta = data.get("metadata") or {}
+            if isinstance(meta.get("interface"), dict):
+                meta["interface"]["enabled"] = False
+                yaml_path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+        def _safe_to_freeze(runner: OrchestratorRunner) -> bool:
+            return runner.orchestrator._pipeline.unsafe_reasons() == []
+
+        # -- Run 1: start, let the first object finish, pause at a safe
+        #    point and stop. The scenario must be saved.
+        runner_a = OrchestratorRunner(
+            config_path, subsystems_dir, use_simulation=True, num_objects=2
+        )
+        runner_a.start()
+        try:
+            await ws_client.connect()
+            await ws_client.send_command("set_scenario_memory", {"enabled": True})
+            await ws_client.receive()
+            await ws_client.send_command("start_workflow")
+            await ws_client.receive()
+
+            # The long waits run in a worker thread: blocking the asyncio
+            # loop for minutes would starve the WebSocket keepalive and the
+            # server would close the connection mid-test.
+            results.check(
+                await asyncio.to_thread(
+                    _wait_for_condition,
+                    lambda: runner_a.orchestrator._progress >= 1,
+                    180.0,
+                    1.0,
+                ),
+                "Run 1: the first object completed (progress >= 1)",
+            )
+
+            # Freeze the flow at a safe point: pause, and if the pause
+            # landed on an in-flight operation (hand / rotation / robot
+            # task) resume and pause again. Stopping from a safe pause
+            # makes the snapshot deterministic.
+            saved_states: Dict[str, str] = {}
+            stopped_safely = False
+            for _ in range(40):
+                await ws_client.send_command("pause_workflow")
+                await ws_client.receive()
+                time.sleep(0.8)
+                if _safe_to_freeze(runner_a):
+                    saved_states = {
+                        oid: runner_a.orchestrator.object_manager.get_object_state(oid)
+                        for oid in runner_a.orchestrator.object_manager.get_object_ids()
+                    }
+                    await ws_client.send_command("stop_workflow")
+                    await ws_client.receive()
+                    stopped_safely = True
+                    break
+                await ws_client.send_command("resume_workflow")
+                await ws_client.receive()
+                time.sleep(1.2)
+            results.check(stopped_safely, "Run 1: stopped at a safe pause point")
+            scenario_path = Path("backend/scenario_state/scenario.json")
+            results.check(
+                stopped_safely and scenario_path.exists(),
+                "Run 1: stopping with *Keep object scenario* saved the scenario",
+            )
+            results.check(
+                len(saved_states) == 2,
+                f"Run 1: both objects in the saved scenario ({len(saved_states)})",
+            )
+
+            # -- Restart the orchestrator (fresh runner = new process state)
+            #    and resume.
+            runner_a.stop()
+            runner_a_stopped = True
+            runner_b = OrchestratorRunner(
+                config_path, subsystems_dir, use_simulation=True, num_objects=2
+            )
+            runner_b.start()
+            orch = runner_b.orchestrator
+            results.check(
+                orch._scenario_memory_enabled and orch._scenario_store.available(),
+                "After the restart the switch and the snapshot survived",
+            )
+
+            # The old WebSocket client is connected to the *stopped*
+            # orchestrator's (now closed) frontend server: reconnect so the
+            # commands go to the restarted one.
+            ws_client = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
+            await ws_client.connect()
+
+            await ws_client.send_command("start_workflow")
+            await ws_client.receive()
+            time.sleep(1.0)
+            # The scenario was not reset: finished objects keep their final
+            # state and no object was thrown back into the initial (box)
+            # state. Mid-stage objects may legitimately have been re-driven
+            # by the resume kicks already (their state moved on from the
+            # exact saved one), so only the *finished* objects' states are
+            # compared verbatim.
+            initial_state, _ = orch._object_initial
+            finals = set(orch.object_manager.config.final_states)
+            kept_finals = all(
+                orch.object_manager.get_object_state(oid) == state
+                for oid, state in saved_states.items()
+                if state in finals
+            )
+            none_reset = all(
+                orch.object_manager.get_object_state(oid) != initial_state
+                for oid in saved_states
+            )
+            results.check(
+                kept_finals and none_reset,
+                "Resume restores every object to its saved state",
+            )
+
+            def _run_complete() -> bool:
+                return (
+                    runner_b.current_state_name in _WORKFLOW_DONE_STATES
+                    and runner_b.orchestrator._progress >= 2
+                )
+
+            results.check(
+                await asyncio.to_thread(
+                    _wait_for_condition, _run_complete, 240.0, 1.0
+                ),
+                "Resumed run completes the remaining objects",
+            )
+            results.check(
+                any(
+                    m.get("event") == "scenario_restored"
+                    for m in ws_client.received_messages
+                ),
+                "The frontend was notified of the restored scenario",
+            )
+            results.check(
+                not scenario_path.exists(),
+                "The snapshot is cleared after the run completes",
+            )
+            results.check(
+                all(
+                    runner_b.orchestrator.object_manager.get_object_state(oid)
+                    in runner_b.orchestrator.object_manager.config.final_states
+                    for oid in saved_states
+                ),
+                "Every restored object reached a final state",
+            )
+            await ws_client.ws.close()
+        finally:
+            # Leave the shared scenario/object state clean for the other
+            # tests (the switch defaults back to off).
+            cleaner = runner_b or runner_a
+            if cleaner is not None:
+                try:
+                    cleaner.orchestrator._scenario_store.save_settings(False)
+                    cleaner.orchestrator._scenario_store.clear()
+                    cleaner.orchestrator.object_manager.clear()
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
+        if not runner_a_stopped and runner_a is not None:
+            runner_a.stop()
+        if runner_b is not None:
+            runner_b.stop()
+
+
 async def test_debug_mode() -> None:
     """Test: the --debug manual MQTT injection feature.
 
@@ -1654,7 +1924,7 @@ async def test_debug_mode() -> None:
     status_topic = f"{TOPIC_SUBSYSTEM}/{ROTATING_PLATFORM}/status"
 
     # ── Debug mode ON ──
-    runner = OrchestratorRunner(CONFIG_PATH, SUBSYSTEMS_CONFIG_DIR, debug_mode=True)
+    runner = OrchestratorRunner(*_real_mode_config(), debug_mode=True)
     runner.start()
     orch = runner.orchestrator
 
@@ -1877,7 +2147,7 @@ async def test_debug_mode() -> None:
     runner.stop()
 
     # ── Debug mode OFF ──
-    runner2 = OrchestratorRunner(CONFIG_PATH, SUBSYSTEMS_CONFIG_DIR, debug_mode=False)
+    runner2 = OrchestratorRunner(*_real_mode_config(), debug_mode=False)
     runner2.start()
     ws_client2 = WebSocketClient(url=f"ws://localhost:{FRONTEND_PORT}")
     await ws_client2.connect()
@@ -2560,6 +2830,8 @@ async def run_all_tests(num_objects: int = 3) -> bool:
         await test_object_points_flow()
         time.sleep(1)
         await test_toggle_starts_no_interface()
+        time.sleep(1)
+        await test_scenario_memory()
         time.sleep(1)
         await test_debug_mode()
         time.sleep(1)

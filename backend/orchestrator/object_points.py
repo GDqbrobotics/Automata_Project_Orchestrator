@@ -198,6 +198,51 @@ class ObjectPointsStore:
         self._consumed.setdefault(object_id, {}).setdefault(kind, {})[label] = taken + 1
         return [point.coordinates]
 
+    # -- snapshot (R14) ----------------------------------------------------
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Serializable full snapshot (data + consumption cursors)."""
+        return {
+            "data": {
+                oid: {kind: entry.to_dict() for kind, entry in kinds.items()}
+                for oid, kinds in self._data.items()
+            },
+            "consumed": {
+                oid: {kind: dict(labels) for kind, labels in per_kind.items()}
+                for oid, per_kind in self._consumed.items()
+            },
+        }
+
+    def restore(self, snap: Dict[str, Any]) -> None:
+        """Rebuild the store from a snapshot (R14)."""
+        self.clear()
+        for oid, kinds in (snap.get("data") or {}).items():
+            for kind, entry in (kinds or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                points = [
+                    PointEntry(
+                        coordinates=[float(v) for v in p.get("coordinates") or []],
+                        label=str(p.get("label") or ""),
+                    )
+                    for p in (entry.get("points") or [])
+                    if isinstance(p, dict)
+                ]
+                if not points:
+                    continue
+                self._data.setdefault(oid, {})[kind] = ObjectPoints(
+                    object_id=str(oid),
+                    kind=str(kind),
+                    source=str(entry.get("source") or ""),
+                    points=points,
+                    received_at=str(entry.get("received_at") or ""),
+                )
+        for oid, per_kind in (snap.get("consumed") or {}).items():
+            if isinstance(per_kind, dict):
+                self._consumed.setdefault(oid, {}).update(
+                    {k: dict(v) for k, v in per_kind.items() if isinstance(v, dict)}
+                )
+
     # -- frontend info / lifecycle ----------------------------------------
 
     def info(self, object_id: str) -> List[Dict[str, Any]]:

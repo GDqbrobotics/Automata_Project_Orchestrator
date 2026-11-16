@@ -246,3 +246,22 @@ or units — the producers and the robot implicitly agree.
   card could show which points it received for the current command;
 - plausibility checks on arrival (count vs the declared `count`, NaN
   rejection, range warnings) instead of accepting whatever arrives.
+
+## 19. Scenario memory v2 (follow-ups of R14)
+
+The v1 resume is deliberately conservative: snapshot only on stop, refuse
+(no reconciliation) on anything stale or unsafe, box scan skipped entirely
+on resume.
+
+**Ideas:**
+- **Periodic snapshots** (every completed stage) so a *crash* also resumes
+  instead of losing the run — needs the unsafe-stop case to become a
+  reconciliation question instead of a refusal;
+- **Resume with a changed box**: a re-scan that only *adds* newly appeared
+  objects (keeping the running ones) — v1 ignores objects added while
+  stopped;
+- **Resume across config changes**: v1 refuses when the blueprint changed;
+  a diff-driven state mapping (rename tolerance) could rescue old
+  scenarios instead;
+- **Scenario history** (the last N snapshots with timestamps) so the
+  operator can pick "resume yesterday's run" from a list.

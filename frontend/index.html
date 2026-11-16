@@ -23,6 +23,17 @@
         <h1>AUTOMATA <span>GUI Orchestrator</span></h1>
       </div>
       <div class="topbar-right">
+        <!-- Stop/start recovery (R14): when enabled, stopping the workflow
+             saves the object scenario and the next Start resumes it
+             instead of a fresh box scan. -->
+        <label
+          class="scenario-switch"
+          title="Keep object scenario: stopping the workflow saves the objects (states, disks, points) and the next Start resumes the run instead of starting fresh"
+        >
+          <input type="checkbox" id="scenarioMemoryToggle" />
+          <span class="scenario-switch-track" aria-hidden="true"><span class="scenario-switch-knob"></span></span>
+          <span class="scenario-switch-label">Keep scenario</span>
+        </label>
         <!-- Configuration wizard: revealed by the backend's debug flag
              (launch_gui.py --debug). Guided editing of workflow,
              subsystems and MQTT message formats. -->

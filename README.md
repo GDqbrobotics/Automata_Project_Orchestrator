@@ -209,6 +209,15 @@ of design tokens (`frontend/src/styles/app.css`).
   when the workflow stops (Stop button or end of a run) or when the GUI
   closes. Output lands in `backend/interface_logs/<name>.log` and every
   launch/stop shows up in the event log.
+- **Keep object scenario** — a switch in the top bar. With it on, a
+  **Stop** saves a scenario snapshot and the next **Start** resumes the
+  run instead of scanning the box again: every object keeps its exact
+  journey state (also across a full GUI restart — the object states live
+  on disk), the stored measurement points and the pipeline bookkeeping
+  survive, and mid-stage work is simply re-driven. **Reset** always
+  discards the snapshot and starts fresh; a stale or unsafe snapshot
+  (object in the robot's hand, platform mid-rotation) refuses the resume
+  with a clear message instead of half-recovering.
 
 ## Configuration
 

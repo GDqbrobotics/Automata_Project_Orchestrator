@@ -77,6 +77,7 @@ from backend.orchestrator.object_points import ObjectPointsStore
 from backend.services.config_service import ConfigError, ConfigService
 from backend.services.frontend_server import FrontendServer
 from backend.services.interface_manager import InterfaceProcessManager
+from backend.services.scenario_store import ScenarioError, ScenarioStore
 from backend.simulation.process_manager import SubsystemProcessManager
 from backend.state.state_machine import StateMachineEngine, StateMachineError
 from backend.orchestrator.object_state_machines import ObjectStateMachines
@@ -279,8 +280,12 @@ class WorkflowOrchestrator:
             config_path=object_config_path,
             storage_dir=object_storage_dir,
         )
-        # Clear any persisted objects from previous runs
-        self.object_manager.clear()
+        # NOTE (R14 scenario memory): the persisted per-object states are
+        # *not* cleared here any more — a stopped workflow may be resumed
+        # later (Keep object scenario), and its object states live exactly
+        # here. Stale files are wiped on every fresh start instead
+        # (_reset_workflow_state), and a resume makes the snapshot's
+        # object list authoritative (stale machines are dropped).
         # Wire up object SM callbacks
         self.object_manager.on_change(self._on_object_state_change)
         self.object_manager.on_event(self._on_object_event)
@@ -312,6 +317,16 @@ class WorkflowOrchestrator:
         # each of their commands needs and receive them pushed on their
         # dedicated points topic right after the command.
         self._points_store = ObjectPointsStore()
+        # Stop/start recovery (R14): when the operator enables *Keep object
+        # scenario*, stopping the workflow persists the scenario (objects,
+        # pipeline bookkeeping, points) and the next Start resumes it
+        # instead of a fresh box scan. The switch itself survives a restart
+        # of the GUI.
+        self._scenario_store = ScenarioStore(
+            _PROJECT_ROOT / "backend" / "scenario_state"
+        )
+        self._scenario_memory_enabled = self._scenario_store.load_settings()
+        self._status.scenario_memory = self._scenario_memory_enabled
         # Commands whose points were not stored yet (R12): the first pick
         # of a freshly discovered object can race the points report (the
         # object list is processed first). Those pushes are deferred and
@@ -426,6 +441,12 @@ class WorkflowOrchestrator:
         self.frontend.set_command_handler(
             WorkflowCommand.RENDER_STATE_MACHINE,
             self._handle_render_state_machine,
+        )
+        # Stop/start recovery (R14): the operator's *Keep object scenario*
+        # switch (top bar) — a runtime preference persisted on disk.
+        self.frontend.set_command_handler(
+            WorkflowCommand.SET_SCENARIO_MEMORY,
+            self._handle_set_scenario_memory,
         )
 
         # ─── Configuration Wizard ───
@@ -675,9 +696,34 @@ class WorkflowOrchestrator:
         # their interface shut down after the previous run) get it launched
         # headless, so they can initialize and report over MQTT.
         self._ensure_interfaces_running()
-        # Always clear previous state before starting a new workflow.
-        # This handles starting from stopped, error, or idle.
-        self._reset_workflow_state()
+        # Scenario memory (R14): with the switch on and a restorable
+        # snapshot, resume the saved scenario instead of a fresh box scan.
+        # A refusal (unsafe or stale snapshot) blocks the start with a
+        # clear message; Reset discards the snapshot and starts fresh.
+        resume_snapshot = None
+        if self._scenario_memory_enabled and self._scenario_store.available():
+            resume_snapshot = self._scenario_store.load()
+        if resume_snapshot is None:
+            # Always clear previous state before starting a new workflow.
+            # This handles starting from stopped, error, or idle.
+            self._reset_workflow_state()
+            self._scenario_store.clear()
+        else:
+            try:
+                self._restore_scenario(resume_snapshot)
+            except ScenarioError as exc:
+                logger.error("[scenario] resume refused: %s", exc)
+                self._scenario_store.clear()
+                self._fire_frontend_event(
+                    BackendEvent.ERROR_REPORTED.value,
+                    {
+                        "message": (
+                            f"Cannot resume the saved scenario: {exc}. "
+                            "Press Reset to discard it and start fresh."
+                        )
+                    },
+                )
+                return
 
         if not self.fire_event(wf.operator_events.get("start", "start_requested")):
             return  # error already logged by fire_event
@@ -744,6 +790,9 @@ class WorkflowOrchestrator:
         """
         logger.info("Operator: reset_workflow")
         wf = self.workflow_names
+        # Reset is the one guaranteed way to discard a saved scenario (R14):
+        # stop/start with *Keep object scenario* resumes it instead.
+        self._scenario_store.clear()
         self._reset_workflow_state()
 
         if not self.fire_event(wf.operator_events.get("reset", "reset_requested")):
@@ -1757,6 +1806,138 @@ class WorkflowOrchestrator:
             self._pending_points.discard((object_id, subsystem_name, command))
 
     # ------------------------------------------------------------------
+    # Scenario memory (R14): stop/start recovery
+    # ------------------------------------------------------------------
+    def _handle_set_scenario_memory(self, data: Dict[str, Any]) -> None:
+        """The operator's *Keep object scenario* switch (top bar).
+
+        A runtime preference persisted on disk (it survives a restart of
+        the GUI). Turning it off discards any saved snapshot.
+        """
+        enabled = bool((data or {}).get("enabled"))
+        self._scenario_memory_enabled = enabled
+        self._scenario_store.save_settings(enabled)
+        self._status.scenario_memory = enabled
+        if not enabled:
+            self._scenario_store.clear()
+        logger.info(
+            "Operator: scenario memory %s",
+            "enabled" if enabled else "disabled",
+        )
+        self.frontend.broadcast_status(self._status)
+
+    def _maybe_save_scenario(self) -> None:
+        """Persist the scenario on workflow stop (R14).
+
+        Saved only when *Keep object scenario* is enabled, the run still
+        has unfinished objects, and the physical world is still describable
+        (nothing in the gripper, no operation in flight, no rotation in
+        progress — otherwise the snapshot would lie about reality and is
+        discarded instead; the operator resets and starts fresh).
+        """
+        if not self._scenario_memory_enabled:
+            self._scenario_store.clear()
+            return
+        object_ids = self.object_manager.get_object_ids()
+        final_states = set(self.object_manager.config.final_states)
+        unfinished = [
+            oid
+            for oid in object_ids
+            if self.object_manager.get_object_state(oid) not in final_states
+        ]
+        if not object_ids or not unfinished:
+            # A completed run has nothing to resume: the next start is a
+            # fresh one.
+            self._scenario_store.clear()
+            return
+        reasons = self._pipeline.unsafe_reasons()
+        if reasons:
+            self._scenario_store.clear()
+            message = (
+                "Scenario not saved — "
+                + "; ".join(reasons)
+                + ". Use Reset to start fresh."
+            )
+            logger.warning("[scenario] %s", message)
+            self._fire_frontend_event(
+                BackendEvent.ERROR_REPORTED.value,
+                {"message": message},
+            )
+            return
+        self._scenario_store.save(
+            {
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "objects": list(object_ids),
+                "progress": self._progress,
+                "total_objects": self._total_objects,
+                "pipeline": self._pipeline.snapshot(),
+                "points": self._points_store.snapshot(),
+            }
+        )
+
+    def _restore_scenario(self, snapshot: Dict[str, Any]) -> None:
+        """Resume a saved scenario instead of starting fresh (R14).
+
+        The object state machines were already persisted per object at
+        every transition (backend/object_states/*.json) and reloaded at
+        orchestrator startup; the snapshot restores what surrounded them:
+        the pipeline bookkeeping (analysis order, queue position, disk
+        occupancy), the stored measurement points and the run counters.
+        The box scan is skipped, the workflow runs its normal start
+        sequence (readiness gate waits for the restarted subsystems), and
+        objects that were mid-stage are re-driven by the pipeline.
+        """
+        object_ids = [str(o) for o in snapshot.get("objects") or []]
+        if not object_ids:
+            raise ScenarioError("the snapshot carries no objects")
+        # The snapshot is authoritative: stale machines loaded from disk
+        # (leftovers of an older run) are dropped together with their
+        # persisted files, so only the saved scenario's objects live on.
+        for stale_oid in self.object_manager.get_object_ids():
+            if stale_oid not in object_ids:
+                self.object_manager.remove_object(stale_oid)
+        blueprint_states = set(self.object_manager.config.states)
+        for oid in object_ids:
+            state = self.object_manager.get_object_state(oid)
+            if state is None:
+                raise ScenarioError(
+                    f"object '{oid}' has no saved state on disk"
+                )
+            if state not in blueprint_states:
+                raise ScenarioError(
+                    f"object '{oid}' is in state '{state}', which does not "
+                    "exist in the current object.yaml (the blueprint changed "
+                    "since the scenario was saved)"
+                )
+        self._points_store.restore(snapshot.get("points") or {})
+        self._pipeline.restore(snapshot.get("pipeline") or {})
+        self.set_total_objects(int(snapshot.get("total_objects") or 0))
+        self._progress = int(snapshot.get("progress") or 0)
+        self._status.progress = self._progress
+        self._current_object = None
+        self._status.current_object = None
+        # The snapshot is consumed: a stop during the resumed run writes a
+        # fresh one, and a crash does not resurrect a stale scenario.
+        self._scenario_store.clear()
+        self._broadcast_objects()
+        self._fire_frontend_event(
+            BackendEvent.SCENARIO_RESTORED.value,
+            {
+                "message": (
+                    f"Scenario restored: {len(object_ids)} object(s), "
+                    f"saved {snapshot.get('saved_at', '')}"
+                ),
+                "objects": len(object_ids),
+                "saved_at": snapshot.get("saved_at"),
+            },
+        )
+        logger.info(
+            "[scenario] restored %d object(s) (saved %s) – the box scan is "
+            "skipped and the run continues from where it stopped",
+            len(object_ids), snapshot.get("saved_at"),
+        )
+
+    # ------------------------------------------------------------------
     # Subsystem Status Updates
     # ------------------------------------------------------------------
     def _refresh_subsystem_info(self, subsystem_name: str) -> None:
@@ -2015,6 +2196,10 @@ class WorkflowOrchestrator:
         # (stop()) shuts them down waited-on instead.
         if new_state == self.workflow_names.stop_state:
             self._shutdown_interfaces(wait=False)
+            # Stop/start recovery (R14): this is where the scenario is
+            # persisted — when the operator stops the workflow with objects
+            # still unfinished and *Keep object scenario* is enabled.
+            self._maybe_save_scenario()
         # Broadcast full status including objects for the frontend
         self.frontend.broadcast_with_display_config(self._status)
 
@@ -2068,6 +2253,7 @@ class WorkflowOrchestrator:
 
     def _get_status(self) -> WorkflowStatus:
         with self._lock:
+            self._status.scenario_memory = self._scenario_memory_enabled
             self._status.objects = [
                 ObjectInfo(
                     object_id=obj["object_id"],

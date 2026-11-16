@@ -76,6 +76,13 @@ export class App {
   start(): void {
     this.client.connect((msg) => this.onMessage(msg));
     this.render();
+    // Stop/start recovery (R14): the *Keep object scenario* switch.
+    const scenarioToggle = document.getElementById(
+      'scenarioMemoryToggle',
+    ) as HTMLInputElement | null;
+    scenarioToggle?.addEventListener('change', () => {
+      this.setScenarioMemory(scenarioToggle.checked);
+    });
   }
 
   stop(): void {
@@ -105,6 +112,17 @@ export class App {
 
   sendCommand(cmd: WorkflowCommand): void {
     this.client.send(cmd);
+  }
+
+  /**
+   * Stop/start recovery (R14): enable/disable *Keep object scenario*.
+   * The state is updated optimistically (the next status broadcast
+   * echoes the backend's persisted choice).
+   */
+  setScenarioMemory(enabled: boolean): void {
+    this.client.send('set_scenario_memory' as WorkflowCommand, { enabled });
+    this.state = { ...this.state, scenarioMemory: enabled };
+    this.render();
   }
 
   /**
@@ -177,6 +195,7 @@ export class App {
     this.updateSimulationBadge();
     this.updateActionButtons();
     this.updateConnectionIndicator();
+    this.updateScenarioSwitch();
     this.updateEventLog();
     // Keep the state machine inspector live while it is open
     if (this.detailRef) {
@@ -547,6 +566,16 @@ export class App {
     const text = document.getElementById('connectionText');
     if (dot) dot.className = `connection-dot ${this.state.connectionStatus === 'connected' ? 'connected' : ''}`;
     if (text) text.textContent = this.state.connectionStatus === 'connected' ? 'Connected' : 'Disconnected';
+  }
+
+  /** Stop/start recovery (R14): reflect the backend's persisted switch. */
+  private updateScenarioSwitch(): void {
+    const toggle = document.getElementById(
+      'scenarioMemoryToggle',
+    ) as HTMLInputElement | null;
+    if (toggle && toggle.checked !== this.state.scenarioMemory) {
+      toggle.checked = this.state.scenarioMemory;
+    }
   }
 
   private updateEventLog(): void {

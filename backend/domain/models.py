@@ -55,6 +55,9 @@ class WorkflowCommand(str, enum.Enum):
     # Rebuild the `states:` block of a config file from the wizard's
     # structured state-machine editor (states/transitions/messages).
     RENDER_STATE_MACHINE = "render_state_machine"
+    # Stop/start recovery (R14): whether stopping the workflow keeps the
+    # object scenario (a snapshot restored by the next Start).
+    SET_SCENARIO_MEMORY = "set_scenario_memory"
 
 
 class Command(str, enum.Enum):
@@ -99,6 +102,9 @@ class BackendEvent(str, enum.Enum):
     # subsystem (subsystem YAML metadata.interface, R11) — headless, the
     # subsystem state is known through MQTT from then on.
     INTERFACE_COMMAND = "interface_command"
+    # Stop/start recovery (R14): a saved scenario was restored — the run
+    # continues from where it stopped instead of a fresh box scan.
+    SCENARIO_RESTORED = "scenario_restored"
 
 
 @dataclass
@@ -410,6 +416,9 @@ class WorkflowStatus:
     active_subsystems: Dict[str, SubsystemInfo] = field(default_factory=dict)
     objects: List[ObjectInfo] = field(default_factory=list)
     error: Optional[str] = None
+    # Stop/start recovery (R14): whether *Keep object scenario* is enabled
+    # (the top-bar switch; the choice survives a restart of the GUI).
+    scenario_memory: bool = False
     last_update: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -424,5 +433,6 @@ class WorkflowStatus:
             },
             "objects": [obj.to_dict() for obj in self.objects],
             "error": self.error,
+            "scenario_memory": self.scenario_memory,
             "last_update": self.last_update,
         }

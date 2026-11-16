@@ -429,6 +429,63 @@ the dispatch state, and the cycle repeats until `done_event`.
 
 ---
 
+## R14 — Scenario Memory (Stop/Start Recovery, "Keep object scenario")
+
+A GUI switch (**Keep object scenario**, persisted in
+`backend/scenario_state/settings.json`) changes what *Stop* and *Start*
+mean:
+
+| | switch OFF (default) | switch ON |
+|---|---|---|
+| **Stop** | plain stop | saves a **scenario snapshot** (`backend/scenario_state/scenario.json`, atomic write) |
+| **Start** | fresh run: reset + box scan | resumes the snapshot instead: **no box scan**, the run continues from where it stopped |
+| **Reset** | reset | discards the snapshot **and** resets — the guaranteed way back to a clean run |
+
+**What is persisted where**
+
+- **Object states** (`backend/object_states/<id>.json`) are saved at
+  every transition by `ObjectStateMachines` (pre-existing) and reloaded
+  at orchestrator startup. The orchestrator constructor must **never**
+  clear them — they *are* the scenario.
+- **The snapshot** carries the surrounding bookkeeping only: the object
+  id list (authoritative), the pipeline state (analysis order, queue
+  position, disk occupancy, rotation flag), the stored measurement
+  points (R12, including the per-label consumption cursors) and the run
+  counters. Saved atomically (tmp + rename) at the workflow's stop state
+  when unfinished objects remain and the switch is on.
+- The snapshot is **consumed** on restore (a stop during the resumed run
+  writes a fresh one; a crash does not resurrect a stale scenario).
+
+**Refusal policy (no reconciliation in v1):** the restore refuses the
+start with a clear frontend message when
+
+- a saved object has no state on disk, or its state is not in the
+  current `object.yaml` (the blueprint changed since the save), or
+- the snapshot is **unsafe**: an object in the robot's hand, the
+  platform mid-rotation, or a robot task in flight (the operator should
+  stop at a stable moment — e.g. after a pause — for a clean resume).
+
+A refused start clears the snapshot and tells the operator to press
+Reset; it never half-reconciles.
+
+**Resume mechanics:** the box scan is skipped (the pipeline phase is
+restored to `pipeline`), the readiness gate runs normally (the
+restarted subsystems must report ready again), and objects that were
+mid-stage are **re-driven** by the pipeline: their outgoing event
+re-runs the stage (an interrupted measurement round is simply re-done —
+its point was already consumed at command time).
+
+**Rules:**
+- Stop-saves-only: the snapshot is written on stop, not periodically
+  (a crash loses the scenario; periodic snapshots are a future idea).
+- The switch is persisted server-side (`ScenarioStore.save_settings`);
+  the GUI's toggle sends `set_scenario_memory` and the status broadcast
+  carries `scenario_memory` so a restarted backend re-syncs the UI.
+- The frontend is notified with a `scenario_restored` event on a
+  successful resume.
+
+---
+
 ## R6 — Object Journey Final States (Derived, Not Hardcoded)
 
 The object workflow's final state(s) are **states with no outgoing transitions** in `object.yaml`. Code uses `StateMachineConfig.final_states` property.
@@ -663,6 +720,13 @@ name, display_name, type, mqtt_topic, initial_state, required
 metadata: {description, hardware, init_duration, work_durations{}, reports[{type, after{from, to}, object_ids{count_source, format?}, points{kind, count?, dimensions, labels?}}], interface{enabled, startup, shutdown?, cwd?}, points_topic?, points_requests[{command, source, kind, label?|index?, select?}]}
 states: {state_name: {description, transitions[{event, target, actions[]}]}}
 ```
+
+**Scenario memory (R14):** no YAML keys — the *Keep object scenario*
+switch is a GUI/runtime setting (persisted in
+`backend/scenario_state/settings.json`); the snapshot lives beside it
+(`scenario.json`). The object states themselves stay in
+`backend/object_states/` and are only wiped by a fresh start or Reset —
+never by the orchestrator constructor.
 
 ### mqtt_formats.yaml
 ```yaml

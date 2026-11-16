@@ -3,3 +3,4 @@ node_modules/
 object_states/
 frontend/dist/assets/
 backend/interface_logs/
+backend/scenario_state/

@@ -202,6 +202,9 @@ class PipelineController:
         self._measuring_pending: Set[str] = set()
         self._rotation_requested = False
         self._rotating = False
+        # Resumed scenario (R14): objects to re-drive once the workflow is
+        # running again (their stage was interrupted by the stop).
+        self._pending_kicks: List[Tuple[str, str]] = []
 
     # ------------------------------------------------------------------
     # Low-level helpers
@@ -284,6 +287,7 @@ class PipelineController:
     # Public API (called by the orchestrator)
     # ------------------------------------------------------------------
     def on_workflow_state(self, state: str) -> None:
+        resume_kick = False
         with self._lock:
             wf = self._orch.workflow_names
             if state == wf.run_state:
@@ -291,10 +295,18 @@ class PipelineController:
                     self._phase = "scanning"
                     logger.info("Pipeline: workflow running – requesting box scan")
                     self._advance()
+                elif self._phase == "pipeline" and self._pending_kicks:
+                    # Resumed scenario (R14): the bookkeeping is restored;
+                    # dispatch continues and the mid-stage objects are
+                    # re-driven (outside the lock).
+                    self._advance()
+                    resume_kick = True
             elif state in wf.suspend_states:
                 if self._phase in ("scanning", "pipeline"):
                     self._phase = "suspended"
                     logger.info("Pipeline: workflow '%s' – dispatch suspended", state)
+        if resume_kick:
+            self._process_resume_kicks()
 
     def on_objects_detected(self, object_ids: List[str]) -> None:
         """The box scanner reported the objects in the box (IDs + order)."""
@@ -368,6 +380,109 @@ class PipelineController:
             self._measuring_pending = set()
             self._rotation_requested = False
             self._rotating = False
+            self._pending_kicks = []
+
+    # ------------------------------------------------------------------
+    # Scenario memory (R14): snapshot / restore of the run bookkeeping
+    # ------------------------------------------------------------------
+    def snapshot(self) -> Dict[str, Any]:
+        """The run bookkeeping to persist for a stop/start recovery."""
+        with self._lock:
+            return {
+                "order": list(self._order),
+                "queue_pos": self._queue_pos,
+                "disks": list(self._disks),
+                "rotation_requested": self._rotation_requested,
+            }
+
+    def unsafe_reasons(self) -> List[str]:
+        """Why the current scenario cannot be safely resumed (R14).
+
+        The physical world must still match the bookkeeping: an object in
+        the robot's gripper, an operation in flight or a platform rotation
+        in progress leave the disks in a state no snapshot can describe.
+        """
+        with self._lock:
+            reasons: List[str] = []
+            if self._rotating:
+                reasons.append("the platform is rotating")
+            if self._robot_task is not None:
+                reasons.append("a robot operation is in flight")
+            for oid in self._orch.object_manager.get_object_ids():
+                state = self._orch.object_manager.get_object_state(oid)
+                meta = self._state_meta.get(state or "", {})
+                if meta.get("position") == "hand":
+                    reasons.append(f"object '{oid}' is in the robot's hand")
+            return reasons
+
+    def restore(self, snap: Dict[str, Any]) -> None:
+        """Rebuild the run bookkeeping from a scenario snapshot (R14).
+
+        In-flight work (robot tasks, measurement tracking) is intentionally
+        not restored: on resume the pipeline re-drives every object that
+        was mid-stage by firing its outgoing transition, which returns it
+        to the dispatch/waiting point and restarts the stage through the
+        normal machinery (an interrupted measurement is skipped; its point
+        was already consumed at command time).
+        """
+        with self._lock:
+            self._order = [str(o) for o in (snap.get("order") or [])]
+            self._queue_pos = int(snap.get("queue_pos") or 0)
+            disks = [None] * self._disk_count
+            for idx, oid in enumerate(snap.get("disks") or []):
+                if idx < len(disks) and oid:
+                    disks[idx] = str(oid)
+            self._disks = disks
+            self._rotation_requested = bool(snap.get("rotation_requested"))
+            self._rotating = False
+            self._robot_task = None
+            self._measuring_object = None
+            self._measuring_pending = set()
+            self._phase = "pipeline"
+
+            # Objects that were mid-stage when the run stopped are kicked
+            # once the workflow is running again (their leave event returns
+            # them to the dispatch/waiting point).
+            self._pending_kicks = []
+            for oid in self._orch.object_manager.get_object_ids():
+                state = self._orch.object_manager.get_object_state(oid)
+                meta = self._state_meta.get(state or "", {})
+                if meta.get("points_dispatch"):
+                    self._pending_kicks.append((oid, "dispatch"))
+                elif meta.get("actor") or meta.get("parallel_actors"):
+                    self._pending_kicks.append((oid, "leave"))
+            if self._pending_kicks:
+                logger.info(
+                    "Pipeline: %d object(s) to re-drive after the resume",
+                    len(self._pending_kicks),
+                )
+
+    def _process_resume_kicks(self) -> None:
+        """Re-drive the objects that were mid-stage when the run stopped.
+
+        Runs OUTSIDE the pipeline lock (it fires object transitions, which
+        take the orchestrator lock — the established lock order).
+        """
+        with self._lock:
+            kicks = list(self._pending_kicks)
+            self._pending_kicks = []
+        for oid, kind in kicks:
+            state = self._obj_state(oid)
+            meta = self._state_meta.get(state or "", {})
+            if kind == "dispatch" and meta.get("points_dispatch"):
+                logger.info(
+                    "Pipeline: re-dispatching points of object '%s' after resume", oid
+                )
+                self._dispatch_points_stage(oid, meta["points_dispatch"])
+            elif kind == "leave":
+                event = self._leave_event.get(state or "")
+                if event:
+                    logger.info(
+                        "Pipeline: object '%s' was mid-stage ('%s') – re-driving "
+                        "via '%s' after resume",
+                        oid, state, event,
+                    )
+                    self._fire_object_event(oid, event)
 
     # ------------------------------------------------------------------
     # Reactions to subsystem completions

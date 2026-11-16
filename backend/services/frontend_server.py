@@ -381,9 +381,22 @@ class FrontendServer:
         ``Server.close()`` schedules its work with ``loop.create_task()``,
         which is NOT thread-safe when called from another thread (the loop
         is never woken and ``wait_closed()`` hangs forever).
+
+        Live client connections are closed explicitly: ``wait_closed()``
+        only completes once every handler has finished, and a client that
+        stays connected keeps the (stopped) server bound to its port — a
+        restart on the same port would then leave a zombie server serving
+        commands to a dead orchestrator.
         """
         if self._server is not None:
             self._server.close()
+            async with self._lock:
+                clients = list(self._connected_clients)
+            for websocket in clients:
+                try:
+                    await websocket.close()
+                except Exception:  # noqa: BLE001 - already-closed clients
+                    pass
             await self._server.wait_closed()
 
     def stop(self) -> None:

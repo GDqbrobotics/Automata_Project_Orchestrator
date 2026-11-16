@@ -47,6 +47,8 @@ export interface UiState {
   workflowStateMachine: StateMachineDef | null;
   /** Debug config (null when the backend is not running with --debug). */
   debug: DebugConfig | null;
+  /** Stop/start recovery (R14): whether *Keep object scenario* is enabled. */
+  scenarioMemory: boolean;
   /** Simulation info (null when the backend is not running with --simulation). */
   simulation: SimulationInfo | null;
   /** Recent MQTT messages per subsystem (sent/received). */
@@ -82,6 +84,7 @@ export function createInitialState(): UiState {
     objectStateMachine: null,
     workflowStateMachine: null,
     debug: null,
+    scenarioMemory: false,
     simulation: null,
     subsystemMessages: {},
     objectMessages: {},
@@ -269,6 +272,10 @@ export function reduceState(state: UiState, msg: unknown): UiState {
     if (d.simulation && typeof d.simulation === 'object') {
       updated.simulation = d.simulation as SimulationInfo;
     }
+    // Stop/start recovery switch (R14)
+    if (d.scenario_memory !== undefined) {
+      updated.scenarioMemory = Boolean(d.scenario_memory);
+    }
   }
 
   // Handle individual object state changes
@@ -335,6 +342,18 @@ export function reduceState(state: UiState, msg: unknown): UiState {
       source: 'interface',
       message: `${d.subsystem}: interface ${d.action}${ok ? '' : ' FAILED'} — ${d.command}`,
       level: ok ? 'info' : 'error',
+    });
+  }
+
+  // Stop/start recovery (R14): a saved scenario was restored — the run
+  // continues from where it stopped instead of a fresh box scan.
+  if (m.event === 'scenario_restored' && m.details) {
+    const d = m.details as Record<string, unknown>;
+    logs.push({
+      time: now(),
+      source: 'workflow',
+      message: `${d.message || 'Scenario restored'}`,
+      level: 'success',
     });
   }
 
